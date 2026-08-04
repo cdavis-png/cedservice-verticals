@@ -17,6 +17,48 @@
 window.CED_ASSESSMENT_CONFIG = {
   storageKey: 'cedSalonGrowthReview',
 
+  /* Identity and shape of this vertical, carried on every submission so a
+     downstream system can tell verticals and assessment revisions apart.
+     Bump assessmentVersion whenever questions, weights, or formulas change. */
+  meta: {
+    verticalId: 'nails',
+    verticalName: 'Nail Salons',
+    assessmentVersion: '1.1.0',
+
+    /* Must match the packages section of index.html and the labels returned by
+       recommendPackage below. Prices are in whole dollars per month. */
+    packages: [
+      { id: 'starter', name: 'Starter', price: 297, currency: 'USD', interval: 'month' },
+      { id: 'salon-growth', name: 'Salon Growth', price: 597, currency: 'USD', interval: 'month' },
+      { id: 'scale', name: 'Scale', price: 997, currency: 'USD', interval: 'month' }
+    ],
+
+    contactFields: ['salonName', 'ownerName', 'email', 'mobile', 'preferredContact'],
+
+    /* Separate, independently recorded permissions. Results delivery is the only
+       required one and is satisfied by email alone, so declining marketing never
+       blocks a visitor from receiving their assessment.
+
+       requiresField gates a consent on another answer: SMS marketing is not
+       offered at all unless a mobile number was given.
+
+       LEGAL REVIEW PENDING — the wording in index.html has not been reviewed by
+       counsel. Do not launch a vertical until it has. */
+    consents: [
+      { key: 'resultsDeliveryConsent', field: 'consentResults', required: true },
+      { key: 'emailMarketingConsent', field: 'consentEmailMarketing', required: false },
+      { key: 'smsMarketingConsent', field: 'consentSmsMarketing', required: false, requiresField: 'mobile' }
+    ]
+  },
+
+  /* Transport settings for shared/assessment-engine/submission.js.
+     endpoint is null until a capture endpoint exists — with no endpoint the
+     adapter logs the payload instead of sending it. */
+  submission: {
+    endpoint: null,
+    timeoutMs: 10000
+  },
+
   /* Which answer names the business on the results screen. */
   subjectField: 'salonName',
   subjectFallback: 'Your salon',
@@ -31,7 +73,9 @@ window.CED_ASSESSMENT_CONFIG = {
   fields: [
     'salonName',
     'ownerName',          /* context only */
-    'email',              /* context only */
+    'email',              /* context only, required */
+    'mobile',             /* context only, optional — gates SMS marketing consent */
+    'preferredContact',   /* context only */
     'technicians',
     'appointmentsDay',    /* context only */
     'averageTicket',
@@ -50,7 +94,10 @@ window.CED_ASSESSMENT_CONFIG = {
     'rating',
     'reviewRequests',
     'promotions',
-    'challenge'           /* context only */
+    'challenge',          /* context only */
+    'consentResults',     /* required; recorded separately in the payload */
+    'consentEmailMarketing',
+    'consentSmsMarketing'
   ],
 
   /* Estimated monthly opportunity, in dollars.
@@ -118,6 +165,7 @@ window.CED_ASSESSMENT_CONFIG = {
 
     if (technicians <= 1 && opportunity < 1000) {
       return {
+        id: 'starter',
         label: 'Starter — $297/month',
         reason: 'Recommended for a solo provider that needs basic missed-call, review, and reactivation automation.'
       };
@@ -125,12 +173,14 @@ window.CED_ASSESSMENT_CONFIG = {
 
     if (technicians >= 5 && (num('callsDay') >= 12 || num('missedCallsDay') >= 4)) {
       return {
+        id: 'scale',
         label: 'Scale — $997/month',
         reason: 'Recommended for a multi-technician salon with enough call volume to justify AI phone coverage and active growth support.'
       };
     }
 
     return {
+      id: 'salon-growth',
       label: 'Salon Growth — $597/month',
       reason: 'Recommended for established salons with appointment, retention, and follow-up opportunities.'
     };

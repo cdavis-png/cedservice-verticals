@@ -25,9 +25,9 @@ family is mostly copy work. A new *family* needs its own assessment design.
 > vertical supplies markup, copy, and an `assessment.config.js`; it writes no
 > assessment JavaScript of its own.
 >
-> Still outstanding platform-wide: completed reviews are stored only in
-> `localStorage` and are never sent anywhere. Every vertical inherits this
-> until a capture endpoint exists.
+> Lead capture is built and shared too, but not connected: `submission.endpoint`
+> is `null`, so completed assessments are logged to the console rather than
+> delivered. Set a real endpoint before launching any vertical.
 
 ---
 
@@ -76,7 +76,7 @@ Anything a second vertical would also need.
 | `design-system/layouts/` | Shell, grids, section rhythm |
 | `design-system/animations/` | Ambient effects, transitions, reduced-motion rules |
 | `design-system/accessibility/` | Focus styles, skip links, screen-reader utilities |
-| `shared/assessment-engine/` | Step navigation, validation, resume, scoring, recommendation |
+| `shared/assessment-engine/` | Step navigation, validation, resume, scoring, recommendation, payload building, submission transport |
 | `shared/components/` | Markup partials shared across verticals |
 | `shared/reports/` | Results rendering and formatting |
 | `shared/scripts/` | Site chrome and utilities: header nav, formatting, analytics |
@@ -92,7 +92,8 @@ code never imports from a vertical.
 
 Only what genuinely differs by industry:
 
-- **Copy** — headlines, subheads, eyebrow labels, FAQ answers, proof points.
+- **Copy** — headlines, subheads, eyebrow labels, FAQ answers, proof points, and
+  the three consent statements (all pending legal review).
 - **Assessment configuration** — question text, answer options, weights,
   opportunity coefficients, priority messages.
 - **Packages** — tier names, prices, feature lists, recommendation thresholds.
@@ -153,9 +154,25 @@ JavaScript is written in the vertical.
 
 ```html
 <script src="../assessment.config.js"></script>
+<script src="../../../../shared/assessment-engine/submission.js"></script>
 <script src="../../../../shared/assessment-engine/engine.js"></script>
 <script src="../../../../shared/scripts/site-nav.js"></script>
 ```
+
+The config also carries a `meta` block (vertical ID and name, assessment
+version, package names and prices, contact field names, consent records) and a
+`submission` block (endpoint and timeout). Both feed the submission payload.
+
+`meta.consents` declares each permission separately — results delivery
+(required), email marketing, SMS marketing — mapping a payload key to a form
+field. `requiresField` gates a consent on another answer; SMS marketing uses it
+so the option only appears once a mobile number is entered. Bump
+`assessmentVersion` whenever questions, weights, or formulas change.
+
+The engine mints an `assessmentSessionId` on first page view and a
+`submissionId` per completed result, records first-touch attribution once, and
+strips prohibited fields. None of that is a vertical's concern — see CLAUDE.md
+section 9 for the rules it enforces.
 
 Order matters — the config must load before the engine. Start from
 [the nails config](../verticals/beauty-wellness-fitness/nails/assessment.config.js)
@@ -199,9 +216,28 @@ than industry-level.
 - [ ] Each package tier is actually reachable from some valid set of answers.
 - [ ] Pause and resume works — reload mid-assessment and confirm the answers and
       step are restored.
-- [ ] Results are captured somewhere durable, not only in `localStorage`.
-      *(Currently unresolved platform-wide — the nails prototype loses every
-      completed assessment unless the visitor clicks the mailto link.)*
+- [ ] `submission.endpoint` set to a real capture endpoint — **a vertical must
+      not launch with this `null`**, or every completed assessment is lost.
+- [ ] **Consent wording reviewed by counsel and `data-legal-review="pending"`
+      removed.** A vertical must not launch while that attribute is present.
+- [ ] Three separate consent checkboxes, all unticked by default; only results
+      delivery is `required`.
+- [ ] "Not a condition of purchase" note present and accurate.
+- [ ] SMS consent hidden and disabled until a mobile number is entered; STOP and
+      HELP wording intact.
+- [ ] Declining both marketing consents still produces and delivers results.
+- [ ] Honeypot `website` field present and invisible.
+- [ ] No form field collects payment, credential, or health data — check the
+      console for the engine's prohibited-field error.
+- [ ] `assessmentSessionId` and `submissionId` present in a captured payload;
+      `Idempotency-Key` header matches `submissionId`.
+- [ ] First-touch attribution survives a second visit from a different campaign
+      link, and `latestTouch` reflects the completing visit.
+- [ ] A "delete my data" path calls
+      `window.CEDAssessment.clearSavedAssessmentData()`.
+- [ ] End-to-end submission confirmed against the live endpoint, including a
+      forced failure to confirm the entry lands in the retry queue.
+- [ ] `meta.packages` prices match the packages section of the page.
 
 **Mobile and accessibility**
 

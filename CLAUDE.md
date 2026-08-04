@@ -77,9 +77,10 @@ Before writing anything, check whether it already exists in `shared/` or
 If a genuine divergence is unavoidable, say so explicitly and explain the
 behavioral difference before writing the duplicate.
 
-**Known outstanding gap:** completed reviews are saved only to `localStorage`
-and are never transmitted. A prospect who finishes the assessment and closes the
-tab leaves no record. This affects every vertical and needs a capture endpoint.
+**Known outstanding gap:** the lead-capture layer is built but not connected.
+`submission.endpoint` is `null` in every vertical config, so completed
+assessments are logged to the console rather than delivered. Standing up a
+capture endpoint is the last step before a vertical can launch.
 
 ---
 
@@ -121,7 +122,39 @@ configured to*, *may be losing*, *identifies opportunities*. The break-even
 example is framed as an illustration and must stay that way.
 
 **When adding or moving a results figure, the disclaimer moves with it.** Never
-ship a number whose disclaimer was left behind.
+ship a number whose disclaimer was left behind. This includes the submission
+payload, which carries the on-page disclaimer text so the estimate cannot reach
+a CRM stripped of its context.
+
+### Consent is separated, never bundled
+
+Three independent permissions, each recorded on its own with `granted`, the
+exact statement shown, and `recordedAt`:
+
+| Record | Required | Notes |
+| --- | --- | --- |
+| `resultsDeliveryConsent` | Yes | Satisfied by email alone |
+| `emailMarketingConsent` | No | Optional |
+| `smsMarketingConsent` | No | Only offered when a mobile number is given |
+
+Rules that must not be broken:
+
+- **Never bundle them into one checkbox.** Agreeing to receive results is not
+  agreeing to marketing.
+- **Marketing consent is never a condition of anything.** Declining must still
+  deliver the results, by email. The page says so in plain language, and that
+  sentence stays.
+- **Never pre-tick a box.** Opt-in only.
+- **SMS consent is unavailable without a mobile number** — the row stays hidden
+  and the checkbox disabled until one is entered.
+- **Keep STOP/HELP language** in the SMS statement, and message-and-data-rates
+  wording where rates can apply.
+- **Store the wording, not a version number.** The engine reads each statement
+  from the DOM at submit time so the record is provably what was displayed.
+
+**All consent wording is pending legal review.** It is marked in the markup with
+`data-legal-review="pending"`. No vertical launches until counsel signs off and
+that attribute is removed.
 
 ---
 
@@ -227,3 +260,67 @@ launch, not by silently reworking unrelated markup.
   content; remove the placeholder in the same commit.
 - Keep working-tree noise out of feature commits. If unrelated changes appear,
   mention them rather than sweeping them in.
+
+---
+
+## 9. Lead data: identity, attribution, retention
+
+### Two ids, two jobs
+
+- **`assessmentSessionId`** — one `crypto.randomUUID()` per assessment on a
+  device, minted on first page view and stored with the saved state. It survives
+  pause, resume, and repeated submissions. It answers *"is this the same person
+  working through the same review?"*
+- **`submissionId`** — one UUID per genuinely new completed result. It is the
+  idempotency key.
+
+Never reuse a `submissionId` for different content, and never mint a new one for
+a retry of the same content.
+
+### Idempotency
+
+- Every POST sends `Idempotency-Key: <submissionId>`.
+- A queued submission keeps its `submissionId` for the life of the entry, so all
+  retries of one result carry one key.
+- The local content fingerprint is a *client-side* duplicate guard only. It is
+  not a substitute for server-side idempotency, because a request that times out
+  may already have been processed.
+- Changing an answer and re-finishing is a new result: new fingerprint, new
+  `submissionId`, and a legitimate second submission.
+
+### First-touch attribution is immutable
+
+- `firstTouch` (URL, referrer, UTMs, timestamp) is captured on the first page
+  view and **must never be rewritten** — not on resume, not on a later visit,
+  not by a newer campaign link. It is how a QR card or one-pager gets credit
+  weeks later.
+- `latestTouch` is captured at completion and may differ freely.
+- Both travel in every payload under `attribution`.
+- Known limit: attribution is per-device `localStorage`. A visitor who starts on
+  a phone and finishes on a laptop is two sessions.
+
+### Local retention limits
+
+Everything the platform stores lives in `localStorage` on the visitor's own
+device:
+
+- Retry queue entries expire **30 days** after being queued.
+- Delivered submissions are deleted **immediately**.
+- Permanently rejected and retry-exhausted entries are retained until they
+  expire, so nothing is silently discarded.
+- The queue is capped at **25 entries**; overflow drops the oldest and logs it.
+- Retries back off exponentially (1 min, doubling, capped at 6 hours) for at
+  most **8 attempts**.
+- `window.CEDAssessment.clearSavedAssessmentData()` removes the saved
+  assessment, the submission record, and the queue. Wire it to any
+  user-facing "delete my data" control.
+
+### Never store or transmit
+
+Payment details, card numbers, bank or routing numbers, passwords, API keys,
+tokens, other credentials, government identifiers, or sensitive health
+information. This is enforced, not just documented: the engine matches form
+field names against a prohibited pattern, logs an error, and strips them from
+the payload. Do not weaken that pattern to make a field pass — if a vertical
+seems to need such a field, it needs a different design. This matters most for
+the planned medical/dental family, where the temptation is highest.

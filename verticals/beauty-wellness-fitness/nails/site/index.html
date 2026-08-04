@@ -289,12 +289,27 @@
       </div>
 
       <form id="growthReview">
+        <!-- Bot trap. Visually hidden and skipped by keyboards and screen readers;
+             anything entered here marks the submission as automated. -->
+        <div class="hp-field" aria-hidden="true">
+          <label for="website">Website</label>
+          <input type="text" id="website" name="website" tabindex="-1" autocomplete="off">
+        </div>
+
         <div class="review-step active" data-step="1">
           <h3>Let's start with your salon.</h3>
           <p>You can pause at any time. Your answers will be saved on this device.</p>
           <label>Salon name<input name="salonName" required placeholder="Example: Polished Nail Studio"></label>
           <label>Your name<input name="ownerName" required placeholder="Owner or manager"></label>
           <label>Email<input name="email" type="email" required placeholder="you@example.com"></label>
+          <label>Mobile phone <span class="label-hint">(optional)</span><input name="mobile" type="tel" inputmode="tel" autocomplete="tel" placeholder="864-555-0134"></label>
+          <label>Preferred contact method
+            <select name="preferredContact">
+              <option value="email">Email</option>
+              <option value="text">Text</option>
+              <option value="either">Either</option>
+            </select>
+          </label>
         </div>
 
         <div class="review-step" data-step="2">
@@ -371,6 +386,30 @@
               <option>Answering calls and messages</option>
             </select>
           </label>
+
+          <!-- ================================================================
+               LEGAL REVIEW PENDING — this consent wording has not been reviewed
+               by counsel. No vertical may launch until it has. Remove the
+               data-legal-review attribute below only after sign-off.
+               ================================================================ -->
+          <div class="consent-group" data-legal-review="pending">
+            <label class="consent-field">
+              <input type="checkbox" name="consentResults" value="granted" required>
+              <span data-consent-for="consentResults">Send my assessment results and directly related follow-up to the email address above. This is required to deliver your results.</span>
+            </label>
+
+            <label class="consent-field">
+              <input type="checkbox" name="consentEmailMarketing" value="granted">
+              <span data-consent-for="consentEmailMarketing">Optional: send me occasional CED Service tips, offers, and updates by email. You can unsubscribe at any time.</span>
+            </label>
+
+            <label class="consent-field" data-consent-gate="consentSmsMarketing" hidden>
+              <input type="checkbox" name="consentSmsMarketing" value="granted" disabled>
+              <span data-consent-for="consentSmsMarketing">Optional: send me occasional offers and updates by text at the mobile number above. Message frequency varies. Message and data rates may apply. Reply STOP to opt out, HELP for help.</span>
+            </label>
+
+            <p class="consent-note">Consent to marketing messages is not a condition of purchase. Your results are delivered by email whether or not you opt in to marketing.</p>
+          </div>
         </div>
 
         <div class="review-step results-step" data-step="8">
@@ -387,6 +426,7 @@
             <p id="recommendationReason">Based on your salon size and follow-up gaps.</p>
           </div>
           <p class="results-disclaimer">This is a preliminary estimate based on your answers and is not a guarantee of revenue or results.</p>
+          <p class="submission-status" id="submissionStatus" role="status" aria-live="polite"></p>
           <a class="btn btn-primary btn-wide" href="mailto:cdavis@cedservice.com?subject=My Salon Growth Review Results">Send My Results & Next Steps</a>
         </div>
 
@@ -400,6 +440,7 @@
 
   <!-- Vertical configuration must load before the shared engine. -->
   <script src="../assessment.config.js"></script>
+  <script src="../../../../shared/assessment-engine/submission.js"></script>
   <script src="../../../../shared/assessment-engine/engine.js"></script>
   <script src="../../../../shared/scripts/site-nav.js"></script>
 </body>
