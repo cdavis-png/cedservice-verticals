@@ -39,7 +39,10 @@
 
   const DEFAULTS = {
     endpoint: null,
-    timeoutMs: 10000,
+    /* Must exceed the server's own operation budget, so the client gives the
+       server a chance to answer instead of abandoning a request that is about
+       to succeed. Ordering: challenge < database < function < client. */
+    timeoutMs: 20000,
     headers: {},
     queueKey: 'ced:assessment:queue',
     maxQueue: 25,
@@ -49,7 +52,51 @@
     retentionMs: 30 * DAY
   };
 
-  /* Transient conditions worth retrying. Every 5xx is also retryable. */
+  /* ---------- retry classification ----------
+     Status alone is not enough. HTTP 409 covers two opposite situations:
+
+       request_in_flight       — a concurrent request holds this key.
+                                 Retrying is exactly the right move.
+       idempotency_key_conflict — this key was already used for different
+                                 content. Retrying can never succeed.
+
+     Classifying both as "permanent" silently discarded completed
+     assessments, which is the failure this table exists to prevent. The
+     structured error code decides; status is only the fallback. */
+
+  const RETRYABLE_CODES = new Set([
+    'request_in_flight',        /* concurrent holder; it will clear */
+    'rate_limited',             /* by design temporary */
+    'challenge_unavailable',    /* verifier outage — never the visitor's fault */
+    'challenge_invalid',        /* token aged out; the server exempts old queued work */
+    'ingestion_failed',
+    'ingestion_timeout',
+    'not_configured',           /* deployment gap, fixable without the visitor */
+    'body_read_failed'
+  ]);
+
+  const PERMANENT_CODES = new Set([
+    'idempotency_key_conflict', /* same key, different content — unfixable by retry */
+    'challenge_rejected',       /* verified as not human */
+    'origin_required',
+    'origin_not_allowed',
+    'unsupported_version',
+    'unsupported_vertical',
+    'unsupported_media_type',
+    'payload_too_large',
+    'payload_limit_exceeded',
+    'prohibited_data',
+    'results_consent_required',
+    'consent_statement_missing',
+    'malformed_json',
+    'invalid_encoding',
+    'submitted_at_too_old',
+    'submitted_at_in_future',
+    'idempotency_key_mismatch',
+    'bir_generation_failed'
+  ]);
+
+  /* Transient statuses, used only when no code was returned. */
   const RETRYABLE_STATUS = new Set([408, 425, 429]);
 
   let idCounter = 0;
@@ -62,15 +109,25 @@
   };
 
   const isPermanent = err => {
+    const code = err && err.errorCode;
+    if (code) {
+      if (RETRYABLE_CODES.has(code)) return false;
+      if (PERMANENT_CODES.has(code)) return true;
+    }
     const status = err && err.httpStatus;
     if (!status) return false;                       /* timeouts and network drops always retry */
     if (status >= 500) return false;
     return status >= 400 && !RETRYABLE_STATUS.has(status);
   };
 
-  /* Doubling backoff, clamped. attempts=1 -> 1m, 2 -> 2m, 3 -> 4m … capped at 6h. */
-  const backoffMs = (attempts, opts) =>
-    Math.min(opts.maxRetryMs, opts.baseRetryMs * Math.pow(2, Math.max(0, attempts - 1)));
+  /* Doubling backoff, clamped. attempts=1 -> 1m, 2 -> 2m, 3 -> 4m … capped at 6h.
+     A server-provided Retry-After wins when it asks for longer: the server
+     knows when its rate-limit window resets and the client does not. */
+  const backoffMs = (attempts, opts, err) => {
+    const base = Math.min(opts.maxRetryMs, opts.baseRetryMs * Math.pow(2, Math.max(0, attempts - 1)));
+    const advised = err && Number(err.retryAfterSeconds) > 0 ? Number(err.retryAfterSeconds) * 1000 : 0;
+    return Math.min(opts.maxRetryMs, Math.max(base, advised));
+  };
 
   const readQueue = key => {
     try {
@@ -110,10 +167,12 @@
       expiresAt: new Date(now + opts.retentionMs).toISOString(),
       attempts,
       maxAttempts: opts.maxAttempts,
-      nextRetryAt: new Date(now + backoffMs(attempts, opts)).toISOString(),
+      nextRetryAt: new Date(now + backoffMs(attempts, opts, err)).toISOString(),
       lastAttemptAt: new Date(now).toISOString(),
       lastError: classify(err),
       httpStatus: (err && err.httpStatus) || null,
+      errorCode: (err && err.errorCode) || null,
+      correlationId: (err && err.correlationId) || null,
       permanent: isPermanent(err),
       exhausted: false,
       payload
@@ -149,9 +208,30 @@
       if (!response.ok) {
         const err = new Error(`Submission rejected with HTTP ${response.status}`);
         err.httpStatus = response.status;
+        /* The structured code is what decides retryability, so it has to be
+           read even on failure. A body that will not parse simply leaves the
+           status-based fallback in charge. */
+        let failure = null;
+        try { failure = await response.json(); } catch { failure = null; }
+        if (failure && failure.error) {
+          err.errorCode = failure.error.code || null;
+          err.correlationId = failure.error.correlationId || null;
+          if (Number(failure.error.retryAfterSeconds) > 0) {
+            err.retryAfterSeconds = Number(failure.error.retryAfterSeconds);
+          }
+        }
+        const header = response.headers && typeof response.headers.get === 'function'
+          ? Number(response.headers.get('retry-after')) : 0;
+        if (!err.retryAfterSeconds && Number.isFinite(header) && header > 0) {
+          err.retryAfterSeconds = header;
+        }
         throw err;
       }
-      return response;
+      /* The capture endpoint returns identifiers the engine can keep with the
+         saved state. A body that will not parse is not a delivery failure. */
+      let body = null;
+      try { body = await response.json(); } catch { body = null; }
+      return { response, body };
     } finally {
       clearTimeout(timer);
     }
@@ -172,8 +252,15 @@
     }
 
     try {
-      await postJson(payload, opts);
-      return { status: 'sent', endpoint: opts.endpoint, submissionId: payload.submissionId || null };
+      const { body } = await postJson(payload, opts);
+      return {
+        status: 'sent',
+        endpoint: opts.endpoint,
+        submissionId: payload.submissionId || null,
+        businessId: (body && body.businessId) || null,
+        identityStatus: (body && body.identityStatus) || null,
+        replayed: Boolean(body && body.replayed)
+      };
     } catch (err) {
       const entry = enqueue(opts, payload, err);
       console.warn('[CED] Submission failed; the assessment was queued locally.', classify(err), err);
@@ -181,6 +268,8 @@
         status: 'queued',
         reason: classify(err),
         httpStatus: (err && err.httpStatus) || null,
+        errorCode: (err && err.errorCode) || null,
+        correlationId: (err && err.correlationId) || null,
         permanent: entry.permanent,
         submissionId: entry.submissionId,
         nextRetryAt: entry.nextRetryAt,
@@ -232,10 +321,12 @@
         entry.attempts = attempts;
         entry.lastError = classify(err);
         entry.httpStatus = (err && err.httpStatus) || null;
+        entry.errorCode = (err && err.errorCode) || null;
+        entry.correlationId = (err && err.correlationId) || null;
         entry.permanent = isPermanent(err);
         entry.exhausted = attempts >= (entry.maxAttempts || opts.maxAttempts);
         entry.lastAttemptAt = new Date(now).toISOString();
-        entry.nextRetryAt = new Date(now + backoffMs(attempts, opts)).toISOString();
+        entry.nextRetryAt = new Date(now + backoffMs(attempts, opts, err)).toISOString();
         if (entry.exhausted) {
           console.warn('[CED] Assessment %s exhausted its retry attempts; retained until it expires.', entry.submissionId || entry.id);
         }
@@ -257,10 +348,21 @@
     return true;
   };
 
-  window.CEDSubmission = {
+  const API = {
     submitAssessment,
     retryPendingSubmissions,
     pendingSubmissions,
-    clearQueue
+    clearQueue,
+    /* Exposed for tests and for the retry-policy documentation. Changing a
+       code's classification changes whether a completed assessment survives,
+       so it is deliberately inspectable. */
+    isPermanent,
+    backoffMs,
+    RETRYABLE_CODES,
+    PERMANENT_CODES,
+    DEFAULTS
   };
+
+  if (typeof module !== 'undefined' && module.exports) module.exports = API;
+  if (typeof window !== 'undefined') window.CEDSubmission = API;
 })();

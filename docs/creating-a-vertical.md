@@ -25,9 +25,15 @@ family is mostly copy work. A new *family* needs its own assessment design.
 > vertical supplies markup, copy, and an `assessment.config.js`; it writes no
 > assessment JavaScript of its own.
 >
-> Lead capture is built and shared too, but not connected: `submission.endpoint`
-> is `null`, so completed assessments are logged to the console rather than
-> delivered. Set a real endpoint before launching any vertical.
+> Lead capture is built, shared, and hardened, but **not connected**: no
+> Supabase project exists, the migrations have never been executed, and no
+> challenge provider has been chosen. Over `file://` the endpoint resolves to
+> `null` and assessments are logged locally; over http(s) it posts to
+> `/api/assessments`.
+>
+> **No vertical can take public traffic yet.** See
+> [PRODUCTION_HARDENING.md §14](PRODUCTION_HARDENING.md#14-remaining-launch-blockers)
+> for what is outstanding.
 
 ---
 
@@ -216,8 +222,23 @@ than industry-level.
 - [ ] Each package tier is actually reachable from some valid set of answers.
 - [ ] Pause and resume works — reload mid-assessment and confirm the answers and
       step are restored.
-- [ ] `submission.endpoint` set to a real capture endpoint — **a vertical must
-      not launch with this `null`**, or every completed assessment is lost.
+- [ ] `submission.endpoint` resolves to `/api/assessments` on http(s) and stays
+      `null` on `file://` — copy the expression from the nails config rather
+      than hard-coding a URL. **A vertical must not launch with this always
+      `null`**, or every completed assessment is lost.
+- [ ] The vertical's production origin is listed in `CED_ALLOWED_ORIGINS`, or
+      every submission is rejected with 403.
+- [ ] `vertical.id` is added to the endpoint's supported-vertical allowlist in
+      [api/assessments.mjs](../api/assessments.mjs), or submissions are
+      rejected with `unsupported_vertical`.
+- [ ] No credential of any kind appears in the vertical config. Verticals
+      configure a path; the server holds the keys.
+- [ ] `submission.timeoutMs` is longer than the server's whole operation
+      budget (currently 20000ms against a 15s function limit). A client that
+      gives up first abandons requests that were about to succeed.
+- [ ] A challenge provider is configured, or the vertical is not taking public
+      traffic. See
+      [PRODUCTION_HARDENING.md](PRODUCTION_HARDENING.md#3-endpoint-threat-model).
 - [ ] **Consent wording reviewed by counsel and `data-legal-review="pending"`
       removed.** A vertical must not launch while that attribute is present.
 - [ ] Three separate consent checkboxes, all unticked by default; only results
@@ -226,7 +247,11 @@ than industry-level.
 - [ ] SMS consent hidden and disabled until a mobile number is entered; STOP and
       HELP wording intact.
 - [ ] Declining both marketing consents still produces and delivers results.
-- [ ] Honeypot `website` field present and invisible.
+- [ ] Honeypot `contactFax` field present, invisible, and `aria-hidden`. Not
+      named `website` — the identity roadmap needs that name for a real
+      business website, and a trap sharing it would turn bot noise into
+      identity evidence. Enforcement is server-side; the field only marks
+      `integrity.honeypotFilled`, and its value never travels.
 - [ ] No form field collects payment, credential, or health data — check the
       console for the engine's prohibited-field error.
 - [ ] `assessmentSessionId` and `submissionId` present in a captured payload;

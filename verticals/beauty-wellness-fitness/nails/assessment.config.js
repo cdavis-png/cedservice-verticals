@@ -52,11 +52,25 @@ window.CED_ASSESSMENT_CONFIG = {
   },
 
   /* Transport settings for shared/assessment-engine/submission.js.
-     endpoint is null until a capture endpoint exists — with no endpoint the
-     adapter logs the payload instead of sending it. */
+
+     Served over http(s), completed assessments POST to the capture endpoint.
+     Opened straight off disk (file://) there is no server to talk to, so the
+     endpoint stays null and the adapter logs the payload locally instead —
+     the documented preview mode keeps working unchanged.
+
+     No credentials appear here. The endpoint is same-origin and the Supabase
+     service role key exists only inside the Vercel Function. */
   submission: {
-    endpoint: null,
-    timeoutMs: 10000
+    endpoint: (typeof window !== 'undefined' &&
+               window.location &&
+               (window.location.protocol === 'http:' || window.location.protocol === 'https:'))
+      ? '/api/assessments'
+      : null,
+    /* Longer than the server's whole operation budget on purpose. The order
+       that must hold is challenge < database < function < client; a client
+       that gives up first abandons requests that were about to succeed and
+       turns them into avoidable retries. See docs/PRODUCTION_HARDENING.md. */
+    timeoutMs: 20000
   },
 
   /* Which answer names the business on the results screen. */

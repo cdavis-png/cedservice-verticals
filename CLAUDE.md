@@ -77,10 +77,49 @@ Before writing anything, check whether it already exists in `shared/` or
 If a genuine divergence is unavoidable, say so explicitly and explain the
 behavioral difference before writing the duplicate.
 
-**Known outstanding gap:** the lead-capture layer is built but not connected.
-`submission.endpoint` is `null` in every vertical config, so completed
-assessments are logged to the console rather than delivered. Standing up a
-capture endpoint is the last step before a vertical can launch.
+**The persistence boundary.** Completed assessments POST to `/api/assessments`
+([api/assessments.mjs](api/assessments.mjs)), which validates and hands the
+submission to one atomic Postgres function. Server code and browser code do not
+share a trust boundary:
+
+- `SUPABASE_SERVICE_ROLE_KEY`, `CED_RATE_LIMIT_SECRET`, and
+  `CED_CHALLENGE_SECRET` exist **only** in the Vercel Function environment.
+  None may appear in a vertical config, a shared script, or any file a page
+  loads, and none may be given a `NEXT_PUBLIC_` prefix.
+- Verticals configure a same-origin endpoint path and nothing else.
+- A page opened from `file://` submits nothing and logs locally, unchanged.
+
+The endpoint is public and unauthenticated because the people filling in the
+assessment have no account. It is therefore defended in layers, and each layer
+has a rule that must not be quietly relaxed:
+
+- **`Origin` is required and exact-matched.** A missing `Origin` is refused.
+  Server-to-server ingestion gets its own authenticated route; do not loosen
+  this one to accommodate it.
+- **The browser is not trusted.** The honeypot, the size limits, and the
+  challenge are all enforced server-side. The honeypot is named `contactFax`,
+  deliberately not `website` — the identity roadmap needs that name — and only
+  a boolean travels, never the value.
+- **Identity values are rejected, never truncated.** A shortened identifier is
+  a different identifier, and a different identifier links the wrong business.
+- **A visitor-supplied identifier is evidence, never a decision.** Automatic
+  linking requires a strong type *and* `verified = true` *and* a trusted
+  source. Do not add a path by which a public form produces a trusted
+  identifier.
+- **Retry classification is by error code, not HTTP status.** 409 means two
+  opposite things; treating them alike silently loses completed assessments.
+- **Never store a credential.** The prohibited-data policy catches challenge
+  tokens by name; that is why the token is stripped from the payload before
+  validation. Do not weaken the pattern to make a field pass.
+
+See [docs/PRODUCTION_HARDENING.md](docs/PRODUCTION_HARDENING.md) and
+[docs/IMPLEMENTATION_MILESTONE_1.md](docs/IMPLEMENTATION_MILESTONE_1.md).
+
+**Known outstanding gaps:** the database is not connected to a real Supabase
+project and **the migrations have never been executed**; no challenge provider
+has been chosen; and there is no surface for working the identity-resolution
+queue, so ambiguous submissions are stored safely but cannot yet be resolved by
+anyone.
 
 ---
 
@@ -299,10 +338,29 @@ a retry of the same content.
 - Known limit: attribution is per-device `localStorage`. A visitor who starts on
   a phone and finishes on a laptop is two sessions.
 
+### Server retention and erasure
+
+The Business Record is append-only, so erasure cannot mean `DELETE` —
+`timeline_events` and `audit_events` refuse it at the database. It means
+**redaction**: `redact_business_pii()` destroys direct identifiers in the
+mutable surfaces, preserves the structural record, scoring, and consent
+evidence, and writes an audit event stating exactly what changed.
+
+This depends on one invariant. **Timeline and audit payloads must never carry
+contact data.** Both tables refuse `UPDATE`, so anything personal that reaches
+them can never be removed. Check every new event payload against this before
+shipping it.
+
+Retention periods, the deletion workflow, the legal-hold rule, and the
+medical/dental restriction live in
+[docs/DATA_RETENTION_AND_REDACTION.md](docs/DATA_RETENTION_AND_REDACTION.md).
+**All of it is pending professional review, and nothing in this repository
+claims compliance with any law or regulation.** Do not add such a claim.
+
 ### Local retention limits
 
-Everything the platform stores lives in `localStorage` on the visitor's own
-device:
+Everything the platform stores on the visitor's own device lives in
+`localStorage`:
 
 - Retry queue entries expire **30 days** after being queued.
 - Delivered submissions are deleted **immediately**.
@@ -310,7 +368,11 @@ device:
   expire, so nothing is silently discarded.
 - The queue is capped at **25 entries**; overflow drops the oldest and logs it.
 - Retries back off exponentially (1 min, doubling, capped at 6 hours) for at
-  most **8 attempts**.
+  most **8 attempts**, and a server `Retry-After` may lengthen but never
+  shorten the wait.
+- The server's `CED_SUBMISSION_MAX_AGE_DAYS` must stay **at least** as long as
+  this 30-day window. A shorter server window permanently rejects assessments
+  the browser is still faithfully retrying.
 - `window.CEDAssessment.clearSavedAssessmentData()` removes the saved
   assessment, the submission record, and the queue. Wire it to any
   user-facing "delete my data" control.

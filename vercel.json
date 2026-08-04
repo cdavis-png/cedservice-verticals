@@ -1,0 +1,25 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "api/assessments.mjs": {
+      "maxDuration": 15,
+      "memory": 512
+    }
+  },
+  "regions": ["iad1"],
+  "headers": [
+    {
+      "source": "/api/(.*)",
+      "headers": [
+        { "key": "Cache-Control", "value": "no-store" },
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "Referrer-Policy", "value": "no-referrer" }
+      ]
+    }
+  ],
+  "comments": {
+    "maxDuration": "The function budget must sit between the database timeout (CED_DB_TIMEOUT_MS, 6s) and the browser timeout (assessment.config.js submission.timeoutMs, 20s). Raising CED_DB_TIMEOUT_MS above this value would let the platform kill the request before the endpoint can answer.",
+    "regions": "Pin the function to the same region as the Supabase project. A function and a database on different continents add 100-300ms to every query INSIDE the ingestion transaction. iad1 is a placeholder: change it to match the region chosen in docs/SUPABASE_SETUP.md.",
+    "scope": "This file configures the deployment. Nothing here deploys anything, and no project is connected yet."
+  }
+}

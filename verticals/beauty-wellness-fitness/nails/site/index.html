@@ -290,10 +290,15 @@
 
       <form id="growthReview">
         <!-- Bot trap. Visually hidden and skipped by keyboards and screen readers;
-             anything entered here marks the submission as automated. -->
+             anything entered here marks the submission as automated. The value
+             is never transmitted — only a boolean.
+
+             Deliberately NOT named "website": the identity roadmap collects a
+             real business website, and a trap sharing that name would turn bot
+             noise into identity evidence once that field ships. -->
         <div class="hp-field" aria-hidden="true">
-          <label for="website">Website</label>
-          <input type="text" id="website" name="website" tabindex="-1" autocomplete="off">
+          <label for="contactFax">Fax</label>
+          <input type="text" id="contactFax" name="contactFax" tabindex="-1" autocomplete="off">
         </div>
 
         <div class="review-step active" data-step="1">

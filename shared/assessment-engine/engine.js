@@ -25,7 +25,11 @@
 
   /* v2: session/submission identity, split consent records, and
      first/latest-touch attribution replaced the flat v1 shape. */
-  const PAYLOAD_SCHEMA_VERSION = 2;
+  /* 3 adds the `integrity` envelope (honeypot indicator, challenge token).
+     The endpoint still accepts 2 during the migration window so assessments
+     already queued by an older page are not lost — see
+     docs/PRODUCTION_HARDENING.md, "Version compatibility". */
+  const PAYLOAD_SCHEMA_VERSION = 3;
 
   /* Shared markup contract. Every vertical's index.html uses these hooks. */
   const SELECTORS = {
@@ -52,8 +56,19 @@
     status: 'submissionStatus'
   };
 
-  /* Bot trap. Real users never see or fill this; anything in it is a bot. */
-  const HONEYPOT_FIELD = 'website';
+  /* Bot trap. Real users never see or fill this; anything in it is a bot.
+
+     Named `contactFax` rather than `website`: the identity roadmap collects a
+     real business website, and a trap sharing that name would turn bot noise
+     into identity evidence the moment the legitimate field ships.
+
+     The value is never transmitted. Only a boolean reaches the server, so the
+     trap cannot become a channel for smuggling data into storage. */
+  const HONEYPOT_FIELD = 'contactFax';
+
+  /* The name of the hidden challenge input, when a provider is wired up. No
+     provider is configured yet; the field is optional and absent today. */
+  const CHALLENGE_FIELD = 'cedChallengeToken';
 
   const UTM_KEYS = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content'];
 
@@ -344,6 +359,7 @@
          separately), and anything matching the prohibited-data policy. */
       const answers = Object.fromEntries(new FormData(form).entries());
       delete answers[HONEYPOT_FIELD];
+      delete answers[CHALLENGE_FIELD];
       consentFields.forEach(name => { delete answers[name]; });
       prohibited.forEach(name => { delete answers[name]; });
 
@@ -368,6 +384,14 @@
         },
         contact,
         consent: consentRecords(now),
+        /* Anti-abuse envelope. The honeypot's VALUE never travels — only
+           whether it was touched — and the server, not this file, decides
+           what that means. A page that has been tampered with to remove this
+           block simply looks like an older schema version to the endpoint. */
+        integrity: {
+          honeypotFilled: Boolean(read.val(HONEYPOT_FIELD)),
+          challengeToken: read.val(CHALLENGE_FIELD) || null
+        },
         answers,
         results: {
           opportunity: Math.round(results.opportunity * 100) / 100,
@@ -401,22 +425,28 @@
       }
     };
 
-    const recordSubmission = (signature, submissionId, status) => {
+    /* businessId, when the capture endpoint returns one, is kept beside the
+       saved state so a later reassessment from this browser can be recognised
+       as the same business. It is an opaque identifier, never a credential. */
+    const recordSubmission = (signature, submissionId, status, extra = {}) => {
       localStorage.setItem(submissionKey, JSON.stringify({
-        signature, submissionId, status, at: nowIso()
+        signature, submissionId, status, at: nowIso(),
+        businessId: extra.businessId || null,
+        identityStatus: extra.identityStatus || null
       }));
     };
 
     const submit = async results => {
       if (sending) return;
 
-      /* Honeypot: render results as normal, send nothing, say nothing. */
-      if (read.val(HONEYPOT_FIELD)) {
-        console.warn('[CED] Honeypot field filled — submission skipped.');
-        return;
-      }
-
+      /* The honeypot is NOT enforced here. A bot that posts directly never
+         runs this code, so a browser-side check protects nothing; the
+         indicator travels in the payload and the server decides. Results
+         still render either way — the visitor's screen is unaffected. */
       const payload = buildPayload(results);
+      if (payload.integrity.honeypotFilled) {
+        console.warn('[CED] Honeypot field filled — the server will refuse this submission.');
+      }
       const signature = signatureOf({ answers: payload.answers, results: payload.results });
       const previous = lastSubmission();
 
@@ -442,7 +472,7 @@
       setStatus('sending');
       try {
         const outcome = await adapter.submitAssessment(payload, submissionOptions);
-        recordSubmission(signature, payload.submissionId, outcome.status);
+        recordSubmission(signature, payload.submissionId, outcome.status, outcome);
         setStatus(outcome.status === 'sent' ? 'sent' : outcome.status === 'queued' ? 'queued' : 'ready');
       } finally {
         sending = false;
