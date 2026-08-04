@@ -1,11 +1,20 @@
 # CED Service Salon Growth Website Prototype
 
-This is a self-contained, mobile-responsive prototype for the Nail Salon vertical.
+This is a mobile-responsive prototype for the Nail Salon vertical. It draws its
+design tokens and assessment behavior from the shared platform.
 
 ## Files
 - `index.html` — complete landing page and self-paced assessment
-- `styles.css` — responsive CED Service visual system
-- `script.js` — navigation, assessment, pause/resume, scoring, and recommendation logic
+- `styles.css` — nail-salon styles; imports the shared design tokens
+
+## Loaded from outside this folder
+- `../assessment.config.js` — nail-specific questions, scoring, and packages
+- `../../../../shared/assessment-engine/engine.js` — generic assessment behavior
+- `../../../../shared/scripts/site-nav.js` — mobile header navigation
+- `../../../../design-system/standards/tokens.css` — shared design tokens
+
+Because these live above this folder, deploy from the repository root rather
+than from `site/` alone.
 
 ## Preview locally
 Open `index.html` directly in a browser, or run:

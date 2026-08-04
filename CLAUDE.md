@@ -77,11 +77,9 @@ Before writing anything, check whether it already exists in `shared/` or
 If a genuine divergence is unavoidable, say so explicitly and explain the
 behavioral difference before writing the duplicate.
 
-**Known outstanding gap:** the assessment engine in
-[nails/site/script.js](verticals/beauty-wellness-fitness/nails/site/script.js)
-has not yet been extracted to `shared/assessment-engine/`. Until it is, a second
-vertical cannot be created without duplicating it. Extract it before adding
-vertical number two.
+**Known outstanding gap:** completed reviews are saved only to `localStorage`
+and are never transmitted. A prospect who finishes the assessment and closes the
+tab leaves no record. This affects every vertical and needs a capture endpoint.
 
 ---
 

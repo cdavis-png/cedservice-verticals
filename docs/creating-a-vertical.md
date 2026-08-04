@@ -20,16 +20,14 @@ businesses all book time slots, suffer no-shows, and depend on rebooking, so
 their assessments differ mostly in vocabulary. A new vertical inside an existing
 family is mostly copy work. A new *family* needs its own assessment design.
 
-> **Current status — read this before cloning.**
-> The shared assessment engine does **not** exist yet. Scoring, opportunity
-> math, step navigation, and localStorage resume are still hardcoded in
-> [nails/site/script.js](../verticals/beauty-wellness-fitness/nails/site/script.js).
-> Design tokens *have* been extracted and are shared.
+> **Current status.**
+> Design tokens and the assessment engine are both extracted and shared. A new
+> vertical supplies markup, copy, and an `assessment.config.js`; it writes no
+> assessment JavaScript of its own.
 >
-> Cloning a vertical today would therefore duplicate roughly 140 lines of
-> scoring logic, which section 3 of CLAUDE.md prohibits. **Extract
-> `shared/assessment-engine/` first.** Step 4 below describes the intended
-> workflow once it exists.
+> Still outstanding platform-wide: completed reviews are stored only in
+> `localStorage` and are never sent anywhere. Every vertical inherits this
+> until a capture endpoint exists.
 
 ---
 
@@ -40,7 +38,7 @@ A vertical lives under `verticals/<family>/<industry>/`:
 ```
 verticals/<family>/<industry>/
 ├── README.md                    what this vertical is, status, live URL
-├── assessment.config.json       questions, weights, packages, copy  (planned)
+├── assessment.config.js         questions, weights, packages, copy
 └── site/
     ├── index.html               landing page + assessment markup
     ├── styles.css               vertical-specific styles only
@@ -78,10 +76,10 @@ Anything a second vertical would also need.
 | `design-system/layouts/` | Shell, grids, section rhythm |
 | `design-system/animations/` | Ambient effects, transitions, reduced-motion rules |
 | `design-system/accessibility/` | Focus styles, skip links, screen-reader utilities |
-| `shared/assessment-engine/` | Step navigation, validation, resume, scoring, recommendation *(planned)* |
+| `shared/assessment-engine/` | Step navigation, validation, resume, scoring, recommendation |
 | `shared/components/` | Markup partials shared across verticals |
 | `shared/reports/` | Results rendering and formatting |
-| `shared/scripts/` | Utilities: formatting, storage, analytics |
+| `shared/scripts/` | Site chrome and utilities: header nav, formatting, analytics |
 | `ai/prompts/`, `ai/scoring/` | Prompt templates and scoring rules |
 
 Shared code must be industry-agnostic. If a function mentions "salon,"
@@ -147,14 +145,26 @@ a comment explaining why.
 
 ### 4. Configure the assessment — do not rewrite it
 
-*This is the step that depends on the pending engine extraction.*
+The vertical supplies an `assessment.config.js` describing its question
+inventory, scoring dimensions, opportunity formulas, priority copy, and package
+thresholds. The page loads that config and then the shared engine, which reads
+`window.CED_ASSESSMENT_CONFIG` and wires everything up. No assessment
+JavaScript is written in the vertical.
 
-Once `shared/assessment-engine/` exists, the vertical supplies an
-`assessment.config.json` describing its questions, weights, opportunity
-coefficients, package tiers, and priority copy. The page loads the shared engine
-and hands it that config. No scoring math is written in the vertical.
+```html
+<script src="../assessment.config.js"></script>
+<script src="../../../../shared/assessment-engine/engine.js"></script>
+<script src="../../../../shared/scripts/site-nav.js"></script>
+```
 
-Until then, do not clone `script.js`. Extract the engine first.
+Order matters — the config must load before the engine. Start from
+[the nails config](../verticals/beauty-wellness-fitness/nails/assessment.config.js)
+and replace the numbers and copy; do not edit the engine to accommodate a
+vertical.
+
+The engine warns in the console when `fields` names an input the markup does
+not contain, which is the usual symptom of a half-renamed clone. Keep that list
+in step with the form.
 
 ### 5. Write the playbook
 
