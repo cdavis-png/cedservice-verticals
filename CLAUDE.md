@@ -286,10 +286,14 @@ launch, not by silently reworking unrelated markup.
 - **Never commit or push unless explicitly asked.** Staging, committing, and
   pushing are separate decisions from writing code.
 - One logical change per commit. Do not mix a token extraction with copy edits.
-- Imperative mood, under 72 characters, prefixed with the top-level area:
-  `design-system:`, `shared:`, `verticals:`, `playbooks:`, `marketing:`,
-  `ai:`, `automations:`, `deployment:`, `docs:`.
-  Example: `design-system: extract shared color tokens`
+- Imperative mood, under 72 characters, describing the change plainly.
+  Example: `Extract reusable assessment engine and nail salon config`
+- A top-level prefix (`design-system:`, `shared:`, `verticals:`, `docs:`) is
+  **permitted but not required**, and only where it genuinely disambiguates a
+  subject that would otherwise be unclear. Do not add one by default.
+  *Why:* every commit in this repository's history uses a plain imperative
+  subject with no prefix. A convention the project does not actually follow is
+  worse than no convention, because it makes the guidance untrustworthy.
 - Explain *why* in the body when the reason is not obvious from the diff.
 - Never commit secrets, `.env` files, API keys, or real client data.
 - Never commit generated or deployment artifacts — see [.gitignore](.gitignore).
