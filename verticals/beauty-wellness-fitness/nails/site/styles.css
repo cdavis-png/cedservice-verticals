@@ -1,18 +1,7 @@
-:root {
-  --bg: #060916;
-  --bg-soft: #0b1023;
-  --panel: rgba(16, 23, 51, .78);
-  --panel-strong: #111a36;
-  --text: #f7f9ff;
-  --muted: #aeb8d6;
-  --line: rgba(152, 170, 223, .18);
-  --blue: #2778ff;
-  --cyan: #20d4ff;
-  --purple: #7b61ff;
-  --green: #55e6b1;
-  --shadow: 0 30px 90px rgba(0, 0, 0, .45);
-  --radius: 24px;
-}
+/* Shared CED Service design tokens. Must stay the first rule in this file.
+   Do not redefine these tokens here — edit design-system/standards/tokens.css. */
+@import url("../../../../design-system/standards/tokens.css");
+
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; }
 body {

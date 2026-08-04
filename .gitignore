@@ -1,0 +1,107 @@
+# ---------- Operating systems ----------
+
+# macOS
+.DS_Store
+.DS_Store?
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.TemporaryItems
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+Icon?
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+*.stackdump
+
+# ---------- Editors ----------
+
+# VS Code (keep shared workspace settings, ignore personal state)
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/tasks.json
+.history/
+*.code-workspace
+
+# JetBrains
+.idea/
+*.iml
+
+# Vim / Emacs / temp editor files
+*.swp
+*.swo
+*~
+\#*\#
+.\#*
+
+# ---------- Node ----------
+node_modules/
+jspm_packages/
+.npm/
+.yarn/*
+!.yarn/patches
+!.yarn/releases
+!.yarn/plugins
+!.yarn/versions
+.pnp.*
+.pnpm-store/
+.eslintcache
+.stylelintcache
+*.tsbuildinfo
+
+# ---------- Environment / secrets ----------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.json
+credentials.json
+
+# ---------- Logs ----------
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+report.*.json
+
+# ---------- Build & deployment artifacts ----------
+dist/
+build/
+out/
+.next/
+.nuxt/
+.svelte-kit/
+.cache/
+.parcel-cache/
+.turbo/
+.vercel
+.netlify
+.serverless/
+.wrangler/
+coverage/
+.nyc_output/
+
+# ---------- Archives & local scratch ----------
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+.scratch/
+tmp/
+temp/
