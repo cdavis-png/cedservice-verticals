@@ -26,10 +26,15 @@
   /* v2: session/submission identity, split consent records, and
      first/latest-touch attribution replaced the flat v1 shape. */
   /* 3 adds the `integrity` envelope (honeypot indicator, challenge token).
-     The endpoint still accepts 2 during the migration window so assessments
-     already queued by an older page are not lost — see
+     4 adds `intelligence` (the nine deterministic dimensions) and `branching`
+     (which questions were shown, which were skipped, and why).
+     5 adds `assessmentStage` (which stage of the progressive review this
+     submission completed, and which submission it continues) and the visible
+     opportunity RANGE alongside the point figure.
+     The endpoint still accepts older versions during the migration window so
+     assessments already queued by an older page are not lost — see
      docs/PRODUCTION_HARDENING.md, "Version compatibility". */
-  const PAYLOAD_SCHEMA_VERSION = 3;
+  const PAYLOAD_SCHEMA_VERSION = 5;
 
   /* Shared markup contract. Every vertical's index.html uses these hooks. */
   const SELECTORS = {
@@ -43,17 +48,39 @@
     prev: '#prevStep',
     progressText: '#progressText',
     progressBar: '#progressBar',
-    disclaimer: '.results-disclaimer'
+    disclaimer: '.results-disclaimer',
+    /* Wraps one conditional question. The engine hides, disables, and clears
+       everything inside; the vertical decides when via config.branching. */
+    question: '[data-question]',
+    /* Polite announcements when the remaining-question count changes, so a
+       screen-reader user is not silently given a different form. */
+    liveRegion: '#reviewLive',
+
+    /* ---- progressive profiling ----
+       A step declares which stage it belongs to. A step that also carries
+       data-results-for is that stage's results screen and always terminates
+       it, however the branching went. */
+    stageLabel: '[data-stage-label]',
+    stageAction: '[data-stage-action]',
+    stageNote: '[data-stage-note]',
+    /* A consent whose availability depends on another answer. Owned by
+       syncConsentGates, never by stage or branch logic. */
+    consentGate: '[data-consent-gate]'
   };
 
-  const RESULT_IDS = {
-    subject: 'resultSalon',
-    score: 'growthScore',
-    opportunity: 'monthlyOpportunity',
-    packageLabel: 'recommendedPackage',
-    packageReason: 'recommendationReason',
-    priorities: 'priorityList',
-    status: 'submissionStatus'
+  /* Result hooks are looked up INSIDE the results step being painted, because
+     there is one results screen per stage and an id may only appear once in a
+     document. */
+  const RESULT_HOOKS = {
+    subject: '[data-result="subject"]',
+    score: '[data-result="score"]',
+    opportunity: '[data-result="opportunity"]',
+    packageLabel: '[data-result="package-label"]',
+    packageReason: '[data-result="package-reason"]',
+    priorities: '[data-result="priorities"]',
+    status: '[data-result="status"]',
+    assumptions: '[data-result="assumptions"]',
+    evidenceNote: '[data-result="evidence-note"]'
   };
 
   /* Bot trap. Real users never see or fill this; anything in it is a bot.
@@ -91,6 +118,40 @@
     ready: 'Results ready.'
   };
 
+  /* Why a later stage opened. Deliberately not called another assessment —
+     it is the same review, continued. */
+  const STAGE_NOTE_COPY = {
+    see_recommended_system: 'To confirm the best fit and setup path, answer a few final questions.',
+    improve_recommendation: 'A few more answers let us narrow the estimate and confirm the recommendation.',
+    requested: 'A few more answers let us confirm the best fit and setup path.'
+  };
+
+  /* COMPLIANCE. Every figure this platform shows is a diagnostic estimate, and
+     capacity evidence may only ever REDUCE one. Neither sentence below may be
+     reworded into anything that suggests we will supply demand — see
+     CLAUDE.md section 4. */
+  const OPPORTUNITY_COPY = {
+    capacityKnown: perMonth =>
+      `Based on the answers you gave, and held to about ${perMonth} additional appointments a month — the amount you told us you could comfortably take on. Recovering appointments you had already booked is not held to that limit.`,
+    /* "held to about 0 additional appointments" is arithmetically right and
+       reads like a mistake. A salon with no room is not being told it has no
+       opportunity; it is being told which part of it is reachable today. */
+    capacityNone:
+      'Based on the answers you gave. You told us you have no room for additional appointments right now, so this covers only what could be recovered from appointments you had already booked.',
+    capacityUnsure:
+      'Based on the answers you gave. You told us you are not sure how much additional work you could take on, so this range is not limited by available capacity. What you can actually take on could change it.',
+    capacityUnknown:
+      'Based on the answers you gave. This range is not limited by available capacity. What you can actually take on could change it.'
+  };
+
+  const CONFIDENCE_WORD = { low: 'lower', medium: 'moderate', high: 'higher' };
+
+  const EVIDENCE_NOTE = {
+    preliminary: word =>
+      `This is a preliminary review of how your salon runs today. Confidence in the estimate is ${word}. We have not yet asked about fit, timing, budget, or setup, so the recommended starting point may change.`,
+    full: word => `Confidence in the estimate is ${word}. Your review is complete.`
+  };
+
   const DEFAULT_PRIORITY_COUNT = 3;
 
   const nowIso = () => new Date().toISOString();
@@ -114,13 +175,21 @@
   const formatCurrency = amount =>
     amount.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
 
-  const setText = (id, value) => {
-    const el = document.getElementById(id);
-    if (el) el.textContent = value;
+  /* A range, not a promise. Collapses to one figure only when the two ends
+     round to the same dollar amount. */
+  const formatRange = ({ low, high }) => {
+    const a = formatCurrency(low);
+    const b = formatCurrency(high);
+    return a === b ? a : `${a} – ${b}`;
   };
 
   const textOf = selector => {
     const el = document.querySelector(selector);
+    return el ? el.textContent.trim() : null;
+  };
+
+  const textIn = (root, selector) => {
+    const el = root && root.querySelector(selector);
     return el ? el.textContent.trim() : null;
   };
 
@@ -180,7 +249,31 @@
     if (!modal || !form) return;
 
     const steps = [...modal.querySelectorAll(SELECTORS.step)];
-    const lastStep = steps.length;
+
+    /* ---------- stages ----------
+       A step's data-stage says which stage it belongs to; a step's
+       data-results-for marks it as that stage's results screen. A vertical
+       that declares neither is a single-stage review and behaves exactly as
+       it did before progressive profiling. */
+    const stepNumberOf = node => Number(node.dataset.step);
+    const stageOf = node => Number(node.dataset.stage || 1);
+
+    const stages = [...new Set(steps.map(stageOf))].sort((a, b) => a - b);
+    const firstStage = stages[0];
+    const finalStage = stages[stages.length - 1];
+
+    const stepNodeOf = number => steps.find(node => stepNumberOf(node) === number) || null;
+    const stepsInStage = stage => steps.filter(node => stageOf(node) === stage);
+    const resultsNodeOf = stage =>
+      steps.find(node => Number(node.dataset.resultsFor) === stage) || null;
+    /* A stage with no declared results screen ends on its last step. */
+    const resultsStepOf = stage => {
+      const node = resultsNodeOf(stage);
+      if (node) return stepNumberOf(node);
+      const inStage = stepsInStage(stage);
+      return inStage.length ? stepNumberOf(inStage[inStage.length - 1]) : null;
+    };
+
     const startButtons = document.querySelectorAll(SELECTORS.open);
     const closeButton = modal.querySelector(SELECTORS.close);
     const backdrop = modal.querySelector(SELECTORS.backdrop);
@@ -195,8 +288,23 @@
     const submissionKey = `${config.storageKey}:submission`;
 
     let currentStep = 1;
+    let currentStage = firstStage;
+    /* The furthest stage this device has opened. Steps beyond it are disabled
+       so their fields never reach a payload; steps at or below it stay enabled
+       even when the visitor navigates back, so no answer is ever lost by
+       moving between stages. */
+    let maxStageReached = firstStage;
     let sending = false;
     let session = null;
+
+    /* Timestamps and links between the stages, persisted with the answers. */
+    let stageState = {
+      stage1CompletedAt: null,
+      stage2StartedAt: null,
+      stage2CompletedAt: null,
+      stage1SubmissionId: null,
+      trigger: null
+    };
 
     verifyFields(config, form);
 
@@ -205,10 +313,19 @@
       console.error(`[CED] Prohibited field(s) present and excluded from storage and submission — ${prohibited.join(', ')}. This platform must not collect payment, credential, or sensitive health data.`);
     }
 
-    /* The only way config functions read answers. */
+    /* The only way config functions read answers.
+
+       A disabled control reads as empty, which keeps `read` in step with
+       FormData and therefore with the payload. Without this a question the
+       visitor was never shown would still hand its default value to scoring,
+       and "not asked" would be indistinguishable from "chose the default". */
+    const readable = name => {
+      const field = form.elements[name];
+      return field && !field.disabled ? field : null;
+    };
     const read = {
-      num: name => Number(form.elements[name]?.value || 0),
-      val: name => form.elements[name]?.value || ''
+      num: name => Number(readable(name)?.value || 0),
+      val: name => readable(name)?.value || ''
     };
 
     /* ---------- session identity and first-touch attribution ---------- */
@@ -244,14 +361,27 @@
       }));
     };
 
+    /* FormData omits disabled controls, which is exactly right: a branched-away
+       answer has been cleared, and a stage the visitor has not opened was never
+       asked. Nothing needs merging forward, because availability is keyed to
+       maxStageReached and that never decreases — once a field is enabled it
+       stays enabled, so navigating back to Stage 1 cannot lose Stage 2 work. */
     const saveState = () => {
       const data = Object.fromEntries(new FormData(form).entries());
-      localStorage.setItem(config.storageKey, JSON.stringify({ data, currentStep, session }));
+      localStorage.setItem(config.storageKey, JSON.stringify({
+        data, currentStep, currentStage, maxStageReached, stageState, session
+      }));
     };
 
     const loadState = () => {
       const saved = readStoredState();
       if (!saved.data && !saved.currentStep) return;
+      maxStageReached = Math.min(Math.max(Number(saved.maxStageReached) || firstStage, firstStage), finalStage);
+      currentStage = Math.min(Math.max(Number(saved.currentStage) || firstStage, firstStage), maxStageReached);
+      stageState = { ...stageState, ...(saved.stageState || {}) };
+      /* Values are restored before anything is disabled, so a stage the
+         visitor has opened comes back intact. */
+      syncStageAvailability();
       Object.entries(saved.data || {}).forEach(([key, value]) => {
         const field = form.elements[key];
         if (!field) return;
@@ -259,7 +389,8 @@
         if (field.type === 'checkbox') field.checked = true;
         else field.value = value;
       });
-      currentStep = Math.min(Math.max(Number(saved.currentStep) || 1, 1), lastStep);
+      const last = resultsStepOf(currentStage) || steps.length;
+      currentStep = Math.min(Math.max(Number(saved.currentStep) || 1, 1), last);
     };
 
     /* ---------- consent ---------- */
@@ -298,25 +429,279 @@
       return records;
     };
 
+    /* ---------- branching ----------
+       Generic and config-driven. The engine knows how to hide a question; it
+       knows nothing about which questions a nail salon should see.
+
+       Hiding disables the inputs, which is what actually removes them from
+       FormData and from constraint validation — `hidden` alone would leave a
+       required field blocking submission from a step nobody can see.
+
+       A hidden answer is CLEARED, not retained. Keeping it would let a
+       question the visitor can no longer see go on feeding scoring, and a
+       later branch change could resurrect an answer to a question they were
+       never really asked. Every clear is recorded so the report can tell
+       "never applicable" from "answered then withdrawn". */
+
+    const branching = config.branching || {};
+    const questionNodes = [...form.querySelectorAll(SELECTORS.question)];
+    const liveRegion = document.querySelector(SELECTORS.liveRegion);
+
+    /* Fields cleared because their question stopped applying. Reported in the
+       payload; never silently discarded. */
+    const staleCleared = new Map();
+
+    const inputsIn = node => [...node.querySelectorAll('input, select, textarea')];
+
+    const questionVisible = node => {
+      const name = node.dataset.question;
+      const rule = branching.questions && branching.questions[name];
+      if (typeof rule !== 'function') return true;
+      try {
+        return Boolean(rule(read));
+      } catch (err) {
+        /* A broken predicate must not strand the visitor on a blank step. */
+        console.error(`[CED] branching predicate for "${name}" threw; showing the question.`, err);
+        return true;
+      }
+    };
+
+    const stepVisible = stepNumber => {
+      const rule = branching.steps && branching.steps[stepNumber];
+      if (typeof rule === 'function') {
+        try {
+          if (!rule(read)) return false;
+        } catch (err) {
+          console.error(`[CED] branching predicate for step ${stepNumber} threw; showing it.`, err);
+          return true;
+        }
+      }
+      /* A step whose every question branched away is an empty step. Skip it
+         rather than showing a heading with nothing under it.
+
+         "Empty" means no unconditional content AND no visible conditional
+         question. A step mixing the two is never empty, which is the common
+         case and was worth getting wrong once to find. */
+      const node = stepNodeOf(stepNumber);
+      if (!node) return true;
+      const questions = [...node.querySelectorAll(SELECTORS.question)];
+      if (!questions.length) return true;
+      const hasUnconditional = [...node.querySelectorAll('input, select, textarea')]
+        .some(input => !input.closest(SELECTORS.question));
+      if (hasUnconditional) return true;
+      return questions.some(questionVisible);
+    };
+
+    let visibleSteps = [];
+
+    /* A field belonging to a stage the visitor has not opened yet is disabled,
+       so it is absent from FormData and therefore from the payload. A Stage 1
+       submission carries Stage 1 answers and nothing else — an empty string
+       for a question nobody was shown is not an answer, and storing one would
+       make "not asked" indistinguishable from "left blank".
+
+       Availability is by maxStageReached, not by currentStage: navigating BACK
+       from Stage 2 must never disable answers already given, or the next save
+       would drop them. */
+    const stageAvailable = node => {
+      const step = node.closest(SELECTORS.step);
+      return !step || stageOf(step) <= maxStageReached;
+    };
+
+    /* Unconditional, ungated fields only. A field inside a [data-question] is
+       owned by the branching pass below, which applies both rules at once; a
+       field inside a [data-consent-gate] is owned by syncConsentGates, and
+       re-enabling it here would offer SMS consent with no mobile number. */
+    const syncStageAvailability = () => {
+      steps.forEach(node => {
+        const available = stageOf(node) <= maxStageReached;
+        inputsIn(node).forEach(input => {
+          if (input.closest(SELECTORS.question)) return;
+          if (available && input.closest(SELECTORS.consentGate)) return;
+          input.disabled = !available;
+        });
+      });
+    };
+
+    /* Recomputes visibility from the current answers. Runs on every input, on
+       resume, and before navigation — so the visible set can never lag behind
+       the answer that changed it. */
+    const syncBranching = () => {
+      syncStageAvailability();
+      questionNodes.forEach(node => {
+        const available = stageAvailable(node);
+        const show = questionVisible(node) && available;
+        node.hidden = !show;
+        inputsIn(node).forEach(input => {
+          input.disabled = !show;
+          /* A question in a stage that has not opened yet was never asked, so
+             there is nothing to clear and nothing stale to report. */
+          if (show || !available) return;
+          const hadValue = input.type === 'checkbox' || input.type === 'radio'
+            ? input.checked
+            : String(input.value || '').trim() !== '';
+          if (!hadValue) return;
+          staleCleared.set(input.name, {
+            field: input.name,
+            clearedAt: nowIso(),
+            reason: 'question_no_longer_applies'
+          });
+          if (input.type === 'checkbox' || input.type === 'radio') input.checked = false;
+          else input.value = '';
+        });
+        /* A question that came back is no longer stale. */
+        if (show) inputsIn(node).forEach(input => staleCleared.delete(input.name));
+      });
+
+      /* Only the current stage is navigable. Its results screen always
+         terminates it, however the branching went. */
+      const stageLast = resultsStepOf(currentStage);
+      visibleSteps = stepsInStage(currentStage)
+        .map(stepNumberOf)
+        .filter(n => n === stageLast || stepVisible(n));
+      if (stageLast !== null && !visibleSteps.includes(stageLast)) visibleSteps.push(stageLast);
+      visibleSteps.sort((a, b) => a - b);
+    };
+
+    /* A field on a step that branched away was not shown either, even though
+       nothing about the field itself is conditional. Reporting it as visible
+       makes the report call it unanswered when it was never applicable, and
+       those mean opposite things.
+
+       Computed from stepVisible rather than from visibleSteps, because
+       visibleSteps covers only the current stage and a completed earlier stage
+       is still perfectly visible. */
+    const branchedAwaySteps = () => new Set(
+      steps.map(stepNumberOf).filter(n => !stepVisible(n)));
+
+    /* Questions that did not apply on this path. A question on a branched-away
+       step counts, for the same reason. Questions in a stage the visitor never
+       opened do NOT: they were not skipped, they were not yet offered. */
+    const skippedQuestionNames = () => {
+      const hiddenSteps = branchedAwaySteps();
+      return questionNodes
+        .filter(node => stageAvailable(node))
+        .filter(node => {
+          const step = node.closest(SELECTORS.step);
+          return node.hidden || (step && hiddenSteps.has(stepNumberOf(step)));
+        })
+        .map(node => node.dataset.question);
+    };
+
+    /* Which stage a field belongs to. A field outside every step — the bot
+       trap — belongs to none and is never stage-filtered. */
+    const stageOfField = el => {
+      const step = el && el.closest ? el.closest(SELECTORS.step) : null;
+      return step ? stageOf(step) : null;
+    };
+
+    /* A Stage N submission carries Stage N answers, by construction rather
+       than by accident. Once a later stage has been opened its fields are
+       enabled, and without this they would leak backwards into an earlier
+       stage that is re-finished — changing what that stage claimed, and
+       making an unchanged result look like a new one. */
+    const withinStage = (el, stage) => {
+      const owner = stageOfField(el);
+      return owner === null || owner <= stage;
+    };
+
+    const visibleFieldNames = (stage = finalStage) => {
+      const names = [];
+      const hiddenSteps = branchedAwaySteps();
+      const onHiddenStep = el => {
+        const step = el.closest(SELECTORS.step);
+        return Boolean(step && hiddenSteps.has(stepNumberOf(step)));
+      };
+
+      questionNodes.forEach(node => {
+        if (node.hidden || onHiddenStep(node) || !withinStage(node, stage)) return;
+        inputsIn(node).forEach(input => { if (input.name) names.push(input.name); });
+      });
+      /* Fields not wrapped in a [data-question] are unconditional. */
+      [...form.elements].forEach(el => {
+        if (!el.name || el.disabled) return;
+        if (el.closest(SELECTORS.question)) return;
+        if (onHiddenStep(el) || !withinStage(el, stage)) return;
+        if (!names.includes(el.name)) names.push(el.name);
+      });
+      return names;
+    };
+
     /* ---------- steps ---------- */
 
+    let announcedTotal = null;
+    const stageLabelNodes = [...modal.querySelectorAll(SELECTORS.stageLabel)];
+
+    const stageNameOf = stage => {
+      const node = stepsInStage(stage)[0];
+      return (node && node.dataset.stageName) || null;
+    };
+
     const showStep = n => {
-      steps.forEach(step => step.classList.toggle('active', Number(step.dataset.step) === n));
-      progressText.textContent = `Step ${n} of ${lastStep}`;
-      progressBar.style.width = `${(n / lastStep) * 100}%`;
-      prevButton.style.visibility = n === 1 ? 'hidden' : 'visible';
-      nextButton.style.display = n === lastStep ? 'none' : 'inline-flex';
-      nextButton.textContent = n === lastStep - 1 ? LABELS.finish : LABELS.continue;
-      currentStep = n;
+      syncBranching();
+      /* Landing on a step that has branched away — by resume or by a changed
+         answer — snaps to the nearest visible step at or before it, never
+         forward past a question the visitor has not seen. */
+      let target = n;
+      if (!visibleSteps.includes(target)) {
+        const earlier = visibleSteps.filter(s => s < target);
+        target = earlier.length ? earlier[earlier.length - 1] : visibleSteps[0];
+      }
+
+      steps.forEach(step => {
+        const number = stepNumberOf(step);
+        step.classList.toggle('active', number === target);
+        step.hidden = !visibleSteps.includes(number);
+      });
+
+      const position = visibleSteps.indexOf(target) + 1;
+      const total = visibleSteps.length;
+      const stageLast = resultsStepOf(currentStage);
+      progressText.textContent = `Step ${position} of ${total}`;
+      progressBar.style.width = `${(position / total) * 100}%`;
+
+      const name = stageNameOf(currentStage);
+      stageLabelNodes.forEach(node => {
+        node.textContent = name || '';
+        node.hidden = !name || stages.length < 2;
+      });
+
+      /* Back is available across a stage boundary: the previous stage's
+         results screen is where it leads, and that screen is not resubmitted. */
+      const isFirst = position === 1 && currentStage === firstStage;
+      const isLast = target === stageLast;
+      const isFinalQuestion = visibleSteps[total - 2] === target;
+      const resultsNode = resultsNodeOf(currentStage);
+
+      prevButton.style.visibility = isFirst ? 'hidden' : 'visible';
+      nextButton.style.display = isLast ? 'none' : 'inline-flex';
+      nextButton.textContent = isFinalQuestion
+        ? ((resultsNode && resultsNode.dataset.finishLabel) || LABELS.finish)
+        : LABELS.continue;
+      currentStep = target;
+
+      /* Only speak when the total actually moved. Announcing every step would
+         be noise; announcing none would hide the form changing shape. */
+      if (liveRegion && announcedTotal !== null && announcedTotal !== total) {
+        liveRegion.textContent =
+          `The remaining questions changed. This review now has ${total} steps.`;
+      }
+      announcedTotal = total;
     };
 
     const currentStepValid = () => {
-      const active = steps[currentStep - 1];
-      return [...active.querySelectorAll('[required]')].every(field => field.reportValidity());
+      const active = stepNodeOf(currentStep);
+      if (!active) return true;
+      /* Disabled fields are skipped by the browser and must be skipped here
+         too — a required question on a hidden branch is not a real blocker. */
+      return [...active.querySelectorAll('[required]')]
+        .filter(field => !field.disabled && !field.closest('[hidden]'))
+        .every(field => field.reportValidity());
     };
 
-    const setStatus = state => {
-      const el = document.getElementById(RESULT_IDS.status);
+    const setStatus = (state, stage = currentStage) => {
+      const root = resultsNodeOf(stage);
+      const el = root && root.querySelector(RESULT_HOOKS.status);
       if (!el) return;
       el.textContent = STATUS_COPY[state] || '';
       el.dataset.state = state;
@@ -324,24 +709,81 @@
 
     /* ---------- results ---------- */
 
-    /* Orchestration: the engine decides the order, the config supplies the math. */
+    /* Orchestration: the engine decides the order, the config supplies the math.
+
+       The RANGE is not the config's business. It is produced by the same
+       functions the Business Intelligence Report uses, from the same answers,
+       so the figure on screen and the figure in the report cannot drift apart.
+       If those modules are not loaded the page falls back to the point figure
+       it has always shown. */
+    const reportEngine = () => window.CEDGenerateBir || null;
+
     const calculate = () => {
       const opportunity = config.opportunity(read);
       const dimensions = config.dimensions(read);
       const score = config.overallScore(dimensions);
       const priorities = selectPriorities(config, dimensions);
       const recommendation = config.recommendPackage(read, { opportunity, score, dimensions });
-      return { opportunity, dimensions, score, priorities, recommendation };
+
+      const answers = Object.fromEntries(new FormData(form).entries());
+      const bir = reportEngine();
+      let range = null;
+      if (bir && typeof bir.visibleOpportunityRange === 'function') {
+        try {
+          range = bir.visibleOpportunityRange({ point: opportunity, answers });
+        } catch (err) {
+          console.error('[CED] the opportunity range could not be computed.', err);
+        }
+      }
+      if (!range) {
+        range = {
+          low: Math.round(opportunity * 100) / 100,
+          point: Math.round(opportunity * 100) / 100,
+          high: Math.round(opportunity * 100) / 100,
+          unconstrainedPoint: Math.round(opportunity * 100) / 100,
+          capacityKnown: false, capacityBand: null, capacityPerMonth: null,
+          clampApplied: false, confidenceBand: null
+        };
+      }
+
+      return { opportunity, dimensions, score, priorities, recommendation, range };
     };
 
-    const paint = results => {
-      setText(RESULT_IDS.subject, read.val(config.subjectField) || config.subjectFallback);
-      setText(RESULT_IDS.score, results.score);
-      setText(RESULT_IDS.opportunity, formatCurrency(results.opportunity));
-      setText(RESULT_IDS.packageLabel, results.recommendation.label);
-      setText(RESULT_IDS.packageReason, results.recommendation.reason);
+    const assumptionCopy = range => {
+      if (range.capacityKnown && range.capacityPerMonth !== null) {
+        const perMonth = Math.round(range.capacityPerMonth);
+        return perMonth === 0
+          ? OPPORTUNITY_COPY.capacityNone
+          : OPPORTUNITY_COPY.capacityKnown(perMonth);
+      }
+      return range.capacityBand === 'unsure'
+        ? OPPORTUNITY_COPY.capacityUnsure
+        : OPPORTUNITY_COPY.capacityUnknown;
+    };
 
-      const list = document.getElementById(RESULT_IDS.priorities);
+    const paint = (results, stage) => {
+      const root = resultsNodeOf(stage);
+      if (!root) return;
+      const put = (hook, value) => {
+        const el = root.querySelector(RESULT_HOOKS[hook]);
+        if (el) el.textContent = value;
+      };
+
+      put('subject', read.val(config.subjectField) || config.subjectFallback);
+      put('score', results.score);
+      /* A range, never a bare point figure, and never larger than the report
+         considers realistically capturable. */
+      put('opportunity', formatRange(results.range));
+      put('assumptions', assumptionCopy(results.range));
+      put('packageLabel', results.recommendation.label);
+      put('packageReason', results.recommendation.reason);
+
+      const word = CONFIDENCE_WORD[results.range.confidenceBand] || 'limited';
+      put('evidenceNote', stage === finalStage
+        ? EVIDENCE_NOTE.full(word)
+        : EVIDENCE_NOTE.preliminary(word));
+
+      const list = root.querySelector(RESULT_HOOKS.priorities);
       if (list) {
         list.innerHTML = results.priorities
           .map((message, i) => `<div class="priority"><b>0${i + 1}</b><span>${message}</span></div>`)
@@ -351,7 +793,7 @@
 
     /* ---------- payload ---------- */
 
-    const buildPayload = results => {
+    const buildPayload = (results, stage) => {
       const now = nowIso();
       const consentFields = consents.map(entry => entry.field);
 
@@ -362,9 +804,33 @@
       delete answers[CHALLENGE_FIELD];
       consentFields.forEach(name => { delete answers[name]; });
       prohibited.forEach(name => { delete answers[name]; });
+      /* Answers belonging to a later stage never travel with an earlier one. */
+      Object.keys(answers).forEach(name => {
+        if (!withinStage(form.elements[name], stage)) delete answers[name];
+      });
+
+      const inStage = name => withinStage(form.elements[name], stage);
 
       const contact = {};
-      (meta.contactFields || []).forEach(name => { contact[name] = read.val(name); });
+      (meta.contactFields || []).forEach(name => {
+        contact[name] = inStage(name) ? read.val(name) : '';
+      });
+
+      /* Optional identity evidence. Visitor-supplied and therefore unverified:
+         it can improve candidate ranking, and it can never link a record on
+         its own. See shared/business-record/resolve-identity.js. */
+      (meta.identityFields || []).forEach(name => {
+        if (!inStage(name)) return;
+        const value = read.val(name).trim();
+        if (value) contact[name] = value;
+      });
+
+      const visible = visibleFieldNames(stage);
+      const engine = window.CEDIntelligence;
+      if (!engine) {
+        console.error('[CED] intelligence.js is not loaded; the submission will carry no dimensions.');
+      }
+      const intelligence = engine ? engine.computeDimensions(answers) : null;
 
       const packageMeta = (meta.packages || [])
         .find(entry => entry.id === results.recommendation.id) || null;
@@ -392,10 +858,56 @@
           honeypotFilled: Boolean(read.val(HONEYPOT_FIELD)),
           challengeToken: read.val(CHALLENGE_FIELD) || null
         },
+        /* Which stage of the review this submission completed, and which
+           submission it continues. A Stage 2 submission never replaces the
+           Stage 1 one: both are stored, and the report generated from this one
+           supersedes the preliminary report while both stay readable. */
+        assessmentStage: {
+          stage,
+          stageId: `stage${stage}`,
+          stageName: stageNameOf(stage),
+          totalStages: stages.length,
+          stage1CompletedAt: stageState.stage1CompletedAt,
+          stage2StartedAt: stage > firstStage ? stageState.stage2StartedAt : null,
+          stage2CompletedAt: stage === finalStage && stages.length > 1
+            ? stageState.stage2CompletedAt : null,
+          /* Null on a Stage 1 submission — there is nothing before it. */
+          supersedesSubmissionId: stage > firstStage ? stageState.stage1SubmissionId : null,
+          trigger: stage > firstStage ? stageState.trigger : 'stage1_complete'
+        },
+        /* Which questions this visitor actually saw. Without it the report
+           cannot tell a question that did not apply from one that was skipped,
+           and those mean opposite things. */
+        branching: {
+          stage,
+          visibleSteps: visibleSteps.slice(),
+          totalSteps: steps.length,
+          stageSteps: stepsInStage(stage).map(stepNumberOf),
+          visibleFields: visible,
+          skippedFields: skippedQuestionNames().filter(name =>
+            withinStage(form.elements[name], stage)),
+          staleClearedFields: [...staleCleared.values()],
+          questionSetVersion: meta.questionSetVersion || null
+        },
+        /* Deterministic, separate from the Growth Score, and recomputed
+           server-side from these same answers by the same module. */
+        intelligence,
         answers,
         results: {
           opportunity: Math.round(results.opportunity * 100) / 100,
           opportunityFormatted: formatCurrency(results.opportunity),
+          /* What the visitor actually saw: the capacity-aware range, with the
+             assumptions stated beside it. Carried so a CRM can never show the
+             figure without the context it was shown in. */
+          opportunityRange: {
+            low: results.range.low,
+            point: results.range.point,
+            high: results.range.high,
+            formatted: formatRange(results.range),
+            capacityKnown: results.range.capacityKnown,
+            clampApplied: results.range.clampApplied,
+            assumptions: assumptionCopy(results.range)
+          },
           score: results.score,
           dimensions: results.dimensions,
           priorities: results.priorities,
@@ -409,46 +921,68 @@
             interval: packageMeta ? packageMeta.interval : null
           },
           /* Compliance: the figure above is diagnostic, never a projection.
-             Taken from the on-page disclaimer so the two cannot drift. */
-          disclaimer: textOf(SELECTORS.disclaimer)
+             Taken from the disclaimer on the results screen THIS stage showed,
+             so a stage can never ship a figure with another stage's wording. */
+          disclaimer: textIn(resultsNodeOf(stage), SELECTORS.disclaimer) ||
+                      textOf(SELECTORS.disclaimer)
         }
       };
     };
 
     /* ---------- submission ---------- */
 
-    const lastSubmission = () => {
+    const submissionLog = () => {
       try {
-        return JSON.parse(localStorage.getItem(submissionKey) || 'null');
+        return JSON.parse(localStorage.getItem(submissionKey) || 'null') || {};
       } catch {
-        return null;
+        return {};
       }
+    };
+
+    /* One record PER STAGE. A single record would let the Stage 2 entry
+       displace the Stage 1 one, after which stepping back to the preliminary
+       results and forward again would look like new content and send a
+       duplicate. A record written before staging is flat and describes the
+       whole review, so it is read as the first stage's. */
+    const lastSubmission = stage => {
+      const log = submissionLog();
+      if (log.signature) return stage === firstStage ? log : null;
+      return log[`stage${stage}`] || null;
     };
 
     /* businessId, when the capture endpoint returns one, is kept beside the
        saved state so a later reassessment from this browser can be recognised
        as the same business. It is an opaque identifier, never a credential. */
-    const recordSubmission = (signature, submissionId, status, extra = {}) => {
-      localStorage.setItem(submissionKey, JSON.stringify({
-        signature, submissionId, status, at: nowIso(),
+    const recordSubmission = (stage, signature, submissionId, status, extra = {}) => {
+      const previous = submissionLog();
+      const log = previous.signature ? {} : { ...previous };
+      log[`stage${stage}`] = {
+        signature, submissionId, status, stage, at: nowIso(),
         businessId: extra.businessId || null,
         identityStatus: extra.identityStatus || null
-      }));
+      };
+      /* The business is not a property of a stage, so it stays at the top. */
+      log.businessId = extra.businessId || log.businessId || null;
+      localStorage.setItem(submissionKey, JSON.stringify(log));
     };
 
-    const submit = async results => {
+    const submit = async (results, stage) => {
       if (sending) return;
 
       /* The honeypot is NOT enforced here. A bot that posts directly never
          runs this code, so a browser-side check protects nothing; the
          indicator travels in the payload and the server decides. Results
          still render either way — the visitor's screen is unaffected. */
-      const payload = buildPayload(results);
+      const payload = buildPayload(results, stage);
       if (payload.integrity.honeypotFilled) {
         console.warn('[CED] Honeypot field filled — the server will refuse this submission.');
       }
-      const signature = signatureOf({ answers: payload.answers, results: payload.results });
-      const previous = lastSubmission();
+      /* The stage is part of the content. A Stage 2 submission whose answers
+         happened to be unchanged is still a different result — it completes a
+         different claim — and must not be suppressed as a duplicate of the
+         preliminary one. */
+      const signature = signatureOf({ stage, answers: payload.answers, results: payload.results });
+      const previous = lastSubmission(stage);
 
       /* Already delivered, or already sitting in the retry queue under its own
          submissionId. Retrying is the queue's job, not this path's. */
@@ -460,31 +994,86 @@
       /* A genuinely new completed result gets a new idempotency key. It travels
          inside the payload, so every retry of this result reuses it. */
       payload.submissionId = newId();
+      /* Remembered so the Stage 2 submission can name the preliminary one it
+         continues, without ever reusing its key. */
+      if (stage === firstStage) {
+        stageState.stage1SubmissionId = payload.submissionId;
+        saveState();
+      }
 
       const adapter = window.CEDSubmission;
       if (!adapter) {
         console.error('[CED] submission.js is not loaded; the completed assessment was not sent.');
-        setStatus('ready');
+        setStatus('ready', stage);
         return;
       }
 
       sending = true;
-      setStatus('sending');
+      setStatus('sending', stage);
       try {
         const outcome = await adapter.submitAssessment(payload, submissionOptions);
-        recordSubmission(signature, payload.submissionId, outcome.status, outcome);
-        setStatus(outcome.status === 'sent' ? 'sent' : outcome.status === 'queued' ? 'queued' : 'ready');
+        recordSubmission(stage, signature, payload.submissionId, outcome.status, outcome);
+        setStatus(outcome.status === 'sent' ? 'sent' : outcome.status === 'queued' ? 'queued' : 'ready', stage);
       } finally {
         sending = false;
       }
     };
 
-    /* submit: true only on the transition into the results step. Resuming a
-       finished review repaints without resending. */
-    const renderResults = ({ submit: shouldSubmit = false } = {}) => {
+    /* submit: true only on the transition into a stage's results step.
+       Resuming a finished stage, or stepping back to it from the next stage,
+       repaints without resending. */
+    const renderResults = ({ submit: shouldSubmit = false, stage = currentStage } = {}) => {
       const results = calculate();
-      paint(results);
-      if (shouldSubmit) void submit(results);
+      paint(results, stage);
+      if (shouldSubmit) void submit(results, stage);
+    };
+
+    /* ---------- stage transitions ---------- */
+
+    const stageNoteNodes = () => [...modal.querySelectorAll(SELECTORS.stageNote)];
+
+    const showStageNote = trigger => {
+      const text = STAGE_NOTE_COPY[trigger] || STAGE_NOTE_COPY.requested;
+      stageNoteNodes().forEach(node => {
+        node.textContent = text;
+        node.hidden = false;
+      });
+    };
+
+    /* Records that a stage finished. The timestamp is written once: a visitor
+       who steps back to a results screen has not completed it a second time. */
+    const markStageComplete = stage => {
+      const at = nowIso();
+      if (stage === firstStage) stageState.stage1CompletedAt ||= at;
+      if (stage === finalStage && stages.length > 1) stageState.stage2CompletedAt ||= at;
+    };
+
+    /* Opens the next stage. Optional by design: nothing here runs unless the
+       visitor asks for it, and the preliminary results stay exactly as they
+       were shown. */
+    const openNextStage = (trigger = 'requested') => {
+      const next = stages[stages.indexOf(currentStage) + 1];
+      if (next === undefined) return false;
+
+      stageState.stage2StartedAt ||= nowIso();
+      stageState.trigger = trigger;
+      currentStage = next;
+      maxStageReached = Math.max(maxStageReached, next);
+      showStageNote(trigger);
+
+      /* The step total changes on purpose here, so the "the questions changed"
+         announcement would be misleading. The stage label carries the news. */
+      announcedTotal = null;
+      syncBranching();
+      if (liveRegion) {
+        const name = stageNameOf(next);
+        liveRegion.textContent = name
+          ? `${name} started. ${visibleSteps.length} steps remaining.`
+          : `${visibleSteps.length} steps remaining.`;
+      }
+      showStep(visibleSteps[0]);
+      saveState();
+      return true;
     };
 
     /* ---------- modal ---------- */
@@ -495,8 +1084,15 @@
       document.body.style.overflow = 'hidden';
       loadState();
       syncConsentGates();
-      /* A finished review resumes on the results step, so repopulate it. */
-      if (currentStep === lastStep) renderResults();
+      /* Resume order matters: answers are restored, THEN branching is
+         recomputed from them, and only then is a step chosen. Resuming into a
+         step that no longer applies is corrected by showStep. */
+      syncBranching();
+      /* A finished stage resumes on its results step, so repopulate it —
+         without resubmitting. */
+      if (currentStep === resultsStepOf(currentStage)) {
+        renderResults({ submit: false, stage: currentStage });
+      }
       showStep(currentStep);
     };
 
@@ -514,21 +1110,84 @@
       if (e.key === 'Escape' && modal.classList.contains('open')) closeReview();
     });
 
+    /* Navigation walks the visible set, so a branch that removes the next step
+       is skipped rather than shown empty. Recomputed on every move because the
+       answer just given may have changed what comes next. */
+    const stepAfter = from => {
+      syncBranching();
+      const later = visibleSteps.filter(s => s > from);
+      return later.length ? later[0] : resultsStepOf(currentStage);
+    };
+
+    const stepBefore = from => {
+      syncBranching();
+      const earlier = visibleSteps.filter(s => s < from);
+      return earlier.length ? earlier[earlier.length - 1] : visibleSteps[0];
+    };
+
     nextButton.addEventListener('click', () => {
+      /* There is nothing after a results screen. The button is hidden there,
+         but a hidden button is a presentation detail and this is the rule:
+         without it, Continue on the results screen would re-enter the same
+         step and produce the result a second time. */
+      if (currentStep === resultsStepOf(currentStage)) return;
       if (!currentStepValid()) return;
       saveState();
-      if (currentStep === lastStep - 1) renderResults({ submit: true });
-      showStep(Math.min(lastStep, currentStep + 1));
+      const next = stepAfter(currentStep);
+      /* Results are produced on the transition INTO this stage's results step,
+         whichever visible step happened to precede it. */
+      if (next === resultsStepOf(currentStage)) {
+        markStageComplete(currentStage);
+        renderResults({ submit: true, stage: currentStage });
+      }
+      showStep(next);
       saveState(); /* persist the step just moved to, so resume lands there */
     });
 
     prevButton.addEventListener('click', () => {
-      showStep(Math.max(1, currentStep - 1));
+      /* Stepping back off the first question of a later stage returns to the
+         previous stage's results screen. It is repainted, never resubmitted:
+         the preliminary result the visitor was shown is not produced twice. */
+      if (currentStep === visibleSteps[0] && currentStage > firstStage) {
+        currentStage = stages[stages.indexOf(currentStage) - 1];
+        announcedTotal = null;
+        syncBranching();
+        renderResults({ submit: false, stage: currentStage });
+        showStep(resultsStepOf(currentStage));
+        saveState();
+        return;
+      }
+      showStep(stepBefore(currentStep));
       saveState();
+    });
+
+    /* The three paths offered after a stage's results. Two continue the
+       review; anything else on the screen is an ordinary link and is left
+       alone. */
+    modal.querySelectorAll(SELECTORS.stageAction).forEach(node => {
+      node.addEventListener('click', event => {
+        const trigger = node.dataset.stageAction;
+        if (!trigger || trigger === 'none') return;
+        if (event && typeof event.preventDefault === 'function') event.preventDefault();
+        openNextStage(trigger);
+      });
     });
 
     form.addEventListener('input', () => {
       syncConsentGates();
+      /* An answer can change which questions apply, so visibility and progress
+         are recomputed immediately rather than at the next navigation. */
+      const before = visibleSteps.length;
+      syncBranching();
+      if (visibleSteps.length !== before) showStep(currentStep);
+      saveState();
+    });
+
+    form.addEventListener('change', () => {
+      syncConsentGates();
+      const before = visibleSteps.length;
+      syncBranching();
+      if (visibleSteps.length !== before) showStep(currentStep);
       saveState();
     });
 
@@ -546,8 +1205,29 @@
 
     ensureSession();
     syncConsentGates();
+    syncBranching();
 
-    window.CEDAssessment = { clearSavedAssessmentData };
+    window.CEDAssessment = {
+      clearSavedAssessmentData,
+      /* The programmatic way into the next stage, for a checkout, proposal, or
+         detailed-report control anywhere on the page. Returns false when there
+         is no further stage, so a caller can fall back to its own path. */
+      requestFitReview: (trigger = 'requested') => openNextStage(trigger),
+      /* Exposed for tests and for verifying a vertical's branching by hand. */
+      inspect: () => ({
+        currentStep,
+        currentStage,
+        maxStageReached,
+        stages: stages.slice(),
+        stageState: { ...stageState },
+        visibleSteps: visibleSteps.slice(),
+        visibleFields: visibleFieldNames(),
+        skippedFields: questionNodes
+          .filter(n => n.hidden && stageAvailable(n))
+          .map(n => n.dataset.question),
+        staleCleared: [...staleCleared.values()]
+      })
+    };
 
     /* Anything stranded by an earlier failure gets another chance on load. */
     if (window.CEDSubmission) {

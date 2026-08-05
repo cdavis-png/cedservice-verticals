@@ -106,7 +106,19 @@ npm run test:all                 # unit, then integration
 | Idempotency cleanup | 1 |
 | Redaction and the no-PII-in-history invariant | 2 |
 | Transaction rollback and retry | 1 |
+| **Migration 0004 — the two-stage assessment (section M)** | **11** |
 | Cleanup | 1 |
+
+Section M stores **real** Business Intelligence Reports produced by
+`generate-bir.js`, not the compact stand-in the rest of the suite uses. The
+stage rules live inside that artifact; a stand-in with the right shape would
+prove the triggers fire and nothing about what they fire on.
+
+> **Section M has not yet run over PostgREST.** Its SQL was validated against
+> `ced-cip-dev` through the Supabase management API on 2026-08-05 — same
+> database, same functions, same triggers, same artifacts — because no
+> service-role key was available in that shell. See
+> [docs/REAL_POSTGRES_VALIDATION.md §0 and §7](../../docs/REAL_POSTGRES_VALIDATION.md).
 
 ---
 
@@ -151,4 +163,9 @@ first — it records what the first validated run produced, so a difference tell
 you whether the migration, the data, or the expectation changed.
 
 A failure in `deliberate constraint violations` means a constraint is missing:
-check that all three migrations applied, in order.
+check that all four migrations applied, in order.
+
+A failure in section M with `payload_schema_version` or `bir_schema_version`
+means 0004 did not apply. A section-M failure on the shared `occurred_at`
+assertion means the Defect 3 fix was lost — read §2 of the validation record
+before changing the assertion.

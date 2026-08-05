@@ -1,6 +1,61 @@
 # Business Intelligence Report (BIR)
 
-**Status:** design only. No BIR has ever been generated.
+**Status:** implemented and generated. Schema version **4**.
+
+> **Version 4 — two-stage progressive assessment.** The assessment now completes
+> in two stages, and a report says which one it came from.
+>
+> One new section, `assessmentProgress`:
+>
+> | Field | Holds |
+> |---|---|
+> | `assessmentStageCompleted` | 1 or 2 |
+> | `stage1CompletedAt`, `stage2CompletedAt` | When each stage finished |
+> | `resultState` | `preliminary_results`, `fit_review_available`, `fit_review_complete`, `activation_ready` |
+> | `confidenceKind` | `preliminary` or `full` |
+> | `closeReadinessProvisional` | True whenever readiness was computed without Stage 2 evidence |
+> | `missingStage2Evidence` | Stage 2 fields not yet answered |
+> | `stage1SubmissionId`, `supersedesPreliminaryBir` | The preliminary submission this report continues |
+>
+> **A preliminary report is a complete answer to a smaller question, not a
+> degraded answer to the whole one.** It scores only the five readiness signals
+> Stage 1 asked about, with the weights renormalised, and it may never reach
+> `ask_for_sale` or carry the approved close language. The validator refuses a
+> report that breaks either rule.
+>
+> A payload that declares no stage predates progressive profiling and is a full
+> review; nothing about a report already generated changes.
+>
+> A Stage 2 report supersedes the preliminary one through
+> `provenance.supersedes`. **Both remain readable.** Nothing is overwritten.
+>
+> Full reference:
+> [ASSESSMENT_INTELLIGENCE_EXPANSION.md §0](ASSESSMENT_INTELLIGENCE_EXPANSION.md#0-the-two-stage-model).
+
+> **Version 3 — Assessment Intelligence Expansion.** The evidence this document
+> described as "not collected" is now collected. Seven of the ten close-readiness
+> signals carry real evidence, the opportunity estimate is capacity-aware, and
+> five new sections were added:
+>
+> | Section | Holds |
+> |---|---|
+> | `intelligenceDimensions` | The nine deterministic dimensions, each with range, polarity, confidence and evidence |
+> | `decisionProfile` | Role, authority, approval path, timing, urgency |
+> | `budgetProfile` | Affordability signal only — never a financial position |
+> | `objectionProfile` | Concern, severity, prior experience, free-text evidence |
+> | `evidencePath` | Which questions were shown, skipped, or cleared |
+> | `identityEvidence` | Visitor-supplied identity evidence, always unverified |
+>
+> `capacityProfile`, `technologyProfile`, `businessProfile.locationCount` and
+> `qualificationProfile` are now populated rather than null.
+>
+> **Two dimensions are higher-is-worse** — `multiLocationComplexity` and
+> `objectionSeverity`. Read `polarity` before comparing anything.
+>
+> Full field reference:
+> [ASSESSMENT_INTELLIGENCE_EXPANSION.md](ASSESSMENT_INTELLIGENCE_EXPANSION.md).
+> Version 2 reports remain valid and readable; migration 0004 widens the
+> database CHECK to accept both.
 
 The canonical shape and all deterministic constants live in
 [shared/business-intelligence/report.schema.js](../shared/business-intelligence/report.schema.js).
@@ -164,7 +219,15 @@ judgment, no drift, no "the AI thought they seemed keen."
 ### 4.1 Signals
 
 Ten signals, each scored 0..100 with its own evidence, combined by the weights in
-`CLOSE_READINESS_SIGNALS` (they total 1.00):
+`CLOSE_READINESS_SIGNALS` (they total 1.00).
+
+> **Stage 1 scores five of them.** A preliminary report renormalises the weights
+> across `STAGE1_READINESS_SIGNALS` — `packageFit`, `capacity`,
+> `estimateConfidence`, `engagementBehavior`, `scopeStandardization`, 0.43 of
+> the total — and marks the rest `inScope: false`. Scoring an unasked signal as
+> a real zero would report "not asked" as "answered badly" and pin every
+> preliminary result near 35 regardless of the business. Read `inScope` before
+> comparing a signal across two reports.
 
 | Signal | Weight | Asks |
 |---|---|---|
@@ -197,6 +260,12 @@ blockers rather than by score. A business can score 94 and still escalate becaus
 it has three locations. `bandBeforeBlockers` preserves what the score alone said,
 so escalation reasons stay auditable.
 
+**Stage 1 is capped at `present_offer`.** The ceiling is applied *before* the
+blockers, so a hard blocker can still route a preliminary report to `escalate`.
+A Stage 1 report that reached `ask_for_sale` would be asking for the sale
+having never asked about authority, budget, timing, integration, or objections;
+`stageCapApplied` records when the ceiling bit.
+
 ### 4.3 Blockers
 
 **Hard blockers** (`HARD_BLOCKERS`) force `escalate` regardless of score: custom
@@ -211,11 +280,22 @@ detected, consent missing for the required purpose.
 | `unknown_decision_authority` | `clarify` |
 | `low_estimate_confidence` | `present_offer` |
 | `unresolved_objection` | `present_offer` |
+| `severe_objection` | `clarify` |
+| `no_defined_approval_path` | `clarify` |
 | `capacity_oversell_risk` | `clarify` |
 | `stale_assessment_data` | `clarify` |
 
 Capping at `clarify` for capacity risk is deliberate: when a business cannot
 absorb more demand, the honest next step is a question, not an offer.
+
+**At Stage 1, the soft blockers that rest on Stage 2 answers are deferred.**
+`unknown_decision_authority`, `no_defined_approval_path`, `unresolved_objection`
+and `severe_objection` are listed under `deferredBlockers` rather than applied.
+Capping a preliminary result for a question we deliberately chose not to ask
+would recreate exactly the friction the two-stage split removes, and would say
+something about the prospect the evidence does not support. Blockers that rest
+on Stage 1 answers — `capacity_oversell_risk`, `low_estimate_confidence` —
+apply in full at both stages.
 
 ### 4.4 Approved close language
 
@@ -254,7 +334,14 @@ days, matching the horizon of any early engagement. And it asks what **they**
 could handle, never implying what CED Service will deliver — this question must
 never be paired with language suggesting demand is promised.
 
-It is **not collected today** and must be added before capacity scoring can run.
+**Collected as of schema v3, in Stage 1 as of v4** — it bounds the figure the
+visitor is shown, so it cannot wait for a stage they may never open. It is
+`capacity90Day` on step 7 of the nail-salon
+assessment, worded exactly as above, and it drives the clamp, `headroomBand`,
+`oversellRisk`, and the `capacity` readiness signal. Each option maps to the
+**low end** of its band, because an estimate that overstates what a business can
+absorb is the one that does harm. See
+[ASSESSMENT_INTELLIGENCE_EXPANSION.md §5](ASSESSMENT_INTELLIGENCE_EXPANSION.md).
 
 ### 5.3 The eight assessments
 
@@ -401,23 +488,32 @@ affected engine can be built.
    suppression all assume durable server-side history. Today the only storage is
    `localStorage` on the visitor's device. **Blocks:** Lifecycle, Opportunity,
    Customer Success.
-3. **Readiness inputs are not collected.** Decision authority, urgency, budget
-   signals, objections, and booking system are not in any assessment — five of
-   ten signals, 0.55 of the total weight. On today's data, close readiness
-   cannot exceed `clarify`. Either the assessment gains questions or readiness
-   stays advisory.
-4. **Capacity is not collected.** The 90-day question does not exist, so the
-   clamp cannot run and `oversellRisk` is always `unknown`.
-5. **Multi-location is a hard blocker but is never asked.** The trigger can only
-   fire on data the platform does not have.
-6. **Page and BIR will disagree.** The page shows an unclamped point figure; the
-   BIR prefers a clamped range. Until the page shows the same range, a business
-   can be told two different numbers. Recommendation: move the page to the range
-   once capacity data exists — this changes visible output and needs explicit
-   approval.
-7. **Server-side retention is undefined.** Local limits are documented; nothing
+3. ~~Readiness inputs are not collected.~~ **Resolved in v3.** Decision
+   authority, urgency, budget signals, objections, and booking system are all
+   collected. Seven of ten signals now carry evidence, and `ask_for_sale` is
+   reachable for a prospect who genuinely is ready.
+4. ~~Capacity is not collected.~~ **Resolved in v3.** The clamp runs when
+   capacity is known and `oversellRisk` is derived from it.
+5. ~~Multi-location is a hard blocker but is never asked.~~ **Resolved in v3** —
+   `locationCount` is asked. The blocker now fires on real data, which means it
+   fires often: until a standardized multi-site scope exists, every
+   multi-location prospect routes to `escalate`.
+6. ~~Page and BIR still disagree.~~ **Resolved in v4.** The page now shows the
+   capacity-adjusted **range**, computed by calling the report's own
+   `visibleOpportunityRange` — the same `computeCapacity`,
+   `computeConfidence` and `applyCapacityClamp` the report uses, so the two
+   cannot drift. A test asserts equality across every capacity band. The
+   assumptions are printed beside the figure, and the unconstrained point is
+   retained in the report for audit but is never shown.
+7. **Stage 2 completion is unmeasured.** Nothing yet reports how many visitors
+   open the fit review or finish it, so there is no evidence about whether the
+   split reduced abandonment or merely moved it. The stage timeline events and
+   `submissions_assessment_stage_idx` make the question answerable; asking it
+   is a separate piece of work. **Blocks:** any claim that this milestone
+   worked.
+8. **Server-side retention is undefined.** Local limits are documented; nothing
    says how long a BIR lives once a store exists.
-8. **Consent purpose mapping.** Onboarding and receipt messages are transactional
+9. **Consent purpose mapping.** Onboarding and receipt messages are transactional
    under `transactional_service`, not marketing — but today's assessment collects
    only `results_delivery`, `email_marketing`, and `sms_marketing`. The
    transactional purpose needs a defined basis before automated close can send

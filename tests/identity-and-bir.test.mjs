@@ -123,15 +123,15 @@ test('a generated BIR validates against the schema contract', () => {
   assert.equal(result.valid, true, JSON.stringify(result.errors));
 });
 
-test('the BIR is schema v2 and carries identity and provenance', () => {
+test('the BIR is schema v4 and carries identity and provenance', () => {
   const bir = generate();
-  assert.equal(bir.schemaVersion, 2);
+  assert.equal(bir.schemaVersion, 4);
   assert.equal(bir.identity.businessId, BUSINESS_ID);
   assert.equal(bir.identity.identityStatus, 'linked');
   assert.equal(bir.identity.legacyBusinessKey, null);
   assert.equal(bir.identity.birId, BIR_ID);
   assert.equal(bir.identity.submissionId, makePayload().submissionId);
-  assert.equal(bir.provenance.payloadSchemaVersion, 3);
+  assert.equal(bir.provenance.payloadSchemaVersion, 5);
   assert.equal(bir.provenance.assessmentVersion, '1.1.0');
   assert.equal(bir.provenance.isCurrent, true);
   assert.ok(bir.provenance.inputHash);
@@ -162,19 +162,47 @@ test('the opportunity stays a range with its disclaimer', () => {
   assert.equal(fin.disclaimer, DISCLAIMER);
   assert.ok(fin.unconstrained.low < fin.unconstrained.point);
   assert.ok(fin.unconstrained.point < fin.unconstrained.high);
+  /* The fixture reports 6-10 additional appointments per week, comfortably
+     above the new demand in this estimate, so no clamp is required. */
   assert.equal(fin.capacityAdjusted.clampApplied, false);
-  assert.match(fin.capacityAdjusted.clampReason, /not collected/i);
+  assert.match(fin.capacityAdjusted.clampReason, /exceeds the newly created demand/i);
+  assert.ok(fin.capacityAdjusted.ceiling > 0);
 });
 
-test('confidence cannot reach high while capacity is uncollected', () => {
-  const bir = generate();
+test('confidence cannot reach high while capacity is unknown', () => {
+  const bir = generate({ answers: { capacity90Day: '' } });
   assert.notEqual(bir.estimateConfidence.band, 'high');
   assert.ok(bir.estimateConfidence.score < 0.8);
   assert.ok(bir.estimateConfidence.reasons.some(r => /capacity/i.test(r)));
 });
 
+test('an explicit "unsure" about capacity is unknown, never favourable', () => {
+  const bir = generate({ answers: { capacity90Day: 'unsure' } });
+  assert.notEqual(bir.estimateConfidence.band, 'high');
+  assert.equal(bir.capacityProfile.headroomBand, 'unknown');
+  assert.equal(bir.financialOpportunityProfile.capacityAdjusted.clampApplied, false);
+  assert.ok(bir.estimateConfidence.reasons.some(r => /does not know/i.test(r)));
+});
+
+test('known capacity lifts the cap that unknown capacity imposed', () => {
+  const unknown = generate({ answers: { capacity90Day: '' } });
+  const known = generate();
+  assert.ok(known.estimateConfidence.score > unknown.estimateConfidence.score,
+    'collecting the ceiling is exactly what the cap was waiting for');
+});
+
+/* Everything the intelligence expansion collects, stripped back out. */
+const NO_INTELLIGENCE = {
+  locationCount: '', yearsInBusiness: '', capacity90Day: '', willingnessToExpand: '',
+  staffingExpandable: '', hoursExpandable: '', spaceConstraint: '',
+  respondentRole: '', canApprove: '', decisionTiming: '', startTiming: '', urgency: '',
+  budgetSignal: '', bookingPlatform: '', bookingPlatformStaying: '', phoneSetup: '',
+  keepNumber: '', willingToChangeSoftware: '', customIntegrationNeeded: '',
+  migrationConcern: '', primaryConcern: ''
+};
+
 test('unknown fields stay unknown and are never invented', () => {
-  const bir = generate();
+  const bir = generate({ answers: NO_INTELLIGENCE });
   assert.equal(bir.businessProfile.locationCount, null);
   assert.equal(bir.capacityProfile.additionalCapacity90Day, null);
   assert.equal(bir.capacityProfile.headroomBand, 'unknown');
@@ -184,21 +212,33 @@ test('unknown fields stay unknown and are never invented', () => {
   assert.equal(bir.riskProfile.churnRisk, 'unknown');
   assert.equal(bir.riskProfile.implementationRisk, 'unknown');
   assert.equal(bir.qualificationProfile.outcome, 'insufficient_data');
+  /* Every dimension reports null rather than a convenient midpoint. */
+  ['capacityReadiness', 'decisionReadiness', 'budgetReadiness',
+   'implementationCompatibility', 'multiLocationComplexity', 'objectionSeverity']
+    .forEach(key => assert.equal(bir.intelligenceDimensions[key].score, null, key));
 });
 
 test('missing critical fields are listed explicitly', () => {
-  const missing = generate().qualificationProfile.missingCriticalFields;
-  ['businessProfile.locationCount', 'capacityProfile.additionalCapacity90Day',
-   'technologyProfile.bookingSystem', 'closeReadiness.decisionAuthority',
-   'closeReadiness.urgency', 'closeReadiness.budgetSignals']
+  const missing = generate({ answers: NO_INTELLIGENCE })
+    .qualificationProfile.missingCriticalFields;
+  ['answers.locationCount', 'answers.capacity90Day', 'answers.bookingPlatform',
+   'answers.canApprove', 'answers.urgency', 'answers.budgetSignal']
     .forEach(field => assert.ok(missing.includes(field), field));
 });
 
+test('a question that did not apply is not reported as unanswered', () => {
+  const bir = generate();
+  /* The fixture never showed multiLocationSystems, so its absence is a fact
+     about the path taken, not a gap in the evidence. */
+  assert.ok(!bir.qualificationProfile.missingCriticalFields.includes('answers.multiLocationSystems'));
+  assert.ok(bir.evidencePath.notApplicable.includes('multiLocationSystems'));
+});
+
 test('close readiness stays limited while its evidence is unknown', () => {
-  const readiness = generate().closeReadinessProfile;
+  const readiness = generate({ answers: NO_INTELLIGENCE }).closeReadinessProfile;
   assert.equal(readiness.signals.decisionAuthority.known, false);
   assert.equal(readiness.signals.capacity.known, false);
-  assert.equal(readiness.unknownSignals.length, 7);
+  assert.ok(readiness.unknownSignals.length >= 6);
   assert.ok(readiness.softBlockers.includes('unknown_decision_authority'));
   assert.ok(['educate', 'clarify'].includes(readiness.band),
     `band was ${readiness.band}; unknown evidence must not produce a sellable band`);

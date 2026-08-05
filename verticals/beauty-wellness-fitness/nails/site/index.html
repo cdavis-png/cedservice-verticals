@@ -285,7 +285,15 @@
           <span class="review-kicker">FREE SELF-PACED REVIEW</span>
           <h2 id="review-title">Salon Growth Review</h2>
         </div>
-        <div class="progress-wrap"><span id="progressText">Step 1 of 8</span><div class="progress-bar"><i id="progressBar"></i></div></div>
+        <div class="progress-wrap">
+          <span class="stage-label" data-stage-label>Growth Review</span>
+          <span id="progressText">Step 1 of 9</span>
+          <div class="progress-bar"><i id="progressBar"></i></div>
+        </div>
+        <!-- Announces only when the number of remaining steps changes, so a
+             screen-reader user is told the form changed shape without hearing
+             every ordinary step advance. -->
+        <p id="reviewLive" class="sr-only" role="status" aria-live="polite"></p>
       </div>
 
       <form id="growthReview">
@@ -301,23 +309,27 @@
           <input type="text" id="contactFax" name="contactFax" tabindex="-1" autocomplete="off">
         </div>
 
-        <div class="review-step active" data-step="1">
+        <!-- ================================================================
+             STAGE 1 — Growth Review
+
+             Steps 1 to 9. Enough to diagnose how the salon runs, produce the
+             Growth Score, bound the estimate by what the salon could take on,
+             and deliver a useful result. Nothing here asks about buying.
+
+             There is no branching in Stage 1: the shortest and longest paths
+             are the same path.
+             ================================================================ -->
+
+        <div class="review-step active" data-step="1" data-stage="1" data-stage-name="Growth Review">
           <h3>Let's start with your salon.</h3>
           <p>You can pause at any time. Your answers will be saved on this device.</p>
           <label>Salon name<input name="salonName" required placeholder="Example: Polished Nail Studio"></label>
           <label>Your name<input name="ownerName" required placeholder="Owner or manager"></label>
           <label>Email<input name="email" type="email" required placeholder="you@example.com"></label>
           <label>Mobile phone <span class="label-hint">(optional)</span><input name="mobile" type="tel" inputmode="tel" autocomplete="tel" placeholder="864-555-0134"></label>
-          <label>Preferred contact method
-            <select name="preferredContact">
-              <option value="email">Email</option>
-              <option value="text">Text</option>
-              <option value="either">Either</option>
-            </select>
-          </label>
         </div>
 
-        <div class="review-step" data-step="2">
+        <div class="review-step" data-step="2" data-stage="1">
           <h3>Tell us about your operation.</h3>
           <label>Number of technicians<input name="technicians" type="number" min="1" value="3"></label>
           <label>Average appointments per day<input name="appointmentsDay" type="number" min="0" value="12"></label>
@@ -325,7 +337,7 @@
           <label>Days open per month<input name="daysOpen" type="number" min="1" max="31" value="24"></label>
         </div>
 
-        <div class="review-step" data-step="3">
+        <div class="review-step" data-step="3" data-stage="1">
           <h3>How are customer inquiries handled?</h3>
           <label>Calls received on an average day<input name="callsDay" type="number" min="0" value="8"></label>
           <label>Calls missed on an average day<input name="missedCallsDay" type="number" min="0" value="2"></label>
@@ -339,7 +351,7 @@
           </label>
         </div>
 
-        <div class="review-step" data-step="4">
+        <div class="review-step" data-step="4" data-stage="1">
           <h3>Protecting the appointment book.</h3>
           <label>No-shows per week<input name="noShowsWeek" type="number" min="0" value="2"></label>
           <label>Last-minute cancellations per week<input name="cancelsWeek" type="number" min="0" value="3"></label>
@@ -356,7 +368,7 @@
           </label>
         </div>
 
-        <div class="review-step" data-step="5">
+        <div class="review-step" data-step="5" data-stage="1">
           <h3>Bringing clients back.</h3>
           <label>Clients asked to rebook before leaving
             <select name="rebooking"><option value="0">Rarely</option><option value="1">Sometimes</option><option value="2">Usually</option><option value="3">Always</option></select>
@@ -367,30 +379,47 @@
           <label>Approximate inactive clients in your customer list<input name="inactiveClients" type="number" min="0" value="150"></label>
         </div>
 
-        <div class="review-step" data-step="6">
-          <h3>Reviews and local visibility.</h3>
+        <div class="review-step" data-step="6" data-stage="1">
+          <h3>Reviews and marketing.</h3>
           <label>Google review count<input name="reviewCount" type="number" min="0" value="65"></label>
           <label>Current Google rating<input name="rating" type="number" min="1" max="5" step=".1" value="4.4"></label>
           <label>How often are customers asked for reviews?
             <select name="reviewRequests"><option value="0">Never</option><option value="1">Rarely</option><option value="2">Sometimes</option><option value="3">After every completed appointment</option></select>
           </label>
-        </div>
-
-        <div class="review-step" data-step="7">
-          <h3>Marketing consistency.</h3>
           <label>How often do you promote offers to past clients?
             <select name="promotions"><option value="0">Never</option><option value="1">A few times a year</option><option value="2">Monthly</option><option value="3">Consistently with tracking</option></select>
           </label>
-          <label>Biggest current challenge
-            <select name="challenge">
-              <option>Filling open appointments</option>
-              <option>Getting new customers</option>
-              <option>Keeping customers</option>
-              <option>No-shows and cancellations</option>
-              <option>Reviews and local visibility</option>
-              <option>Answering calls and messages</option>
+        </div>
+
+        <div class="review-step" data-step="7" data-stage="1">
+          <h3>Size and room to grow.</h3>
+          <p>These two decide how your estimate is sized, so we ask them now.</p>
+          <label>How many locations do you operate?
+            <select name="locationCount" required>
+              <option value="">Select</option>
+              <option value="1">One</option>
+              <option value="2">Two</option>
+              <option value="3">Three or four</option>
+              <option value="5">Five or more</option>
             </select>
           </label>
+          <label>If demand increases, how much additional business could you comfortably handle over the next 90 days?
+            <select name="capacity90Day" required>
+              <option value="">Select</option>
+              <option value="none">None right now</option>
+              <option value="1_5">1–5 additional appointments per week</option>
+              <option value="6_10">6–10 additional appointments per week</option>
+              <option value="11_20">11–20 additional appointments per week</option>
+              <option value="over_20">More than 20 additional appointments per week</option>
+              <option value="unsure">Unsure</option>
+            </select>
+          </label>
+          <p class="consent-note">Your answer here can only reduce the estimate we show you. We never use it to suggest how much work we would bring in.</p>
+        </div>
+
+        <div class="review-step" data-step="8" data-stage="1">
+          <h3>Where to send your results.</h3>
+          <p>We will email your Growth Review to the address you gave us.</p>
 
           <!-- ================================================================
                LEGAL REVIEW PENDING — this consent wording has not been reviewed
@@ -417,22 +446,378 @@
           </div>
         </div>
 
-        <div class="review-step results-step" data-step="8">
-          <div class="results-badge">YOUR PRELIMINARY RESULTS</div>
-          <h3><span id="resultSalon">Your salon</span> has clear opportunities to capture more appointments.</h3>
+        <!-- Stage 1 results. Complete and useful on its own: a visitor who
+             stops here has a Growth Score, a capacity-aware range, three
+             priorities, and a recommended starting point. -->
+        <div class="review-step results-step" data-step="9" data-stage="1"
+             data-results-for="1" data-finish-label="See My Results">
+          <div class="results-badge">YOUR GROWTH REVIEW</div>
+          <h3><span data-result="subject">Your salon</span> has clear opportunities to capture more appointments.</h3>
           <div class="results-grid">
-            <div class="result-score"><small>Growth Score</small><strong id="growthScore">--</strong><span>/100</span></div>
-            <div><small>Estimated Monthly Opportunity</small><strong id="monthlyOpportunity">$0</strong><span>diagnostic estimate</span></div>
+            <div class="result-score"><small>Growth Score</small><strong data-result="score">--</strong><span>/100</span></div>
+            <div><small>Estimated Monthly Opportunity</small><strong data-result="opportunity">$0</strong><span>diagnostic estimate</span></div>
           </div>
-          <div class="priority-list" id="priorityList"></div>
+          <p class="results-assumptions" data-result="assumptions"></p>
+          <div class="priority-list" data-result="priorities"></div>
           <div class="recommended-box">
             <span>RECOMMENDED STARTING POINT</span>
-            <h4 id="recommendedPackage">Salon Growth — $597/month</h4>
-            <p id="recommendationReason">Based on your salon size and follow-up gaps.</p>
+            <h4 data-result="package-label">Salon Growth — $597/month</h4>
+            <p data-result="package-reason">Based on your salon size and follow-up gaps.</p>
           </div>
+          <p class="results-evidence" data-result="evidence-note"></p>
           <p class="results-disclaimer">This is a preliminary estimate based on your answers and is not a guarantee of revenue or results.</p>
-          <p class="submission-status" id="submissionStatus" role="status" aria-live="polite"></p>
-          <a class="btn btn-primary btn-wide" href="mailto:cdavis@cedservice.com?subject=My Salon Growth Review Results">Send My Results & Next Steps</a>
+          <p class="submission-status" data-result="status" role="status" aria-live="polite"></p>
+
+          <div class="results-actions">
+            <button type="button" class="btn btn-secondary btn-wide" data-stage-action="improve_recommendation">Improve My Recommendation</button>
+            <button type="button" class="btn btn-primary btn-wide" data-stage-action="see_recommended_system">See the Recommended System</button>
+            <a class="btn btn-secondary btn-wide" href="mailto:cdavis@cedservice.com?subject=Personal Salon Growth Review">Request a Personal Review</a>
+          </div>
+        </div>
+
+        <!-- ================================================================
+             STAGE 2 — Fit and Activation Review
+
+             Steps 10 to 17. Optional, and only offered after Stage 1 results.
+             Nothing here changes the Growth Score or the opportunity formula;
+             it decides whether and how the system would actually fit.
+             ================================================================ -->
+
+        <div class="review-step" data-step="10" data-stage="2" data-stage-name="Fit and Activation Review">
+          <p class="stage-note" data-stage-note hidden></p>
+          <h3>What you are working with today.</h3>
+          <label>What do you use for booking today?
+            <select name="bookingPlatform" required>
+              <option value="">Select</option>
+              <option value="none_paper">Paper book or notes</option>
+              <option value="phone_only">Phone and text only</option>
+              <option value="square">Square</option>
+              <option value="vagaro">Vagaro</option>
+              <option value="boulevard">Boulevard</option>
+              <option value="glossgenius">GlossGenius</option>
+              <option value="fresha">Fresha</option>
+              <option value="other">Something else</option>
+              <option value="unsure">Not sure</option>
+            </select>
+          </label>
+          <div data-question="bookingPlatformStaying">
+            <label>Do you plan to keep that system?
+              <select name="bookingPlatformStaying">
+                <option value="">Select</option>
+                <option value="keep">Yes, keeping it</option>
+                <option value="open_to_change">Open to changing</option>
+                <option value="must_change">Looking to replace it</option>
+                <option value="unsure">Not sure</option>
+              </select>
+            </label>
+          </div>
+          <div data-question="willingToChangeSoftware">
+            <label>Would you change software if it were clearly better?
+              <select name="willingToChangeSoftware">
+                <option value="">Select</option>
+                <option value="yes">Yes</option>
+                <option value="maybe">Maybe</option>
+                <option value="no">No</option>
+              </select>
+            </label>
+          </div>
+          <div data-question="migrationConcern">
+            <label>If you moved systems, what would concern you most?
+              <select name="migrationConcern">
+                <option value="">Select</option>
+                <option value="none">Nothing in particular</option>
+                <option value="data">Moving existing client records</option>
+                <option value="downtime">Downtime during the switch</option>
+                <option value="staff_training">Retraining staff</option>
+                <option value="several">Several of these</option>
+              </select>
+            </label>
+          </div>
+          <label>How long have you been open?
+            <select name="yearsInBusiness" required>
+              <option value="">Select</option>
+              <option value="under_1">Less than a year</option>
+              <option value="1_3">One to three years</option>
+              <option value="4_10">Four to ten years</option>
+              <option value="over_10">More than ten years</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="review-step" data-step="11" data-stage="2">
+          <h3>Creating room to grow.</h3>
+          <div data-question="staffingExpandable">
+            <label>Could you add staff if you needed to?
+              <select name="staffingExpandable">
+                <option value="">Select</option>
+                <option value="yes">Yes</option>
+                <option value="maybe">Maybe</option>
+                <option value="no">No</option>
+                <option value="unsure">Not sure</option>
+              </select>
+            </label>
+          </div>
+          <div data-question="hoursExpandable">
+            <label>Could you extend your hours?
+              <select name="hoursExpandable">
+                <option value="">Select</option>
+                <option value="yes">Yes</option>
+                <option value="maybe">Maybe</option>
+                <option value="no">No</option>
+                <option value="unsure">Not sure</option>
+              </select>
+            </label>
+          </div>
+          <div data-question="spaceConstraint">
+            <label>Do space or equipment limits hold you back?
+              <select name="spaceConstraint">
+                <option value="">Select</option>
+                <option value="none">No, there is room</option>
+                <option value="some">Somewhat</option>
+                <option value="significant">Yes, significantly</option>
+                <option value="unsure">Not sure</option>
+              </select>
+            </label>
+          </div>
+          <label>If demand grew, would you want to expand?
+            <select name="willingnessToExpand" required>
+              <option value="">Select</option>
+              <option value="yes">Yes</option>
+              <option value="if_proven">Only if it were clearly working</option>
+              <option value="no">No, prefer current size</option>
+              <option value="unsure">Not sure</option>
+            </select>
+          </label>
+          <div data-question="capacityLeadTime">
+            <label>How long would it take to add that capacity?
+              <select name="capacityLeadTime">
+                <option value="">Select</option>
+                <option value="immediate">We could start now</option>
+                <option value="weeks_2_4">Two to four weeks</option>
+                <option value="months_1_3">One to three months</option>
+                <option value="over_3_months">More than three months</option>
+                <option value="unsure">Not sure</option>
+              </select>
+            </label>
+          </div>
+        </div>
+
+        <div class="review-step" data-step="12" data-stage="2">
+          <h3>How decisions get made.</h3>
+          <label>What is your role?
+            <select name="respondentRole" required>
+              <option value="">Select</option>
+              <option value="owner">Owner</option>
+              <option value="co_owner">Co-owner or partner</option>
+              <option value="manager">Manager</option>
+              <option value="staff">Staff</option>
+              <option value="other">Something else</option>
+            </select>
+          </label>
+          <label>Can you approve a decision like this on your own?
+            <select name="canApprove" required>
+              <option value="">Select</option>
+              <option value="yes">Yes</option>
+              <option value="partly">Up to a point</option>
+              <option value="no">No</option>
+            </select>
+          </label>
+          <div data-question="otherApprovers">
+            <label>Who else would need to agree?
+              <select name="otherApprovers">
+                <option value="">Select</option>
+                <option value="none">Nobody, on reflection</option>
+                <option value="one_partner">A business partner</option>
+                <option value="family">A family member</option>
+                <option value="corporate">A corporate or franchise office</option>
+                <option value="unsure">Not sure</option>
+              </select>
+            </label>
+          </div>
+          <label>When would you want to decide?
+            <select name="decisionTiming" required>
+              <option value="">Select</option>
+              <option value="this_week">This week</option>
+              <option value="this_month">This month</option>
+              <option value="1_3_months">In one to three months</option>
+              <option value="over_3_months">Later than that</option>
+              <option value="unsure">Not sure</option>
+            </select>
+          </label>
+          <label>If you went ahead, when would you want to start?
+            <select name="startTiming" required>
+              <option value="">Select</option>
+              <option value="immediately">Right away</option>
+              <option value="within_month">Within a month</option>
+              <option value="1_3_months">In one to three months</option>
+              <option value="later">Later</option>
+              <option value="unsure">Not sure</option>
+            </select>
+          </label>
+          <label>How pressing is this for you?
+            <select name="urgency" required>
+              <option value="">Select</option>
+              <option value="critical">It needs solving now</option>
+              <option value="important">Important this quarter</option>
+              <option value="exploring">Exploring options</option>
+              <option value="curious">Just curious</option>
+            </select>
+          </label>
+          <label>What made you look at this now? <span class="label-hint">(optional)</span>
+            <input name="changeReason" type="text" maxlength="300" placeholder="In your own words">
+          </label>
+        </div>
+
+        <div class="review-step" data-step="13" data-stage="2">
+          <h3>Across your locations.</h3>
+          <p>You told us you run more than one, so this affects how we would set things up.</p>
+          <label>Do your locations share one booking system?
+            <select name="multiLocationSystems">
+              <option value="">Select</option>
+              <option value="shared">Yes, one shared system</option>
+              <option value="separate">No, each runs its own</option>
+              <option value="mixed">A mix of both</option>
+              <option value="unsure">Not sure</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="review-step" data-step="14" data-stage="2">
+          <h3>How calls reach you.</h3>
+          <label>What handles your business calls today?
+            <select name="phoneSetup" required>
+              <option value="">Select</option>
+              <option value="mobile_only">A mobile phone</option>
+              <option value="landline">A landline</option>
+              <option value="voip">An internet phone service</option>
+              <option value="answering_service">An answering service</option>
+              <option value="unsure">Not sure</option>
+            </select>
+          </label>
+          <div data-question="keepNumber">
+            <label>Do you need to keep your current number?
+              <select name="keepNumber">
+                <option value="">Select</option>
+                <option value="yes">Yes</option>
+                <option value="no">No</option>
+                <option value="unsure">Not sure</option>
+              </select>
+            </label>
+          </div>
+          <!-- Deliberately unconditional. A "yes" here raises a hard blocker
+               and routes the prospect to a person; hiding it behind a branch
+               would quietly close the path that exists to catch what we
+               cannot serve. -->
+          <label>Do you need anything connected to a custom or in-house system?
+            <select name="customIntegrationNeeded" required>
+              <option value="">Select</option>
+              <option value="no">No</option>
+              <option value="yes">Yes</option>
+              <option value="unsure">Not sure</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="review-step" data-step="15" data-stage="2">
+          <h3>Budget and anything on your mind.</h3>
+          <label>Which of these best describes your position?
+            <select name="budgetSignal" required>
+              <option value="">Select</option>
+              <option value="budgeted">Already budgeted for this</option>
+              <option value="approve_if_value">Can approve it if the value is clear</option>
+              <option value="compare_options">Need to compare options first</option>
+              <option value="need_financing">Would need financing or staged payments</option>
+              <option value="not_budgeted">Not currently budgeted</option>
+              <option value="prefer_not_say">Prefer not to say</option>
+            </select>
+          </label>
+          <p class="consent-note">We do not ask for revenue, bank details, or credit information, and we never will.</p>
+          <label>What is your biggest concern about a service like this?
+            <select name="primaryConcern" required>
+              <option value="">Select</option>
+              <option value="none">Nothing in particular</option>
+              <option value="price">The price</option>
+              <option value="contract">Being locked into a contract</option>
+              <option value="setup">How much setup it takes</option>
+              <option value="staff_adoption">Whether staff would use it</option>
+              <option value="technology">The technology itself</option>
+              <option value="results_skepticism">Whether it would actually work</option>
+              <option value="prior_bad_experience">A bad experience with something similar</option>
+              <option value="other">Something else</option>
+            </select>
+          </label>
+          <div data-question="concernDetail">
+            <label>Tell us more, if you would like. <span class="label-hint">(optional)</span>
+              <input name="concernDetail" type="text" maxlength="300" placeholder="In your own words">
+            </label>
+          </div>
+          <div data-question="priorBadExperience">
+            <label>Have you tried something like this before and been let down?
+              <select name="priorBadExperience">
+                <option value="">Select</option>
+                <option value="no">No</option>
+                <option value="yes">Yes</option>
+              </select>
+            </label>
+          </div>
+          <label>Biggest current challenge
+            <select name="challenge">
+              <option>Filling open appointments</option>
+              <option>Getting new customers</option>
+              <option>Keeping customers</option>
+              <option>No-shows and cancellations</option>
+              <option>Reviews and local visibility</option>
+              <option>Answering calls and messages</option>
+            </select>
+          </label>
+          <label>Any questions you want answered? <span class="label-hint">(optional)</span>
+            <input name="openQuestions" type="text" maxlength="300" placeholder="In your own words">
+          </label>
+        </div>
+
+        <div class="review-step" data-step="16" data-stage="2">
+          <h3>A few last details.</h3>
+          <p>The bottom three are optional. They help us match your results to the right business.</p>
+          <label>Preferred contact method
+            <select name="preferredContact">
+              <option value="email">Email</option>
+              <option value="text">Text</option>
+              <option value="either">Either</option>
+            </select>
+          </label>
+          <label>Business phone <span class="label-hint">(optional)</span>
+            <input name="businessPhone" type="tel" inputmode="tel" autocomplete="tel" placeholder="864-555-0134">
+          </label>
+          <label>Website <span class="label-hint">(optional)</span>
+            <input name="website" type="text" inputmode="url" placeholder="example.com">
+          </label>
+          <label>Google Business Profile <span class="label-hint">(optional)</span>
+            <input name="googleProfile" type="text" placeholder="Link to your Google listing">
+          </label>
+        </div>
+
+        <!-- Stage 2 results. The same Growth Score and the same estimate: the
+             fit review narrows what we recommend and how it would be set up,
+             and never moves the figures the visitor was already shown. -->
+        <div class="review-step results-step" data-step="17" data-stage="2"
+             data-results-for="2" data-finish-label="See My Full Results">
+          <div class="results-badge">YOUR FIT AND ACTIVATION REVIEW</div>
+          <h3><span data-result="subject">Your salon</span> has clear opportunities to capture more appointments.</h3>
+          <div class="results-grid">
+            <div class="result-score"><small>Growth Score</small><strong data-result="score">--</strong><span>/100</span></div>
+            <div><small>Estimated Monthly Opportunity</small><strong data-result="opportunity">$0</strong><span>diagnostic estimate</span></div>
+          </div>
+          <p class="results-assumptions" data-result="assumptions"></p>
+          <div class="priority-list" data-result="priorities"></div>
+          <div class="recommended-box">
+            <span>RECOMMENDED STARTING POINT</span>
+            <h4 data-result="package-label">Salon Growth — $597/month</h4>
+            <p data-result="package-reason">Based on your salon size and follow-up gaps.</p>
+          </div>
+          <p class="results-evidence" data-result="evidence-note"></p>
+          <p class="results-disclaimer">This is a preliminary estimate based on your answers and is not a guarantee of revenue or results.</p>
+          <p class="submission-status" data-result="status" role="status" aria-live="polite"></p>
+          <a class="btn btn-primary btn-wide" href="mailto:cdavis@cedservice.com?subject=My Salon Growth Review Results">Send My Results &amp; Next Steps</a>
         </div>
 
         <div class="review-controls">
@@ -443,9 +828,18 @@
     </section>
   </div>
 
-  <!-- Vertical configuration must load before the shared engine. -->
+  <!-- Vertical configuration must load before the shared engine.
+
+       report.schema.js and generate-bir.js are loaded so the page computes the
+       visible opportunity range with the SAME functions the Business
+       Intelligence Report uses. Duplicating that arithmetic here is how the
+       figure on screen and the figure in the report would drift apart. The
+       engine degrades to the point estimate if they are absent. -->
   <script src="../assessment.config.js"></script>
   <script src="../../../../shared/assessment-engine/submission.js"></script>
+  <script src="../../../../shared/assessment-engine/intelligence.js"></script>
+  <script src="../../../../shared/business-intelligence/report.schema.js"></script>
+  <script src="../../../../shared/business-intelligence/generate-bir.js"></script>
   <script src="../../../../shared/assessment-engine/engine.js"></script>
   <script src="../../../../shared/scripts/site-nav.js"></script>
 </body>

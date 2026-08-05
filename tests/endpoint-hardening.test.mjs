@@ -151,9 +151,18 @@ test('the engine and the markup agree on the honeypot field name', async () => {
     new URL('../verticals/beauty-wellness-fitness/nails/site/index.html', import.meta.url), 'utf8');
 
   const name = engine.match(/const HONEYPOT_FIELD = '([^']+)'/)[1];
-  assert.notEqual(name, 'website', 'must not collide with the future legitimate website field');
+  assert.notEqual(name, 'website', 'must not collide with the legitimate website field');
   assert.ok(html.includes(`name="${name}"`), 'the markup uses the same name');
-  assert.ok(!html.includes('name="website"'), 'the old trap name is gone');
+
+  /* `website` is now a REAL question — optional identity evidence added by the
+     intelligence expansion. That it can coexist with the trap is the whole
+     point of having renamed the trap before shipping it. */
+  assert.ok(html.includes('name="website"'), 'the legitimate website field exists');
+  assert.ok(html.includes(`name="${name}"`) && name === 'contactFax',
+    'the trap keeps its own distinct name');
+  /* And the two must never be the same input. */
+  const trapBlock = html.slice(html.indexOf('class="hp-field"'), html.indexOf('class="hp-field"') + 400);
+  assert.ok(!trapBlock.includes('name="website"'), 'the trap is not the website field');
 });
 
 /* ---------- F3. Challenge verification ---------- */

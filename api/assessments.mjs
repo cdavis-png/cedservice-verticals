@@ -56,8 +56,8 @@ const { buildRateLimitKeys, rateLimitPolicy } = rateLimit;
    sitting in a browser retry queue — built by a page loaded before the
    deploy — are still delivered instead of being rejected as "unsupported".
    Policy and window: docs/PRODUCTION_HARDENING.md. */
-const CURRENT_PAYLOAD_SCHEMA = 3;
-const SUPPORTED_PAYLOAD_SCHEMAS = Object.freeze([2, 3]);
+const CURRENT_PAYLOAD_SCHEMA = 5;
+const SUPPORTED_PAYLOAD_SCHEMAS = Object.freeze([2, 3, 4, 5]);
 /* Versions below this were never persisted by a released page. */
 const MIN_KNOWN_PAYLOAD_SCHEMA = 2;
 
@@ -347,6 +347,74 @@ const validatePayload = (payload, idempotencyKey, now, env) => {
   if (pkg.price !== null && pkg.price !== undefined &&
       (typeof pkg.price !== 'number' || !Number.isFinite(pkg.price) || pkg.price < 0)) {
     fail(400, 'invalid_package_price', 'results.recommendedPackage.price must be a non-negative number.');
+  }
+
+  /* Schema 4 carries the intelligence dimensions and the branching record.
+     Both are optional in shape terms — the report recomputes the dimensions
+     from the answers regardless — but a malformed block is a broken client,
+     not something to store and puzzle over later. */
+  if (schemaVersion >= 4) {
+    if (payload.branching !== undefined &&
+        (payload.branching === null || typeof payload.branching !== 'object' ||
+         Array.isArray(payload.branching))) {
+      fail(400, 'invalid_branching', 'branching must be an object when present.');
+    }
+    if (payload.intelligence !== undefined && payload.intelligence !== null &&
+        (typeof payload.intelligence !== 'object' || Array.isArray(payload.intelligence))) {
+      fail(400, 'invalid_intelligence', 'intelligence must be an object or null when present.');
+    }
+    const b = payload.branching;
+    if (b) {
+      ['visibleSteps', 'visibleFields', 'skippedFields', 'staleClearedFields'].forEach(key => {
+        if (b[key] !== undefined && !Array.isArray(b[key])) {
+          fail(400, 'invalid_branching', `branching.${key} must be an array when present.`);
+        }
+      });
+    }
+  }
+
+  /* Schema 5 declares which stage of the progressive review this submission
+     completed. It is validated rather than trusted loosely, because the stage
+     decides what the report is permitted to conclude — a Stage 1 report may
+     never ask for the sale, and a forged stage would lift that ceiling.
+
+     A schema-4 payload has no block and is treated as a full review, which is
+     what it was. */
+  if (schemaVersion >= 5) {
+    const stageBlock = payload.assessmentStage;
+    if (stageBlock !== undefined && stageBlock !== null) {
+      if (typeof stageBlock !== 'object' || Array.isArray(stageBlock)) {
+        fail(400, 'invalid_assessment_stage', 'assessmentStage must be an object when present.');
+      }
+      if (![1, 2].includes(stageBlock.stage)) {
+        fail(400, 'invalid_assessment_stage', 'assessmentStage.stage must be 1 or 2.');
+      }
+      /* A Stage 1 submission has nothing before it, and a Stage 2 submission
+         that names a predecessor must name a real submission id. Never the
+         same id: two stages are two submissions, two idempotency keys, and
+         two reports. */
+      const supersedes = stageBlock.supersedesSubmissionId;
+      if (supersedes !== undefined && supersedes !== null) {
+        if (stageBlock.stage === 1) {
+          fail(400, 'invalid_assessment_stage',
+            'A Stage 1 submission must not supersede another submission.');
+        }
+        if (!isUuid(supersedes)) {
+          fail(400, 'invalid_assessment_stage',
+            'assessmentStage.supersedesSubmissionId must be a UUID.');
+        }
+        if (supersedes === payload.submissionId) {
+          fail(400, 'invalid_assessment_stage',
+            'A submission cannot supersede itself.');
+        }
+      }
+      ['stage1CompletedAt', 'stage2StartedAt', 'stage2CompletedAt'].forEach(key => {
+        const value = stageBlock[key];
+        if (value !== undefined && value !== null && !isIso(value)) {
+          fail(400, 'invalid_assessment_stage', `assessmentStage.${key} must be an ISO 8601 timestamp.`);
+        }
+      });
+    }
   }
 
   /* Field sizes and structural bounds, before any database work. Identity

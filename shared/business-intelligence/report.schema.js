@@ -36,10 +36,12 @@
      v1 (legacy)  — identity.businessKey, a string with no defined resolution
                     rule. A v1 businessKey must NEVER be reinterpreted as a
                     businessId. See docs/decisions/ADR-001. */
-  const BIR_SCHEMA_VERSION = 2;
+  const BIR_SCHEMA_VERSION = 4;
   const BIR_SCHEMA_VERSION_HISTORY = [
     { version: 1, status: 'legacy', note: 'identity.businessKey; no identity resolution.' },
-    { version: 2, status: 'current', note: 'identity.businessId (UUID) canonical; businessKey deprecated.' }
+    { version: 2, status: 'superseded', note: 'identity.businessId (UUID) canonical; businessKey deprecated.' },
+    { version: 3, status: 'superseded', note: 'Assessment Intelligence Expansion: intelligenceDimensions, populated capacity/decision/budget/implementation/objection evidence, capacity-aware opportunity clamp.' },
+    { version: 4, status: 'current', note: 'Two-stage progressive assessment: assessmentProgress, result states, preliminary versus full confidence, stage-scoped close readiness.' }
   ];
 
   /* Field descriptor helper. Keeps one field per line and readable. */
@@ -52,6 +54,22 @@
   const VOCAB = {
     confidenceBand: ['low', 'medium', 'high'],
     readinessBand: ['educate', 'clarify', 'present_offer', 'ask_for_sale', 'escalate'],
+
+    /* Where the visitor has got to, and what may therefore be said to them.
+       An ordered ladder: a later state never reverts to an earlier one for the
+       same journey, because a Stage 2 report supersedes a Stage 1 report
+       rather than replacing it. */
+    resultState: [
+      'preliminary_results',   /* Stage 1 complete and nothing further is outstanding */
+      'fit_review_available',  /* Stage 1 complete; Stage 2 evidence would improve accuracy */
+      'fit_review_complete',   /* Stage 2 complete; full close-readiness evidence present */
+      'activation_ready'       /* Stage 2 complete AND the deterministic rules support an offer */
+    ],
+
+    /* Preliminary confidence is not "low confidence". It is confidence in a
+       smaller claim: everything Stage 1 asked about is measured, and the
+       report says plainly what it did not ask. */
+    confidenceKind: ['preliminary', 'full'],
     capacityHeadroom: ['none', 'limited', 'moderate', 'ample', 'unknown'],
     oversellRisk: ['low', 'moderate', 'high', 'unknown'],
     qualificationOutcome: ['qualified', 'nurture', 'disqualified', 'insufficient_data'],
@@ -171,9 +189,72 @@
     unknown_decision_authority: 'clarify',
     low_estimate_confidence:    'present_offer',
     unresolved_objection:       'present_offer',
+    /* A concern the prospect has already been burned by, or does not believe
+       the product works, is not answered by presenting an offer harder. */
+    severe_objection:           'clarify',
     capacity_oversell_risk:     'clarify',
+    /* Cannot decide alone AND cannot name who can. An approval path turns this
+       from a blocker into a next step, which is why its absence is the test. */
+    no_defined_approval_path:   'clarify',
     stale_assessment_data:      'clarify'
   };
+
+  /* ---------------------------------------------------------
+     Two-stage progressive assessment
+     --------------------------------------------------------- */
+
+  /* What each stage is permitted to conclude.
+
+     The rule that matters: Stage 1 MAY NEVER ask for the sale. It has not
+     asked about authority, budget, timing, integration, or objections, so a
+     high score there measures a promising operational picture and nothing
+     about whether this business should be sold to today. Capping the band is
+     how that stays true no matter how the weights move later. */
+  const STAGE_POLICY = {
+    1: {
+      id: 'stage1',
+      name: 'Growth Review',
+      maxBand: 'present_offer',
+      confidenceKind: 'preliminary',
+      closeReadinessProvisional: true,
+      mayUseApprovedCloseLanguage: false
+    },
+    2: {
+      id: 'stage2',
+      name: 'Fit and Activation Review',
+      maxBand: null,
+      confidenceKind: 'full',
+      closeReadinessProvisional: false,
+      mayUseApprovedCloseLanguage: true
+    }
+  };
+
+  /* The close-readiness signals Stage 1 can actually evidence.
+
+     Stage 1 scores ONLY these, with the weights renormalised across them.
+     Scoring the rest as zero would be arithmetically tidy and substantively
+     wrong: it would report "not asked" as "answered badly", and no Stage 1
+     result could ever exceed roughly 35 however good the business looked.
+     The excluded signals are still listed, still zero, and still flagged so
+     nothing downstream mistakes a renormalised score for a complete one. */
+  const STAGE1_READINESS_SIGNALS = [
+    'packageFit',
+    'capacity',
+    'estimateConfidence',
+    'engagementBehavior',
+    'scopeStandardization'
+  ];
+
+  /* Soft blockers that exist only because Stage 2 has not been asked yet.
+     Applying them at Stage 1 would cap every preliminary result at `clarify`
+     for the sole reason that we chose not to ask — which is the friction this
+     whole split exists to remove. They apply in full at Stage 2. */
+  const STAGE2_EVIDENCE_BLOCKERS = [
+    'unknown_decision_authority',
+    'no_defined_approval_path',
+    'unresolved_objection',
+    'severe_objection'
+  ];
 
   /* The only approved high-readiness close sentence. Never paraphrased,
      never generated, never combined with an invented incentive. */
@@ -250,6 +331,19 @@
       supersededBy: f('uuid', { note: 'Set when a newer BIR replaces this one as current.' }),
       isCurrent: f('boolean', { required: true }),
       sourceEvents: f('array<string>', { note: 'Event ids that contributed, for audit.' })
+    },
+
+    /* ---- how far through the review this report was generated ---- */
+    assessmentProgress: {
+      assessmentStageCompleted: f('integer', { required: true, values: [1, 2], note: 'Highest stage completed when this report was generated.' }),
+      stage1CompletedAt: f('iso8601', { nullable: true }),
+      stage2CompletedAt: f('iso8601', { nullable: true, note: 'Null on every preliminary report.' }),
+      resultState: f('enum', { required: true, values: 'VOCAB.resultState' }),
+      confidenceKind: f('enum', { required: true, values: 'VOCAB.confidenceKind', note: 'preliminary reports measure a smaller claim, not a worse one.' }),
+      closeReadinessProvisional: f('boolean', { required: true, note: 'True whenever close readiness was computed without the Stage 2 evidence.' }),
+      missingStage2Evidence: f('array<string>', { note: 'Stage 2 field names not yet answered. Empty on a complete fit review.' }),
+      stage1SubmissionId: f('uuid', { nullable: true, note: 'The preliminary submission this one continues. Null on a Stage 1 report.' }),
+      supersedesPreliminaryBir: f('boolean', { note: 'True when this full report supersedes a preliminary one. Both remain readable.' })
     },
 
     /* ---- profiles ---- */
@@ -537,6 +631,9 @@
     READINESS_BANDS,
     HARD_BLOCKERS,
     SOFT_BLOCKERS,
+    STAGE_POLICY,
+    STAGE1_READINESS_SIGNALS,
+    STAGE2_EVIDENCE_BLOCKERS,
     APPROVED_CLOSE_LANGUAGE,
     CAPACITY_HEADROOM_BANDS,
     LIFECYCLE_POLICY,

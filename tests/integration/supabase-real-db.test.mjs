@@ -33,6 +33,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
+import { createRequire } from 'node:module';
+
+/* The real Business Intelligence Engine. Section M stores reports it actually
+   produces rather than a stand-in: the stage rules live inside that artifact,
+   and a stand-in with the right shape would prove the triggers fire and
+   nothing at all about what they fire on. */
+const bie = createRequire(import.meta.url)('../../shared/business-intelligence/generate-bir.js');
 
 /* ---------- guards ---------- */
 
@@ -162,6 +169,115 @@ const payload = ({ submissionId, sessionId, name = 'Polished Nail Studio',
   answers: { technicians: '3', averageTicket: '50' },
   results: { score: 26, opportunity: 1679.7 }
 });
+
+/* ---------- staged fixtures (migration 0004) ----------
+   A structurally complete schema-5 payload, close enough to what the engine
+   builds that generate-bir.js produces a real report from it. Stage 1 carries
+   Stage 1 answers ONLY — absent keys, not empty strings, because an unasked
+   question is not a blank answer. */
+
+const STAGE1_ANSWERS = {
+  technicians: '3', appointmentsDay: '12', averageTicket: '50', daysOpen: '24',
+  callsDay: '8', missedCallsDay: '2', missedCallProcess: '1',
+  noShowsWeek: '2', cancelsWeek: '3', reminders: '1', waitlist: '0',
+  rebooking: '1', reactivation: '0', inactiveClients: '150',
+  reviewCount: '65', rating: '4.4', reviewRequests: '1', promotions: '1',
+  locationCount: '1', capacity90Day: '11_20'
+};
+
+const STAGE2_ANSWERS = {
+  preferredContact: 'email', challenge: 'Filling open appointments',
+  yearsInBusiness: '4_10', bookingPlatform: 'square', bookingPlatformStaying: 'keep',
+  willingToChangeSoftware: 'maybe',
+  willingnessToExpand: 'if_proven', capacityLeadTime: 'weeks_2_4',
+  respondentRole: 'owner', canApprove: 'yes',
+  decisionTiming: 'this_month', startTiming: 'within_month', urgency: 'important',
+  budgetSignal: 'approve_if_value',
+  phoneSetup: 'mobile_only', customIntegrationNeeded: 'no',
+  primaryConcern: 'none'
+};
+
+const DISCLAIMER =
+  'This is a preliminary estimate based on your answers and is not a guarantee of revenue or results.';
+
+const stagedPayload = ({ stage, submissionId, sessionId, name = 'Polished Nail Studio',
+                         contactEmail = email('staged'), submittedAt = new Date().toISOString(),
+                         supersedesSubmissionId = null }) => {
+  const stageOne = stage === 1;
+  const answers = {
+    salonName: name, ownerName: 'Test Owner', email: contactEmail, mobile: '',
+    ...STAGE1_ANSWERS,
+    ...(stageOne ? {} : STAGE2_ANSWERS)
+  };
+  return {
+    schemaVersion: 5,
+    assessmentVersion: '1.3.0',
+    submissionId,
+    assessmentSessionId: sessionId,
+    vertical: { id: 'nails', name: 'Nail Salons' },
+    submittedAt,
+    assessmentStage: {
+      stage,
+      stageId: `stage${stage}`,
+      stageName: stageOne ? 'Growth Review' : 'Fit and Activation Review',
+      totalStages: 2,
+      stage1CompletedAt: submittedAt,
+      stage2StartedAt: stageOne ? null : submittedAt,
+      stage2CompletedAt: stageOne ? null : submittedAt,
+      supersedesSubmissionId: stageOne ? null : supersedesSubmissionId,
+      trigger: stageOne ? 'stage1_complete' : 'improve_recommendation'
+    },
+    branching: {
+      stage,
+      visibleSteps: stageOne ? [1, 2, 3, 4, 5, 6, 7, 8, 9] : [10, 11, 12, 14, 15, 16, 17],
+      totalSteps: 17,
+      stageSteps: stageOne ? [1, 2, 3, 4, 5, 6, 7, 8, 9] : [10, 11, 12, 13, 14, 15, 16, 17],
+      visibleFields: Object.keys(answers),
+      skippedFields: stageOne ? [] : ['multiLocationSystems', 'otherApprovers', 'concernDetail'],
+      staleClearedFields: [],
+      questionSetVersion: 'nails-questions-3.0.0'
+    },
+    contact: {
+      salonName: name, ownerName: 'Test Owner', email: contactEmail, mobile: '',
+      preferredContact: stageOne ? '' : 'email',
+      locationCount: '1'
+    },
+    consent: {
+      resultsDeliveryConsent: {
+        field: 'consentResults', granted: true, available: true,
+        statement: 'Send my assessment results and directly related follow-up to the email address above.',
+        recordedAt: submittedAt
+      }
+    },
+    integrity: { honeypotFilled: false, challengePresented: false },
+    attribution: {
+      firstTouch: {
+        url: 'https://nails.cedservice.com/?utm_source=qr_card',
+        referrer: 'https://qr.example/',
+        utm: { utm_source: 'qr_card' },
+        occurredAt: submittedAt
+      },
+      latestTouch: { url: 'https://nails.cedservice.com/', referrer: null, utm: {}, occurredAt: submittedAt }
+    },
+    answers,
+    results: {
+      opportunity: 1679.7,
+      opportunityFormatted: '$1,680',
+      score: 26,
+      dimensions: { missedOpportunity: 28, appointmentProtection: 24,
+                    retention: 22, reputation: 30, marketing: 30 },
+      priorities: ['Recover missed calls and inquiries automatically.',
+                   'Automate reminders and fill last-minute cancellations.',
+                   'Create consistent rebooking and client-reactivation follow-up.'],
+      recommendedPackage: {
+        id: 'salon-growth', label: 'Salon Growth — $597/month',
+        reason: 'Recommended for established salons with appointment, retention, and follow-up opportunities.',
+        name: 'Salon Growth', price: 597, currency: 'USD', interval: 'month'
+      },
+      disclaimer: DISCLAIMER
+    }
+  };
+};
 
 const signal = (type, value, opts = {}) => ({
   type,
@@ -855,6 +971,567 @@ it('a failure mid-transaction leaves no partial records and the key stays retrya
     signals: [signal('email_exact', email('rollback'))] });
   assert.equal(retry.error, null, 'the key was not poisoned by the rollback');
   assert.equal(retry.data.identityStatus, 'linked');
+});
+
+/* ============================================================
+   M. Migration 0004 — the two-stage progressive assessment
+
+   Everything above proves the store. This section proves the two
+   AFTER INSERT triggers 0004 adds, and it does so with REAL
+   Business Intelligence Reports produced by generate-bir.js
+   rather than the compact stand-in used elsewhere. The stage
+   rules live inside that artifact — a stand-in with the right
+   shape and invented contents would prove the triggers fire and
+   nothing about what they fire on.
+   ============================================================ */
+
+const stagedIngest = async ({ key: idemKey, hash, payload: p, birId = id(),
+                              supersedesBirId = null, signals = [], meta = {} }) => {
+  const report = bie.generateBir({
+    submission: p,
+    birId,
+    generatedAt: new Date().toISOString(),
+    supersedesBirId
+  });
+  /* A malformed report must never reach the database from here: a trigger test
+     that silently stored a broken artifact would pass for the wrong reason. */
+  const check = bie.validateGeneratedBir(report);
+  assert.deepEqual(check.errors, [], 'the generated BIR must validate before storage');
+
+  const result = await ingest({ key: idemKey, hash, payload: p, signals, birDoc: report, birId, meta });
+  return { ...result, report };
+};
+
+/* Timeline rows the ingestion of one submission produced, in the order the
+   database recorded them. correlation_id is the submission id for every row
+   ingest_assessment writes AND for every row the 0004 triggers write. */
+const eventsFor = async submissionId => {
+  const { data, error } = await db.from('timeline_events')
+    .select('event_name, event_version, occurred_at, recorded_at, producer, idempotency_key, payload')
+    .eq('correlation_id', submissionId)
+    .order('recorded_at', { ascending: true });
+  if (error) throw new Error(`timeline read failed: ${error.message}`);
+  return data;
+};
+const namesOf = events => events.map(e => e.event_name);
+
+it('M1 — a Stage 1 submission stores a preliminary BIR and emits only Stage 1 events', async () => {
+  const submissionId = id();
+  const sessionId = id();
+  const key = `it-${RUN}-stage1`;
+  const p = stagedPayload({ stage: 1, submissionId, sessionId, name: `Staged ${RUN}` });
+
+  const before = {
+    businesses: await count('business_records'),
+    submissions: await count('assessment_submissions'),
+    birs: await count('business_intelligence_reports'),
+    events: await count('timeline_events')
+  };
+
+  const { data, error, report } = await stagedIngest({
+    key, hash: `h-${RUN}-stage1`, payload: p,
+    signals: [signal('email_exact', email('staged')), signal('business_name', `staged ${RUN}`)]
+  });
+
+  assert.equal(error, null, error && error.message);
+  assert.equal(data.replayed, false);
+  assert.equal(data.payloadSchemaVersion, 5, 'payload schema 5 is accepted');
+  assert.equal(data.supersedesBirId, null, 'nothing precedes a preliminary report');
+
+  assert.equal(await count('business_records'), before.businesses + 1);
+  assert.equal(await count('assessment_submissions'), before.submissions + 1);
+  assert.equal(await count('business_intelligence_reports'), before.birs + 1);
+  assert.equal(await count('timeline_events'), before.events + 7,
+    'five from the function plus stage1.completed and preliminary_bir.generated');
+
+  /* KNOWN LIMITATION — the response enumerates the events ingest_assessment
+     wrote ITSELF. The two written by the 0004 triggers are not in the list,
+     because a trigger cannot append to the function's local array. They are
+     discoverable by correlation_id, which is what this suite uses. Asserted so
+     the gap is a decision rather than a surprise. See
+     docs/REAL_POSTGRES_VALIDATION.md. */
+  assert.equal(data.timelineEventIds.length, 5,
+    'timelineEventIds covers the function\'s own events, not the triggers\'');
+
+  const events = await eventsFor(submissionId);
+  const names = namesOf(events);
+
+  /* Same regression as M2, on the preliminary side. */
+  const birEvent = events.find(e => e.event_name === 'bir.generated');
+  const prelimEvent = events.find(e => e.event_name === 'preliminary_bir.generated');
+  assert.equal(prelimEvent.occurred_at, birEvent.occurred_at,
+    'two events describing one BIR insert must carry one timestamp');
+  ['business.created', 'identity.resolved', 'identity.linked',
+   'assessment.completed', 'bir.generated',
+   'stage1.completed', 'preliminary_bir.generated']
+    .forEach(name => assert.ok(names.includes(name), `missing ${name}`));
+  ['stage2.started', 'stage2.completed', 'full_bir.generated']
+    .forEach(name => assert.ok(!names.includes(name), `Stage 2 event leaked: ${name}`));
+
+  /* Stored BIR JSON, read back from Postgres rather than from memory. */
+  const [stored] = await rows('business_intelligence_reports', 'bir_id', report.identity.birId);
+  assert.equal(stored.schema_version, 4);
+  const doc = stored.report;
+  assert.equal(doc.assessmentProgress.assessmentStageCompleted, 1);
+  assert.equal(doc.assessmentProgress.resultState, 'fit_review_available');
+  assert.equal(doc.assessmentProgress.confidenceKind, 'preliminary');
+  assert.equal(doc.estimateConfidence.kind, 'preliminary');
+  assert.equal(doc.assessmentProgress.closeReadinessProvisional, true);
+  assert.equal(doc.closeReadinessProfile.provisional, true);
+  assert.notEqual(doc.closeReadinessProfile.band, 'ask_for_sale',
+    'a preliminary report may never ask for the sale');
+  assert.equal(doc.closeReadinessProfile.approvedLanguageKey, null);
+  assert.ok(doc.assessmentProgress.missingStage2Evidence.length > 0);
+  ['canApprove', 'budgetSignal', 'bookingPlatform', 'primaryConcern']
+    .forEach(f => assert.ok(doc.assessmentProgress.missingStage2Evidence.includes(f), f));
+
+  /* Attribution and consent survive ingestion untouched. */
+  const [submission] = await rows('assessment_submissions', 'submission_id', submissionId);
+  assert.equal(submission.raw_payload.attribution.firstTouch.url, p.attribution.firstTouch.url);
+  assert.equal(submission.attribution_snapshot.firstTouch.utm.utm_source, 'qr_card');
+  assert.equal(submission.consent_snapshot.resultsDeliveryConsent.granted, true);
+  assert.equal(submission.submitted_at.startsWith(p.submittedAt.slice(0, 19)), true);
+});
+
+it('M2 — a Stage 2 submission in the same session supersedes the preliminary BIR', async () => {
+  const sessionId = id();
+  const stage1Id = id();
+  const stage2Id = id();
+
+  const first = await stagedIngest({
+    key: `it-${RUN}-chain-s1`, hash: `h-${RUN}-chain-s1`,
+    payload: stagedPayload({ stage: 1, submissionId: stage1Id, sessionId, name: `Chain ${RUN}` }),
+    signals: [signal('email_exact', email('chain'))]
+  });
+  assert.equal(first.error, null, first.error && first.error.message);
+  const businessId = first.data.businessId;
+  const preliminaryBirId = first.data.birId;
+
+  const before = {
+    submissions: await count('assessment_submissions'),
+    birs: await count('business_intelligence_reports'),
+    events: await count('timeline_events')
+  };
+
+  const second = await stagedIngest({
+    key: `it-${RUN}-chain-s2`, hash: `h-${RUN}-chain-s2`,
+    payload: stagedPayload({ stage: 2, submissionId: stage2Id, sessionId,
+                             supersedesSubmissionId: stage1Id, name: `Chain ${RUN}` }),
+    signals: [signal('email_exact', email('chain'))]
+  });
+  assert.equal(second.error, null, second.error && second.error.message);
+
+  assert.equal(second.data.businessId, businessId, 'the session links both stages');
+  assert.equal(second.data.supersedesBirId, preliminaryBirId);
+  assert.equal(await count('assessment_submissions'), before.submissions + 1);
+  assert.equal(await count('business_intelligence_reports'), before.birs + 1);
+  assert.equal(await count('timeline_events'), before.events + 7,
+    'four from the function plus stage2.started, stage2.completed, full_bir.generated');
+
+  /* The chain, read from the database. */
+  const [fullRow] = await rows('business_intelligence_reports', 'bir_id', second.data.birId);
+  assert.equal(fullRow.supersedes_bir_id, preliminaryBirId);
+  const [record] = await rows('business_records', 'business_id', businessId);
+  assert.equal(record.current_bir_id, second.data.birId, 'current points at the full report');
+
+  /* The preliminary report is still there, still preliminary, untouched. */
+  const [prelimRow] = await rows('business_intelligence_reports', 'bir_id', preliminaryBirId);
+  assert.ok(prelimRow, 'the preliminary report is preserved');
+  assert.equal(prelimRow.report.assessmentProgress.assessmentStageCompleted, 1);
+  assert.equal(prelimRow.report.closeReadinessProfile.provisional, true);
+
+  const full = fullRow.report;
+  assert.equal(full.assessmentProgress.assessmentStageCompleted, 2);
+  assert.equal(full.assessmentProgress.confidenceKind, 'full');
+  assert.equal(full.estimateConfidence.kind, 'full');
+  assert.equal(full.assessmentProgress.closeReadinessProvisional, false);
+  assert.equal(full.closeReadinessProfile.provisional, false);
+  assert.equal(full.assessmentProgress.stage1SubmissionId, stage1Id);
+  assert.equal(full.assessmentProgress.supersedesPreliminaryBir, true);
+  assert.equal(full.assessmentProgress.resultState !== 'fit_review_available', true);
+  /* Readiness evidence that Stage 1 could not have is populated now. */
+  Object.values(full.closeReadinessProfile.signals)
+    .forEach(s => assert.equal(s.inScope, true, 'every signal is in scope at Stage 2'));
+  assert.equal(full.decisionProfile.canApprove, 'yes');
+  assert.equal(full.budgetProfile.signal, 'approve_if_value');
+  assert.equal(full.technologyProfile.bookingSystem, 'square');
+  /* Approved close language only ever accompanies ask_for_sale. */
+  if (full.closeReadinessProfile.band === 'ask_for_sale') {
+    assert.equal(full.closeReadinessProfile.approvedLanguageKey, 'ask_for_sale');
+  } else {
+    assert.equal(full.closeReadinessProfile.approvedLanguageKey, null);
+  }
+
+  const events = await eventsFor(stage2Id);
+  const s2 = namesOf(events);
+  ['stage2.started', 'stage2.completed', 'full_bir.generated']
+    .forEach(name => assert.ok(s2.includes(name), `missing ${name}`));
+  ['stage1.completed', 'preliminary_bir.generated']
+    .forEach(name => assert.ok(!s2.includes(name), `Stage 1 event duplicated: ${name}`));
+
+  /* REGRESSION — real-Postgres validation, 2026-08-05.
+     bir.generated and full_bir.generated describe the SAME insert in the SAME
+     transaction. The first version of the trigger anchored on generated_at
+     while ingest_assessment anchors on least(submitted_at, now()), and the two
+     drifted by 104 seconds in the first validated run. The browser retry queue
+     holds submissions for up to 30 days, so the gap is bounded only by that
+     window. One insert, one timestamp. */
+  const birEvent = events.find(e => e.event_name === 'bir.generated');
+  const fullEvent = events.find(e => e.event_name === 'full_bir.generated');
+  assert.equal(fullEvent.occurred_at, birEvent.occurred_at,
+    'two events describing one BIR insert must carry one timestamp');
+
+  /* And Stage 1's own events were not written a second time. */
+  const s1 = namesOf(await eventsFor(stage1Id));
+  assert.equal(s1.filter(n => n === 'stage1.completed').length, 1);
+  assert.equal(s1.filter(n => n === 'preliminary_bir.generated').length, 1);
+});
+
+it('M3 — replaying either stage creates nothing, triggers included', async () => {
+  const sessionId = id();
+  const stage1Id = id();
+  const stage2Id = id();
+
+  const p1 = stagedPayload({ stage: 1, submissionId: stage1Id, sessionId, name: `Replay ${RUN}` });
+  const p2 = stagedPayload({ stage: 2, submissionId: stage2Id, sessionId,
+                             supersedesSubmissionId: stage1Id, name: `Replay ${RUN}` });
+
+  const a = await stagedIngest({ key: `it-${RUN}-rep-s1`, hash: `h-${RUN}-rep-s1`, payload: p1 });
+  const b = await stagedIngest({ key: `it-${RUN}-rep-s2`, hash: `h-${RUN}-rep-s2`, payload: p2 });
+  assert.equal(a.error, null);
+  assert.equal(b.error, null);
+
+  const before = {
+    submissions: await count('assessment_submissions'),
+    birs: await count('business_intelligence_reports'),
+    events: await count('timeline_events')
+  };
+
+  /* Deliberately different BIR ids: a replay must ignore them entirely, which
+     also means the triggers cannot fire again — nothing is inserted to fire on. */
+  const replay1 = await stagedIngest({ key: `it-${RUN}-rep-s1`, hash: `h-${RUN}-rep-s1`,
+                                       payload: p1, birId: id() });
+  const replay2 = await stagedIngest({ key: `it-${RUN}-rep-s2`, hash: `h-${RUN}-rep-s2`,
+                                       payload: p2, birId: id() });
+
+  assert.equal(replay1.data.replayed, true);
+  assert.equal(replay2.data.replayed, true);
+  assert.equal(replay1.data.birId, a.data.birId, 'the original BIR id is returned');
+  assert.equal(replay2.data.birId, b.data.birId);
+  assert.equal(replay2.data.supersedesBirId, b.data.supersedesBirId);
+
+  assert.equal(await count('assessment_submissions'), before.submissions);
+  assert.equal(await count('business_intelligence_reports'), before.birs);
+  assert.equal(await count('timeline_events'), before.events, 'no staged event fires twice');
+
+  const names = namesOf(await eventsFor(stage2Id));
+  assert.equal(names.filter(n => n === 'stage2.started').length, 1);
+  assert.equal(names.filter(n => n === 'stage2.completed').length, 1);
+  assert.equal(names.filter(n => n === 'full_bir.generated').length, 1);
+});
+
+it('M4 — a payload declaring no stage stays a full review and emits no staged events', async () => {
+  const submissionId = id();
+  const sessionId = id();
+  const key = `it-${RUN}-legacy`;
+
+  const p = stagedPayload({ stage: 2, submissionId, sessionId, name: `Legacy ${RUN}` });
+  /* A page cached before this deploy: schema 4, no assessmentStage block. */
+  delete p.assessmentStage;
+  delete p.results.opportunityRange;
+  p.schemaVersion = 4;
+
+  const before = { events: await count('timeline_events') };
+  const { data, error, report } = await stagedIngest({
+    key, hash: `h-${RUN}-legacy`, payload: p
+  });
+
+  assert.equal(error, null, error && error.message);
+  assert.equal(data.payloadSchemaVersion, 4, 'schema 4 remains accepted');
+  assert.equal(await count('timeline_events'), before.events + 5, 'only the function\'s own events');
+
+  const names = namesOf(await eventsFor(submissionId));
+  assert.ok(names.includes('assessment.completed'));
+  assert.ok(names.includes('bir.generated'));
+  assert.ok(!names.some(n => n.startsWith('stage')), 'no staged event for an unstaged review');
+  assert.ok(!names.some(n => n.endsWith('_bir.generated')),
+    'naming it a full-review report would assert a review that never happened');
+
+  const [stored] = await rows('business_intelligence_reports', 'bir_id', report.identity.birId);
+  assert.equal(stored.report.assessmentProgress.assessmentStageCompleted, 2);
+  assert.equal(stored.report.assessmentProgress.stageDeclared, false);
+  assert.equal(stored.report.closeReadinessProfile.provisional, false);
+});
+
+it('M5 — staged events satisfy the timeline constraint under maximum tolerated clock skew', async () => {
+  const sessionId = id();
+  const submissionId = id();
+  /* The endpoint accepts up to five minutes of future skew. The trigger clamps
+     with least(submitted_at, now()) for the same reason ingest_assessment does:
+     recorded_at >= occurred_at must hold or the whole transaction aborts. */
+  const future = new Date(Date.now() + 5 * 60 * 1000 - 1000).toISOString();
+  const started = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+
+  const p = stagedPayload({ stage: 2, submissionId, sessionId, name: `Skew ${RUN}`,
+                            submittedAt: future, supersedesSubmissionId: id() });
+  p.assessmentStage.stage2StartedAt = started;
+
+  const { data, error } = await stagedIngest({
+    key: `it-${RUN}-skew`, hash: `h-${RUN}-skew`, payload: p,
+    meta: { clockSkewDetected: true }
+  });
+  assert.equal(error, null, error && error.message);
+  assert.ok(data.ok);
+
+  const events = await eventsFor(submissionId);
+  assert.ok(events.length >= 7);
+  events.forEach(e => {
+    assert.ok(Date.parse(e.recorded_at) >= Date.parse(e.occurred_at),
+      `${e.event_name}: recorded_at must not precede occurred_at`);
+  });
+
+  /* The visitor's own timestamp is preserved verbatim on the submission row
+     even though every event timestamp was clamped. */
+  const [submission] = await rows('assessment_submissions', 'submission_id', submissionId);
+  assert.equal(submission.raw_payload.submittedAt, future);
+  assert.equal(submission.raw_payload.assessmentStage.stage2StartedAt, started);
+});
+
+it('M6 — stage2.started carries when the fit review opened, not when it landed', async () => {
+  const sessionId = id();
+  const submissionId = id();
+  const opened = new Date(Date.now() - 8 * 60 * 1000).toISOString();
+
+  const p = stagedPayload({ stage: 2, submissionId, sessionId, name: `Gap ${RUN}`,
+                            supersedesSubmissionId: id() });
+  p.assessmentStage.stage2StartedAt = opened;
+
+  const { error } = await stagedIngest({ key: `it-${RUN}-gap`, hash: `h-${RUN}-gap`, payload: p });
+  assert.equal(error, null, error && error.message);
+
+  const events = await eventsFor(submissionId);
+  const started = events.find(e => e.event_name === 'stage2.started');
+  const completed = events.find(e => e.event_name === 'stage2.completed');
+  assert.ok(started && completed);
+  assert.ok(Date.parse(started.occurred_at) < Date.parse(completed.occurred_at),
+    'the gap between opening and finishing must be recoverable from the timeline');
+  assert.equal(Math.abs(Date.parse(started.occurred_at) - Date.parse(opened)) < 1000, true);
+  assert.equal(started.payload.continuesSubmissionId, p.assessmentStage.supersedesSubmissionId);
+});
+
+it('M7 — a failure inside the staged flow leaves no partial chain and no orphan events', async () => {
+  const sessionId = id();
+  const stage1Id = id();
+
+  /* First a real Stage 1, so there is a chain to damage. */
+  const good = await stagedIngest({
+    key: `it-${RUN}-roll-s1`, hash: `h-${RUN}-roll-s1`,
+    payload: stagedPayload({ stage: 1, submissionId: stage1Id, sessionId, name: `Roll ${RUN}` }),
+    signals: [signal('email_exact', email('roll'))]
+  });
+  assert.equal(good.error, null);
+  const businessId = good.data.businessId;
+  const preliminaryBirId = good.data.birId;
+
+  const before = {
+    submissions: await count('assessment_submissions'),
+    birs: await count('business_intelligence_reports'),
+    events: await count('timeline_events'),
+    keys: await count('idempotency_records')
+  };
+
+  /* Now a Stage 2 whose BIR fails its CHECK. The submission row — and
+     therefore the stage2.started / stage2.completed trigger inserts — has
+     already happened by the time the BIR insert raises. */
+  const failId = id();
+  const failKey = `it-${RUN}-roll-s2`;
+  const p2 = stagedPayload({ stage: 2, submissionId: failId, sessionId,
+                             supersedesSubmissionId: stage1Id, name: `Roll ${RUN}` });
+  const badReport = bie.generateBir({
+    submission: p2, birId: id(), generatedAt: new Date().toISOString()
+  });
+  badReport.estimateConfidence.band = 'bogus';
+
+  const failed = await ingest({ key: failKey, hash: `h-${RUN}-roll-s2`, payload: p2,
+    signals: [signal('email_exact', email('roll'))], birDoc: badReport });
+  assert.ok(failed.error, 'the invalid BIR must be refused');
+
+  assert.equal(await count('assessment_submissions'), before.submissions, 'no partial submission');
+  assert.equal(await count('business_intelligence_reports'), before.birs, 'no partial BIR');
+  assert.equal(await count('timeline_events'), before.events,
+    'the trigger rows rolled back with everything else');
+  assert.equal(await count('idempotency_records'), before.keys, 'not even the claim survives');
+
+  /* Nothing orphaned: no staged event exists for a submission that does not. */
+  assert.equal((await eventsFor(failId)).length, 0);
+
+  /* The chain is exactly where it was. */
+  const [record] = await rows('business_records', 'business_id', businessId);
+  assert.equal(record.current_bir_id, preliminaryBirId,
+    'current_bir_id still points at a BIR that exists');
+  const [stillThere] = await rows('business_intelligence_reports', 'bir_id', record.current_bir_id);
+  assert.ok(stillThere, 'current_bir_id never points at a missing BIR');
+
+  /* And the key is retryable. */
+  const retry = await stagedIngest({ key: failKey, hash: `h-${RUN}-roll-s2`, payload: p2,
+    signals: [signal('email_exact', email('roll'))] });
+  assert.equal(retry.error, null, 'the key was not poisoned by the rollback');
+  assert.equal(retry.data.supersedesBirId, preliminaryBirId);
+});
+
+it('M8 — a trigger failure aborts the whole ingestion rather than losing an event', async () => {
+  /* A staged submission whose stage cannot be parsed. The trigger casts it,
+     so the cast raises inside the transaction. What is being proved is not
+     that bad input is rejected — it is that a trigger raising takes the whole
+     transaction with it, leaving no submission behind without its events. */
+  const submissionId = id();
+  const sessionId = id();
+  const key = `it-${RUN}-trigfail`;
+  const p = stagedPayload({ stage: 1, submissionId, sessionId, name: `Trig ${RUN}` });
+  p.assessmentStage.stage = 'one';
+
+  const before = {
+    submissions: await count('assessment_submissions'),
+    events: await count('timeline_events'),
+    keys: await count('idempotency_records')
+  };
+
+  const { error } = await stagedIngest({ key, hash: `h-${RUN}-trigfail`, payload: p });
+  assert.ok(error, 'an unparseable stage must abort ingestion');
+
+  assert.equal(await count('assessment_submissions'), before.submissions);
+  assert.equal(await count('timeline_events'), before.events);
+  assert.equal(await count('idempotency_records'), before.keys);
+  assert.equal((await eventsFor(submissionId)).length, 0);
+});
+
+it('M9 — capacity-adjusted ranges survive storage and match what the page shows', async () => {
+  const cases = [
+    { band: '11_20', label: 'known capacity',      expect: { known: true } },
+    { band: 'none',  label: 'zero capacity',       expect: { known: true, clamped: true } },
+    { band: 'unsure', label: 'unknown capacity',   expect: { known: false } },
+    { band: 'over_20', label: 'expansion-capable', expect: { known: true } }
+  ];
+
+  for (const c of cases) {
+    const submissionId = id();
+    const sessionId = id();
+    const p = stagedPayload({ stage: 1, submissionId, sessionId, name: `Cap ${RUN}` });
+    p.answers.capacity90Day = c.band;
+    if (c.band !== 'none' && c.band !== 'unsure') {
+      p.answers.willingnessToExpand = 'yes';
+    }
+    /* What the page computed, through the SAME function the page calls. */
+    const shown = bie.visibleOpportunityRange({
+      point: p.results.opportunity, answers: p.answers
+    });
+    p.results.opportunityRange = {
+      low: shown.low, point: shown.point, high: shown.high,
+      formatted: `$${Math.round(shown.low)} – $${Math.round(shown.high)}`,
+      capacityKnown: shown.capacityKnown, clampApplied: shown.clampApplied,
+      assumptions: 'Based on the answers you gave.'
+    };
+
+    const { error, report } = await stagedIngest({
+      key: `it-${RUN}-cap-${c.band}`, hash: `h-${RUN}-cap-${c.band}`, payload: p
+    });
+    assert.equal(error, null, `${c.label}: ${error && error.message}`);
+
+    const [stored] = await rows('business_intelligence_reports', 'bir_id', report.identity.birId);
+    const fin = stored.report.financialOpportunityProfile;
+
+    /* The stored report and the figure on screen are the same numbers. */
+    assert.equal(fin.capacityAdjusted.point, shown.point, `${c.label}: point`);
+    assert.equal(fin.capacityAdjusted.low, shown.low, `${c.label}: low`);
+    assert.equal(fin.capacityAdjusted.high, shown.high, `${c.label}: high`);
+    assert.equal(stored.raw_payload === undefined, true);
+
+    /* The unconstrained estimate is retained, never overwritten. */
+    assert.equal(fin.unconstrained.point, Math.round(p.results.opportunity * 100) / 100,
+      `${c.label}: the unconstrained figure is preserved`);
+    assert.equal(fin.isDiagnosticEstimate, true);
+    assert.ok(fin.disclaimer && fin.disclaimer.includes('not a guarantee'),
+      `${c.label}: the disclaimer travels with the figure`);
+
+    if (c.expect.known) {
+      assert.equal(stored.report.capacityProfile.ceilingKnown, true, `${c.label}: ceiling known`);
+      assert.equal(typeof fin.capacityAdjusted.ceiling, 'number');
+    } else {
+      assert.equal(stored.report.capacityProfile.ceilingKnown, false,
+        `${c.label}: a missing ceiling is recorded as missing`);
+      assert.equal(fin.capacityAdjusted.ceiling, null);
+      assert.equal(fin.capacityAdjusted.clampApplied, false, `${c.label}: unknown stays unconstrained`);
+      assert.equal(fin.capacityAdjusted.point, fin.unconstrained.point);
+    }
+
+    if (c.expect.clamped) {
+      assert.equal(fin.capacityAdjusted.clampApplied, true, `${c.label}: clamp applied`);
+      assert.ok(fin.capacityAdjusted.point < fin.unconstrained.point, `${c.label}: clamped down`);
+      assert.ok(fin.capacityAdjusted.point > 0,
+        'zero headroom still leaves the backfill opportunity');
+      assert.ok(fin.capacityAdjusted.backfillPortion > 0);
+    }
+  }
+});
+
+it('M10 — the stored payload carries the whole question path', async () => {
+  const submissionId = id();
+  const sessionId = id();
+  const p = stagedPayload({ stage: 2, submissionId, sessionId, name: `Path ${RUN}`,
+                            supersedesSubmissionId: id() });
+
+  const { error } = await stagedIngest({ key: `it-${RUN}-path`, hash: `h-${RUN}-path`, payload: p });
+  assert.equal(error, null, error && error.message);
+
+  const [submission] = await rows('assessment_submissions', 'submission_id', submissionId);
+  const b = submission.raw_payload.branching;
+  const s = submission.raw_payload.assessmentStage;
+
+  assert.equal(b.questionSetVersion, 'nails-questions-3.0.0');
+  assert.equal(b.stage, 2);
+  assert.ok(Array.isArray(b.visibleFields) && b.visibleFields.length > 0);
+  assert.ok(Array.isArray(b.skippedFields));
+  assert.ok(b.skippedFields.includes('multiLocationSystems'));
+  assert.ok(Array.isArray(b.staleClearedFields));
+  assert.ok(Array.isArray(b.visibleSteps) && b.visibleSteps.length > 0);
+
+  assert.equal(s.stage, 2);
+  assert.ok(s.stage1CompletedAt, 'the Stage 1 timestamp travels with Stage 2');
+  assert.ok(s.stage2StartedAt);
+  assert.ok(s.stage2CompletedAt);
+  assert.ok(s.supersedesSubmissionId);
+
+  /* The indexed expression the drop-off report will use resolves on real data. */
+  const { data: staged, error: qErr } = await db.from('assessment_submissions')
+    .select('submission_id').eq('submission_id', submissionId);
+  assert.equal(qErr, null);
+  assert.equal(staged.length, 1);
+});
+
+it('M11 — a Stage 1 payload carries no Stage 2 answer, even after navigating backward', async () => {
+  /* The engine scopes a payload by stage rather than relying on fields
+     happening to be disabled. This asserts the property on the artifact that
+     actually reaches storage. */
+  const submissionId = id();
+  const sessionId = id();
+  const p = stagedPayload({ stage: 1, submissionId, sessionId, name: `Scope ${RUN}` });
+
+  const { error } = await stagedIngest({ key: `it-${RUN}-scope`, hash: `h-${RUN}-scope`, payload: p });
+  assert.equal(error, null, error && error.message);
+
+  const [submission] = await rows('assessment_submissions', 'submission_id', submissionId);
+  const answers = submission.raw_payload.answers;
+
+  ['canApprove', 'budgetSignal', 'bookingPlatform', 'primaryConcern', 'urgency',
+   'phoneSetup', 'yearsInBusiness', 'preferredContact', 'respondentRole']
+    .forEach(f => assert.ok(!(f in answers),
+      `${f} must be absent, not empty: an unasked question is not a blank answer`));
+
+  /* Stage 1's own evidence is all there. */
+  ['locationCount', 'capacity90Day', 'averageTicket', 'missedCallsDay', 'promotions']
+    .forEach(f => assert.ok(f in answers, `${f} is Stage 1 evidence and must be present`));
+
+  assert.equal(submission.raw_payload.contact.preferredContact, '');
 });
 
 /* ---------- L. cleanup ---------- */

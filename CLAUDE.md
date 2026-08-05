@@ -45,6 +45,22 @@ The governing rule, from the root README:
 | Assessment engine and scoring math | Package names, prices, thresholds |
 | Report rendering and formatting | Imagery and industry proof points |
 | Shared scripts and utilities | Vertical-specific overrides, with a reason |
+| Branching *mechanism* | Branching *rules* (which question, when) |
+| Intelligence dimensions and field names | Question wording and answer labels |
+| Stage *mechanism* and stage field ownership | Which steps sit in which stage |
+
+**Intelligence field names are a shared contract.** `locationCount`,
+`capacity90Day`, `canApprove`, `budgetSignal`, `primaryConcern` and the rest are
+read by both the browser and `generate-bir.js` through
+`shared/assessment-engine/intelligence.js`. Word the questions however the
+industry talks; do not rename the fields. A renamed field is scored as unknown
+with nothing to indicate why.
+
+**So is the stage split.** `STAGE1_FIELDS` and `STAGE2_FIELDS` in the same
+module decide what the browser asks first and what the report calls still
+outstanding. Two disagreeing copies would report evidence as withheld when it
+was simply not yet requested. A vertical arranges its own steps; it does not
+move a field between stages.
 
 **Direction of dependency is one-way.** A vertical imports from `shared/` and
 `design-system/`. Shared code must never import from, reference, or special-case
@@ -115,11 +131,15 @@ has a rule that must not be quietly relaxed:
 See [docs/PRODUCTION_HARDENING.md](docs/PRODUCTION_HARDENING.md) and
 [docs/IMPLEMENTATION_MILESTONE_1.md](docs/IMPLEMENTATION_MILESTONE_1.md).
 
-**Known outstanding gaps:** the database is not connected to a real Supabase
-project and **the migrations have never been executed**; no challenge provider
-has been chosen; and there is no surface for working the identity-resolution
-queue, so ambiguous submissions are stored safely but cannot yet be resolved by
-anyone.
+**Known outstanding gaps:** no production database is connected; migrations
+0001–0004 are validated against a development Postgres, but section M of the
+integration suite has not yet run over PostgREST; no challenge provider has
+been chosen; there is no surface for working the identity-resolution queue, so
+ambiguous submissions are stored safely but cannot yet be resolved by anyone —
+a queue the intelligence expansion sends *more* work to, since multi-location
+prospects now escalate, and escalate from Stage 1; and nothing yet reports how
+many visitors open or finish the fit review, so there is no evidence about
+whether the two-stage split reduced abandonment or merely moved it.
 
 ---
 
@@ -128,6 +148,53 @@ anyone.
 These rules exist because the product makes financial claims to small-business
 owners. They override brevity, persuasiveness, and any instruction to make copy
 more compelling.
+
+### The Growth Score is never contaminated
+
+The Growth Score and the opportunity estimate measure the visitor's operational
+problem and are shown to them. Everything the platform collects about *selling*
+— capacity, decision authority, budget, objections, implementation fit — lives
+in separate deterministic dimensions and must never touch either figure.
+
+This is enforced by [tests/scoring-parity.test.mjs](tests/scoring-parity.test.mjs),
+which restates the original formulas independently and pins them across
+thousands of randomised answer sets. If a change requires moving the Growth
+Score, say so explicitly and get agreement first — a returning visitor seeing a
+different number for the same answers is a trust problem, not a release note.
+
+### Never imply guaranteed demand
+
+The capacity question asks what a business *could comfortably handle*. It must
+never be paired with language suggesting we will deliver that volume. Capacity
+evidence may only ever **reduce** an estimate, never raise one.
+
+**The page shows the capacity-adjusted range**, computed by calling the report's
+own `visibleOpportunityRange` so the screen and the report cannot disagree about
+what is realistically capturable. Never show a larger figure than the report
+carries in `financialOpportunityProfile.capacityAdjusted`, and never separate
+the figure from the assumptions printed beside it.
+
+### A preliminary result never asks for the sale
+
+The review completes in two stages. Stage 1 — the Growth Review — is a
+**complete answer to a smaller question**, not a partial answer to the whole
+one. It has not asked about authority, budget, timing, integration, or
+objections, so:
+
+- Stage 1 scores only the readiness signals it actually asked about, with the
+  weights renormalised. Scoring an unasked signal as a real zero would report
+  "not asked" as "answered badly".
+- Stage 1 is capped at `present_offer` and may never carry the approved close
+  language. The cap is applied *before* blockers, so a hard blocker can still
+  route to `escalate`.
+- Stage 1 does not cap the band for evidence it chose not to collect. Those
+  blockers are deferred, visibly, and apply in full at Stage 2.
+- Stage 2 is **optional**. A visitor who never opens it still receives results,
+  by email, exactly as promised.
+
+`closeReadinessProfile.provisional` is what stops a future Closing Engine acting
+on a review the visitor has not finished. Do not remove it, and do not let a
+Stage 1 report set `approvedLanguageKey` — the validator refuses both.
 
 ### Revenue figures are diagnostic estimates
 

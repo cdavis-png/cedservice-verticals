@@ -67,8 +67,9 @@ export function createFakeDb(options = {}) {
     if (linked !== (row.business_id !== null && row.business_id !== undefined)) {
       throw new ConstraintViolation('assessment_submissions_identity_consistency');
     }
+    /* Mirrors migration 0004: payload versions 2-5 are accepted. */
     if (row.payload_schema_version !== null && row.payload_schema_version !== undefined &&
-        (row.payload_schema_version < 2 || row.payload_schema_version > 3)) {
+        (row.payload_schema_version < 2 || row.payload_schema_version > 5)) {
       throw new ConstraintViolation('assessment_submissions_payload_version_check');
     }
   };
@@ -482,6 +483,13 @@ export function createFakeDb(options = {}) {
     if (state.business_intelligence_reports.some(r => r.assessment_submission_id === submissionId)) {
       throw new ConstraintViolation('bir_one_per_submission');
     }
+    /* Mirrors 0001 as widened by 0004: BIR schema versions 2-4. */
+    if (report.schemaVersion < 2 || report.schemaVersion > 4) {
+      throw new ConstraintViolation('bir_schema_version_check');
+    }
+    if (!['low', 'medium', 'high'].includes(report.estimateConfidence?.band ?? 'low')) {
+      throw new ConstraintViolation('bir_confidence_band_check');
+    }
     state.business_intelligence_reports.push({
       bir_id: birId, business_id: businessId, assessment_submission_id: submissionId,
       schema_version: report.schemaVersion, generated_at: nowIso, report,
@@ -537,6 +545,53 @@ export function createFakeDb(options = {}) {
       'Business Intelligence Report generated.',
       { birId, supersedesBirId: previousBirId, confidenceBand: report.estimateConfidence?.band,
         closeReadinessBand: report.closeReadinessProfile?.band });
+
+    /* Mirrors the two AFTER INSERT triggers added by migration 0004. A payload
+       or report that declares no stage emits nothing: inventing a stage event
+       for a review that had no stages would put a false fact into a store that
+       cannot correct one. */
+    const declaredStage = Number(payload.assessmentStage?.stage) || null;
+    if (declaredStage === 1) {
+      appendEvent('stage1.completed', 1, timelineAt, 'assessment-engine', submissionId,
+        'Growth Review completed. Preliminary results delivered.',
+        { submissionId, assessmentSessionId: sessionId, verticalId,
+          assessmentVersion: payload.assessmentVersion,
+          trigger: payload.assessmentStage?.trigger ?? null });
+    } else if (declaredStage === 2) {
+      const startedAt = payload.assessmentStage?.stage2StartedAt;
+      const startedMs = startedAt ? Date.parse(startedAt) : NaN;
+      const clampedStart = new Date(
+        Math.min(Number.isFinite(startedMs) ? startedMs : Date.parse(timelineAt),
+          Date.parse(timelineAt))).toISOString();
+      appendEvent('stage2.started', 1, clampedStart, 'assessment-engine', submissionId,
+        'Fit and Activation Review opened by the visitor.',
+        { submissionId, assessmentSessionId: sessionId,
+          trigger: payload.assessmentStage?.trigger ?? null,
+          continuesSubmissionId: payload.assessmentStage?.supersedesSubmissionId ?? null });
+      appendEvent('stage2.completed', 1, timelineAt, 'assessment-engine', submissionId,
+        'Fit and Activation Review completed.',
+        { submissionId, assessmentSessionId: sessionId, verticalId,
+          assessmentVersion: payload.assessmentVersion,
+          continuesSubmissionId: payload.assessmentStage?.supersedesSubmissionId ?? null });
+    }
+
+    /* stageDeclared, not assessmentStageCompleted: the latter always has a
+       value, the former says whether the submission actually named a stage. */
+    const reportStage = report.assessmentProgress?.stageDeclared === true
+      ? Number(report.assessmentProgress.assessmentStageCompleted) || null
+      : null;
+    if (reportStage) {
+      appendEvent(reportStage === 1 ? 'preliminary_bir.generated' : 'full_bir.generated',
+        1, timelineAt, 'business-intelligence-engine', birId,
+        reportStage === 1
+          ? 'Preliminary Business Intelligence Report generated from the Growth Review.'
+          : 'Full Business Intelligence Report generated from the completed Fit and Activation Review.',
+        { birId, supersedesBirId: previousBirId, assessmentStageCompleted: reportStage,
+          resultState: report.assessmentProgress?.resultState ?? null,
+          confidenceKind: report.assessmentProgress?.confidenceKind ?? null,
+          closeReadinessProvisional: report.assessmentProgress?.closeReadinessProvisional === true,
+          closeReadinessBand: report.closeReadinessProfile?.band ?? null });
+    }
     trip('timeline');
 
     /* 9. Ambiguity or claim conflict -> a case. */

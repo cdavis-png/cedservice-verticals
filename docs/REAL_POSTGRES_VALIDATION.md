@@ -1,24 +1,141 @@
 # Real-Postgres validation
 
-The record of Milestone 1.1's migrations being executed against an actual
-Supabase Postgres, and the checklist for repeating it.
+The record of the migrations being executed against an actual Supabase
+Postgres, and the checklist for repeating it.
 
 **Status: executed and passed.** Blocker B7 — "the SQL has never run" — is
 closed. Everything below was observed, not predicted.
 
-| | |
-|---|---|
-| Project | `ced-cip-dev` (development; created for this purpose) |
-| Region | us-west-1 |
-| Postgres | 17.6 |
-| Migrations | 0001 → 0002 → 0003, in order |
-| Date | 2026-08-04 |
-| Method | Supabase management API; SQL executed directly |
-| Result | **35 structural and behavioural checks passed, 19 constraint violations correctly refused, 2 defects found and fixed** |
+## Runs
+
+| | Run 1 — Milestone 1.1 | Run 2 — migration 0004 |
+|---|---|---|
+| Date | 2026-08-04 | 2026-08-05 |
+| Project | `ced-cip-dev` | `ced-cip-dev` (same) |
+| Region | us-west-1 | us-west-1 |
+| Postgres | 17.6 | **17.6.1.155** |
+| Migrations | 0001 → 0002 → 0003 | 0004, after 0001–0003 |
+| Method | Supabase management API; SQL executed directly | same |
+| Result | 35 checks passed, 19 violations correctly refused, **2 defects found and fixed** | 31 checks passed, 4 forced rollbacks all clean, **1 defect found and fixed, 1 limitation recorded** |
 
 No production system was touched. No credentials were created, printed, or
 stored. The nail-salon page, pricing, scoring, and the assessment itself were
-not modified.
+not modified in either run.
+
+---
+
+## 0. Run 2 — migration 0004 and the two-stage assessment
+
+### What was applied
+
+0004 in three parts: constraints and indexes, the two stage triggers, and the
+timestamp fix for the defect found mid-run. Applied cleanly, in order, after
+0001–0003.
+
+| Check | Result |
+|---|---|
+| Migration applies cleanly | ✔ |
+| Existing rows still valid | ✔ 9 BIRs at schema 2 and 9 submissions at payload 3, all inside the widened ranges. Both constraints added without `NOT VALID`, so Postgres verified every row; `convalidated = true` on both. |
+| BIR schema versions 2–4 accepted | ✔ `CHECK ((schema_version >= 2) AND (schema_version <= 4))` |
+| Payload schema versions 2–5 accepted | ✔ `CHECK ((payload_schema_version IS NULL) OR (…>= 2 AND …<= 5))` |
+| `bir_readiness_band_idx` | ✔ exists, partial on `business_id is not null` |
+| `submissions_assessment_stage_idx` | ✔ exists; `Index Scan`, 4 buffers, 0.181 ms |
+| `bir_result_state_idx` | ✔ exists; `Index Scan`, 0.187 ms |
+| `assessment_submissions_stage_events` trigger | ✔ `AFTER INSERT … FOR EACH ROW` |
+| `bir_stage_event` trigger | ✔ `AFTER INSERT … FOR EACH ROW` |
+| Both functions `SECURITY DEFINER` | ✔ |
+| Both pin `search_path` | ✔ `pg_catalog, public, pg_temp` |
+| Execute revoked | ✔ ACL `postgres=X/postgres \| service_role=X/postgres`; `anon`, `authenticated` and `public` all false |
+| Security advisors | ✔ 10 × INFO `rls_enabled_no_policy` — unchanged, and the intended design. **No new WARN.** |
+| Performance advisors | ✔ all INFO. Three new `unused_index` notices appeared on the new indexes; two cleared once exercised. **No new WARN.** |
+
+The index scans were measured with `enable_seqscan = off`. At 16 rows the
+planner correctly prefers a sequential scan; what is being proved is that the
+expression indexes are *usable*, not that they are chosen at this size.
+
+### Staged ingestion
+
+| # | Scenario | Result |
+|---|---|---|
+| 1 | Stage 1 alone | 1 submission, 1 BIR, **7 events**: the function's 5 plus `stage1.completed` and `preliminary_bir.generated`. No Stage 2 event. `resultState = fit_review_available`, band `present_offer`, never `ask_for_sale`. Attribution, consent and `submitted_at` preserved verbatim. |
+| 2 | Stage 2, same session | Linked to the **same** `businessId` via the session. New submission, new BIR, `supersedes_bir_id` = the preliminary BIR, `current_bir_id` moved to the full BIR, preliminary preserved unchanged. **7 events**: 4 from the function plus `stage2.started`, `stage2.completed`, `full_bir.generated`. No Stage 1 event repeated. |
+| 3 | Replay of both stages | Both returned `replayed: true` with the **original** `birId` and `businessId`, ignoring the fresh BIR ids supplied. Submissions, BIRs and events all unchanged. Exactly one of each staged event name per submission. |
+| 4 | Legacy payload (schema 4, no `assessmentStage`) | Accepted. **5 events only** — no staged event of any kind. Report carries `stageDeclared = false`, `provisional = false`. The two gates are independent: the submission trigger keys off the payload, the BIR trigger off `stageDeclared`. |
+| 5 | Maximum tolerated clock skew | `submittedAt` at +4m59s and `stage2StartedAt` at +5m00s. Every event — including all three staged ones — clamped to `now()`; `recorded_at >= occurred_at` held on all 8. The visitor's claimed timestamps survive verbatim in `raw_payload` and on `submitted_at`. |
+| 6 | `stage2.started` timing | Carries when the fit review **opened** (8 minutes before completion), not when the submission landed, so the gap is recoverable from the timeline. |
+
+### Forced rollbacks
+
+Four failure points, each verified to leave nothing behind. Counts before and
+after were identical in every case: 8 businesses, 12 submissions, 12 BIRs, 60
+events, 12 keys, 13 audits.
+
+| Failure point | How | Result |
+|---|---|---|
+| During staged **trigger** execution | `assessmentStage.stage = "one"`, which the trigger casts | Raised inside the submission insert. No submission, no events, no claim. |
+| Before the preliminary **BIR** insert | invalid `confidence_band` | Submission **and its two trigger events** already written — all unwound. This is also the "after submission, before timeline completion" case: the function's own timeline inserts had not run. |
+| During the function's own **timeline** inserts | a pre-existing `assessment.completed` row colliding on `(event_name, idempotency_key)` | Failed after the submission, its trigger events, and the BIR. All unwound. |
+| During full-BIR **supersession** | Stage 2 in the existing chain with an invalid band | `current_bir_id` still points at the preliminary BIR. |
+
+Also verified across the whole database afterwards: **0** `business_records`
+whose `current_bir_id` names a missing BIR, and **0** BIRs superseding a
+missing BIR. The rolled-back key was then reused successfully — the rollback
+does not poison it.
+
+### Stored BIR JSON
+
+Read back from Postgres, not asserted from memory.
+
+| | Stage 1 BIR | Stage 2 BIR |
+|---|---|---|
+| `schema_version` | 4 | 4 |
+| `assessmentStageCompleted` | 1 | 2 |
+| `confidenceKind` / `estimateConfidence.kind` | `preliminary` | `full` |
+| `closeReadinessProvisional` | `true` | `false` |
+| `resultState` | `fit_review_available` | `activation_ready` |
+| `band` | `present_offer` | `ask_for_sale` |
+| `approvedLanguageKey` | `null` | `ask_for_sale` |
+| `missingStage2Evidence` | 23 fields | 8 (all optional or branched away) |
+| `supersedes_bir_id` | `null` | the preliminary BIR |
+| `current` | no | yes |
+
+The Stage 2 report reached `ask_for_sale` on real deterministic rules, and the
+approved language appeared only there — which is also the proof that Stage 1's
+cap is doing work rather than describing a case that cannot arise.
+
+### Capacity ranges
+
+The figure the page shows and the figure the report calls capacity-adjusted,
+compared field by field **after** a storage round trip.
+
+| Band | Page low / point / high | BIR capacityAdjusted | Equal | Clamped | Ceiling | Unconstrained preserved | Disclaimer |
+|---|---|---|---|---|---|---|---|
+| `11_20` known | 1427.75 / 1679.70 / 1931.66 | identical | ✔ | no | 2381.50 | 1679.70 | ✔ |
+| `none` zero | 651.44 / **766.40** / 881.36 | identical | ✔ | **yes** | 0 | 1679.70 | ✔ |
+| `unsure` unknown | 1175.79 / 1679.70 / 2183.61 | identical | ✔ | no | **null**, `ceilingKnown false` | 1679.70 | ✔ |
+
+Zero capacity clamps to 766.40 and **not to zero**: the backfill portion —
+appointments already on the book — needs no new headroom and is preserved.
+`isDiagnosticEstimate` is true and the disclaimer travels with the figure in
+all three.
+
+### Question-path metadata
+
+| | Stage 1 | Stage 2 |
+|---|---|---|
+| `questionSetVersion` | `nails-questions-3.0.0` | same |
+| visible fields | 24 | 41 |
+| skipped fields | 0 | 3 |
+| stale-cleared | 0 | 0 |
+| visible steps | 9 | 7 |
+| `stage1CompletedAt` / `stage2StartedAt` / `stage2CompletedAt` | set / null / null | set / set / set |
+| Stage 2-only answers present | **0 of 12** | 12 of 12 |
+| Stage 1 evidence present | 5 of 5 | 5 of 5 |
+| `contact.preferredContact` | `""` | `email` |
+
+A Stage 1 payload carries no Stage 2 answer at all — absent keys, not empty
+strings — which is the property that stops "not asked" being stored as
+"declined to answer".
 
 ---
 
@@ -40,24 +157,38 @@ Repeat this against any fresh development project.
 - [ ] `0001_business_record_foundation.sql`
 - [ ] `0002_ingest_assessment.sql`
 - [ ] `0003_production_hardening.sql`
+- [ ] `0004_assessment_intelligence_expansion.sql`
 
-Order matters. 0003 depends on both, **drops and recreates**
+Order matters. 0003 depends on the first two, **drops and recreates**
 `ingest_assessment` (the signature gains `p_meta`), and **narrows** the
-strong-identifier unique index to verified rows.
+strong-identifier unique index to verified rows. 0004 depends on all three; it
+adds no function signature, so it needs no drop.
 
 ### Verify structure
 
 - [ ] 10 tables in `public`
 - [ ] RLS **enabled** on 10, **forced** on 10
 - [ ] **0** policies
-- [ ] 30 indexes, 29 CHECK constraints, 4 triggers, 7 functions
+- [ ] 33 indexes, 29 CHECK constraints, 6 triggers, 9 functions
 - [ ] `ingest_assessment` appears **once**, with 8 arguments
 - [ ] `business_identifiers_strong_unique` is **gone**;
       `business_identifiers_verified_strong_unique` exists
-- [ ] Execute is revoked from `public`, `anon`, `authenticated` on **all seven**
-      functions
+- [ ] `bir_schema_version_check` accepts **2–4**;
+      `assessment_submissions_payload_version_check` accepts **2–5**; both
+      report `convalidated = true`, which is what proves no existing row was
+      stranded
+- [ ] `bir_readiness_band_idx`, `submissions_assessment_stage_idx` and
+      `bir_result_state_idx` exist
+- [ ] `assessment_submissions_stage_events` and `bir_stage_event` triggers
+      exist, both `AFTER INSERT … FOR EACH ROW`
+- [ ] Execute is revoked from `public`, `anon`, `authenticated` on **all nine**
+      functions, `append_stage_timeline_events` and `append_bir_stage_event`
+      included, and both pin `search_path`
 - [ ] Supabase security advisors show no `WARN`; the 10
       `rls_enabled_no_policy` notices are `INFO` and **intended**
+- [ ] Performance advisors show no `WARN`. New indexes appear as INFO
+      `unused_index` until something queries them; that is expected on a fresh
+      apply and is not a finding.
 
 ### Verify behaviour
 
@@ -74,6 +205,26 @@ strong-identifier unique index to verified rows.
 - [ ] Redaction → PII gone, structure and scoring preserved
 - [ ] Rollback → no orphans, key retryable
 
+Staged flow (0004):
+
+- [ ] Stage 1 → `1, 1, 1, 7`; `stage1.completed` and
+      `preliminary_bir.generated` present, no Stage 2 event
+- [ ] Stage 1 report → `provisional true`, band never `ask_for_sale`,
+      `approvedLanguageKey` null
+- [ ] Stage 2, same session → same business, `supersedes_bir_id` = preliminary,
+      `current_bir_id` moved, preliminary preserved, 7 events
+- [ ] `bir.generated` and `{preliminary,full}_bir.generated` share one
+      `occurred_at` — see Defect 3
+- [ ] Replay of either stage → nothing created, no staged event fires twice
+- [ ] Unstaged payload → 5 events, no staged event of any kind
+- [ ] Skew at +5 min → every staged event clamped, `recorded_at >= occurred_at`
+- [ ] Four forced rollbacks → counts identical, no dangling `current_bir_id`,
+      no BIR superseding a missing BIR, key retryable
+- [ ] Capacity fixtures → page range equals `capacityAdjusted` after a round
+      trip; zero capacity clamps without zeroing; unknown stays unconstrained
+      with `ceilingKnown false`
+- [ ] Stage 1 payload contains **no** Stage 2 answer key
+
 ### Verify refusals
 
 All 19 in §4 must be refused.
@@ -88,7 +239,77 @@ All 19 in §4 must be refused.
 
 ## 2. Defects found
 
-Real execution found two things the in-memory double could not.
+Real execution found three things the in-memory double could not, plus one
+limitation worth stating rather than discovering later.
+
+### Defect 3 — the BIR stage event carried the wrong timestamp *(fixed)*
+
+Found in run 2, first execution.
+
+`bir.generated` and `preliminary_bir.generated` describe **the same BIR insert
+in the same transaction**. `ingest_assessment` anchors its event on
+`least(submitted_at, now())` — the clamped visitor timestamp. The 0004 trigger
+anchored on `generated_at`, which is server receive time.
+
+Measured drift in the first run: **104 seconds**.
+
+That gap is not bounded by clock skew. A submission delivered from the browser
+retry queue can be up to `CED_SUBMISSION_MAX_AGE_DAYS` — currently **30 days**
+— old, and the two events would then sit a month apart on a timeline that is
+append-only and cannot be corrected. A reader sorting by `occurred_at` would
+conclude the preliminary report was generated long after the BIR it *is*.
+
+**Fixed** by looking the submission up by primary key and using the same
+clamped value:
+
+```sql
+select least(s.submitted_at, now()) into v_occurred_at
+  from public.assessment_submissions s
+ where s.submission_id = new.assessment_submission_id;
+v_occurred_at := coalesce(v_occurred_at, least(new.generated_at, now()));
+```
+
+Re-validated: `full_bir.generated` and `bir.generated` now share
+`2026-08-05 01:18:21.898+00` exactly, and all five staged BIR events written
+after the fix show **0.000000** seconds of drift. Pinned by an assertion in
+`tests/integration/supabase-real-db.test.mjs` sections M1 and M2.
+
+**One drifted row survives in `ced-cip-dev` and always will.** BIR
+`79f827e1-8b61-4912-a48a-ad85fdb24142`, the first Stage 1 ingestion of run 2,
+carries the 104-second gap. `timeline_events` refuses `UPDATE` and `DELETE`,
+so the defect's own evidence is permanent — which is the append-only guarantee
+behaving exactly as designed, and a useful reminder that a bug shipped into
+this store cannot be tidied away afterwards. A validation query looking for
+timestamp disagreements will return 1, not 0, on this database; on a project
+created after the fix it returns 0.
+
+### Limitation — `timelineEventIds` does not include trigger events
+
+`ingest_assessment` returns the ids it collected in its own local array. The
+two rows the 0004 triggers write are not in it, because a trigger cannot append
+to the calling function's variable. A Stage 1 ingestion returns **5** ids while
+**7** rows were written.
+
+Nothing reads this field for business logic; the endpoint uses its length for
+one log line, which now under-reports. Every event is discoverable by
+`correlation_id = submissionId`, which is what the integration suite uses.
+
+**Not fixed.** Closing it means redefining the 490-line function to re-query
+its own writes, and a transcription error in the 485 unchanged lines is a
+likelier failure than the gap itself. Recorded here and asserted in M1 so it
+stays a decision rather than a surprise.
+
+### Note — the endpoint's stage validation is load-bearing
+
+A payload whose `assessmentStage.stage` is not an integer makes the trigger's
+cast raise and aborts the whole ingestion with a raw Postgres error. That is
+correct behaviour for the database — fail closed, lose nothing — and it is
+exactly what the forced-rollback test exercises. It is reachable only by a
+caller that bypasses the endpoint, which rejects a non-1-or-2 stage with
+`400 invalid_assessment_stage` before any database work.
+
+That validation is therefore not merely defensive. Any future server-to-server
+ingestion route must repeat it.
 
 ### Defect 1 — trigger functions unhardened *(fixed)*
 
@@ -154,6 +375,48 @@ The five events, in order:
 
 An existing business produces four (no `business.created`). An unresolved
 identity produces four with `identity.review_required` and no `identity.linked`.
+
+**After migration 0004** a *staged* submission produces more, because the
+triggers append alongside those events rather than replacing them:
+
+| Submission | Function events | Trigger events | Total |
+|---|---|---|---|
+| Stage 1, new business | 5 | `stage1.completed`, `preliminary_bir.generated` | **7** |
+| Stage 2, existing business | 4 | `stage2.started`, `stage2.completed`, `full_bir.generated` | **7** |
+| Unstaged (schema ≤ 4, or no `assessmentStage`) | 5 | none | **5** |
+
+### Database state across run 2
+
+| Table | Before 0004 | After run 2 | Added |
+|---|---|---|---|
+| `business_records` | 6 | 12 | 6 |
+| `business_identifiers` | 8 | 8 | 0 |
+| `assessment_sessions` | 7 | 13 | 6 |
+| `assessment_submissions` | 9 | 16 | 7 |
+| `business_intelligence_reports` | 9 | 16 | 7 |
+| `timeline_events` | 41 | 89 | 48 |
+| `identity_resolution_cases` | 3 | 3 | 0 |
+| `audit_events` | 10 | 17 | 7 |
+| `idempotency_records` | 9 | 16 | 7 |
+
+Of the new rows: 7 submissions (Stage 1, Stage 2, legacy, a rollback retry, a
+clock-skew case, and two capacity fixtures), 14 staged timeline events, 7 BIRs
+of which 7 are schema 4, and 6 submissions at payload schema 5.
+
+**All of it is permanent.** `timeline_events` and `audit_events` refuse
+`UPDATE` and `DELETE` by trigger, and `assessment_submissions` refuses
+`DELETE`; deleting the parent `business_record` does not help, because the
+cascade nulls `business_id` on linked submissions and that violates
+`assessment_submissions_identity_consistency`. Only `idempotency_records` and
+`rate_limit_buckets` can be removed, and this run left its keys in place so the
+replay assertions stay reproducible.
+
+That is the append-only guarantee working. The remedy for a development
+database with too much test history is to re-create the project and re-apply
+0001–0004, not to try to delete rows.
+
+The four forced rollbacks added **nothing** — they are counted in neither
+column, which is the point of them.
 
 ### Behaviour confirmed
 
@@ -292,18 +555,44 @@ index rather than the wrong query shape.
 
 ## 7. What this did **not** validate
 
+- **Run 2 did not go through PostgREST.** No service-role key was available in
+  the working shell, and asking for one is out of bounds, so run 2 executed its
+  SQL through the Supabase management API rather than through
+  `db.rpc(...)` the way `api/assessments.mjs` does. Same database, same
+  functions, same triggers, same artifacts — a different transport.
+
+  What that leaves unproven for the staged flow specifically: PostgREST's
+  resolution of the 8-argument `ingest_assessment` signature, and its
+  serialisation of a schema-5 payload. Both are already proven for the
+  unstaged flow by run 1, and neither is affected by 0004, which adds no
+  function signature and no new argument. Section M of
+  `tests/integration/supabase-real-db.test.mjs` is written and guarded and
+  will exercise the PostgREST path on the next run with credentials present;
+  it has **not yet been executed**.
 - **The Vercel Function itself.** The endpoint's own code path — origin policy,
   bounded body reading, limits, honeypot, challenge, rate-limit key derivation
-  — is covered by the 222 unit tests, not here. Only the SQL it calls was
-  exercised against real Postgres.
+  — is covered by the unit suite (336 tests), not here. Only the SQL it calls
+  was exercised against real Postgres.
 - **Concurrency.** `request_in_flight` was not reproduced under genuine
   parallel load; it needs two simultaneous connections holding one key. The
   logic is exercised, the race is not.
 - **Scale.** 9,008 identifier rows is enough to make the planner choose an
   index; it is not a load test.
-- **The full production BIR** was not pushed through the SQL. The unit suite
-  proves the 7,248-byte artifact's shape and that `schemaVersion` is 2 and the
-  band is within the enum; the integration fixture is a compact stand-in
-  carrying exactly the fields the function reads or writes.
+- **Run 1 did not push the full production BIR** through the SQL; its fixture
+  is a compact stand-in carrying exactly the fields the function reads or
+  writes. **Run 2 did.** Every report in run 2 is the real `generate-bir.js`
+  output, validated by `validateGeneratedBir` before storage and read back
+  from Postgres afterwards, so section 0's BIR assertions are made against
+  stored JSON rather than remembered objects.
+
+  Two of the four capacity fixtures were assembled by taking the real
+  `capacity90Day = 11_20` report and replacing the five sections that actually
+  differ by band — `capacityProfile`, `financialOpportunityProfile`,
+  `estimateConfidence`, `riskProfile`, `closeReadinessProfile` — with the real
+  generated values for that band. The remaining sections are identical because
+  nothing else in the report depends on capacity, which was verified by
+  diffing the two full artifacts first (26 and 38 differing leaf paths, all
+  inside those five sections plus `provenance.inputHash` and two derived
+  narrative fields).
 - **Anything about compliance.** Redaction was proven to behave as designed.
   That is a technical statement and nothing more.

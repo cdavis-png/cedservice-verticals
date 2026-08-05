@@ -35,10 +35,15 @@ test('first submission creates exactly one business, submission, BIR and timelin
   assert.deepEqual({ businesses: c.businesses, submissions: c.submissions, birs: c.birs, cases: c.cases },
     { businesses: 1, submissions: 1, birs: 1, cases: 0 });
 
+  /* assessment.completed and bir.generated are unchanged: they are a published
+     contract and a rename would rewrite history. The stage events added by
+     migration 0004 are additional facts alongside them. */
   const names = db.state.timeline_events.map(e => e.event_name);
   assert.deepEqual(names,
-    ['business.created', 'identity.resolved', 'identity.linked', 'assessment.completed', 'bir.generated']);
-  assert.equal(body.timelineEventIds.length, 5);
+    ['business.created', 'identity.resolved', 'identity.linked',
+     'assessment.completed', 'bir.generated',
+     'stage2.started', 'stage2.completed', 'full_bir.generated']);
+  assert.equal(body.timelineEventIds.length, 8);
   assert.equal(db.state.audit_events.length, 1);
 });
 

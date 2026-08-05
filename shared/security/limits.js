@@ -52,7 +52,11 @@
     /* assessment content */
     answerKey: 64,
     answerValue: 2000,
-    answerCount: 120,
+    answerCount: 200,          /* the intelligence expansion roughly doubled the inventory */
+    /* Free-text intelligence answers. Bounded well below answerValue because
+       these are "in your own words" boxes, not essays, and every one of them
+       reaches the report as evidence a human will read. */
+    freeTextAnswer: 300,
     consentStatement: 2000,
     recommendationCopy: 600,
     priorityText: 600,
@@ -88,6 +92,7 @@
     answerKey: 'answer_key',
     answerValue: 'answer_value',
     answerCount: 'answer_count',
+    freeTextAnswer: 'free_text_answer',
     consentStatement: 'consent_statement',
     recommendationCopy: 'recommendation_copy',
     priorityText: 'priority_text',
@@ -108,6 +113,10 @@
     external_customer_id: /^[A-Za-z0-9_\-:.]{4,128}$/,
     payment_customer_id: /^[A-Za-z0-9_\-]{4,128}$/
   };
+
+  /* "In your own words" answers from the intelligence expansion. Bounded
+     tighter than a general answer because they are read by a person. */
+  const FREE_TEXT_ANSWERS = ['changeReason', 'concernDetail', 'openQuestions'];
 
   const violation = (category, path, limit, actual) => ({ category, path, limit, actual });
 
@@ -217,8 +226,11 @@
           out.push(violation(CATEGORY.answerKey, `answers.${key.slice(0, 24)}…`, LIMITS.answerKey, key.length));
           return;
         }
+        const isFreeText = FREE_TEXT_ANSWERS.includes(key);
         checkLength(out, typeof answers[key] === 'string' ? answers[key] : null,
-          CATEGORY.answerValue, `answers.${key}`, LIMITS.answerValue);
+          isFreeText ? CATEGORY.freeTextAnswer : CATEGORY.answerValue,
+          `answers.${key}`,
+          isFreeText ? LIMITS.freeTextAnswer : LIMITS.answerValue);
       });
     }
 
@@ -237,6 +249,17 @@
       checkLength(out, str(results, 'disclaimer'), CATEGORY.disclaimer, 'results.disclaimer', LIMITS.disclaimer);
       checkLength(out, str(results, 'opportunityFormatted'), CATEGORY.recommendationCopy,
         'results.opportunityFormatted', LIMITS.recommendationCopy);
+
+      /* The range the visitor actually saw, and the assumptions printed beside
+         it. Bounded like the disclaimer because it does the same job: it is
+         the context without which the figure must never travel. */
+      const range = results.opportunityRange;
+      if (range && typeof range === 'object' && !Array.isArray(range)) {
+        checkLength(out, str(range, 'formatted'), CATEGORY.recommendationCopy,
+          'results.opportunityRange.formatted', LIMITS.recommendationCopy);
+        checkLength(out, str(range, 'assumptions'), CATEGORY.disclaimer,
+          'results.opportunityRange.assumptions', LIMITS.disclaimer);
+      }
 
       const priorities = results.priorities;
       if (Array.isArray(priorities)) {
@@ -283,7 +306,8 @@
     return format ? format.test(value) : true;
   };
 
-  const API = { LIMITS, CATEGORY, FORMATS, checkPayloadLimits, isAcceptableIdentifier };
+  const API = { LIMITS, CATEGORY, FORMATS, FREE_TEXT_ANSWERS,
+                checkPayloadLimits, isAcceptableIdentifier };
 
   if (typeof module !== 'undefined' && module.exports) module.exports = API;
   else if (typeof window !== 'undefined') window.CEDLimits = API;

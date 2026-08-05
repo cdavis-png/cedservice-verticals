@@ -281,5 +281,5 @@ test('purging an expired key does not resurrect the assessment', async () => {
 
   assert.equal(db.state.assessment_submissions.length, 1, 'the assessment itself is untouched');
   assert.equal(db.state.business_records.length, 1);
-  assert.equal(db.state.timeline_events.length, 5);
+  assert.equal(db.state.timeline_events.length, 8);
 });

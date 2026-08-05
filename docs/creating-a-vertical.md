@@ -161,6 +161,7 @@ JavaScript is written in the vertical.
 ```html
 <script src="../assessment.config.js"></script>
 <script src="../../../../shared/assessment-engine/submission.js"></script>
+<script src="../../../../shared/assessment-engine/intelligence.js"></script>
 <script src="../../../../shared/assessment-engine/engine.js"></script>
 <script src="../../../../shared/scripts/site-nav.js"></script>
 ```
@@ -179,6 +180,122 @@ The engine mints an `assessmentSessionId` on first page view and a
 `submissionId` per completed result, records first-touch attribution once, and
 strips prohibited fields. None of that is a vertical's concern — see CLAUDE.md
 section 9 for the rules it enforces.
+
+### 4a. Conditional questions
+
+A vertical declares its own branching; the engine has no idea what a location
+or an approval chain is.
+
+```js
+branching: {
+  steps:     { 13: read => Number(read.val('locationCount')) > 1 },
+  questions: { otherApprovers: read => read.val('canApprove') !== '' &&
+                                       read.val('canApprove') !== 'yes' }
+}
+```
+
+Wrap each conditional question in the markup:
+
+```html
+<div data-question="otherApprovers">
+  <label>Who else would need to agree? <select name="otherApprovers">…</select></label>
+</div>
+```
+
+Rules worth knowing before writing predicates:
+
+- **An unanswered gate is not a "no".** Test for the answer you want, not for
+  the absence of another — `read.val('x') !== 'yes'` is true before `x` is
+  answered at all, which shows the question prematurely.
+- A hidden question's answer is **cleared** and recorded as stale. Do not rely
+  on a value surviving behind a closed branch.
+- A step is skipped when every conditional question in it is hidden **and** it
+  has no unconditional content.
+- Predicates must be pure and cheap; they run on every keystroke.
+- **Never branch away a question whose answer could raise a hard blocker.**
+  Hiding it does not mean the blocker will not apply — it means nobody will
+  find out. `customIntegrationNeeded` is unconditional in the nails vertical
+  for exactly this reason.
+
+### 4a-2. The two stages
+
+A review is split by marking each step with `data-stage`, and marking that
+stage's results screen with `data-results-for`. The engine reads both out of
+the markup; a vertical that declares neither is a single-stage review and
+behaves as it always did.
+
+```html
+<div class="review-step" data-step="1" data-stage="1" data-stage-name="Growth Review"> … </div>
+…
+<div class="review-step results-step" data-step="9" data-stage="1"
+     data-results-for="1" data-finish-label="See My Results">
+  <strong data-result="score">--</strong>
+  <strong data-result="opportunity">$0</strong>
+  <p data-result="assumptions"></p>
+  <div data-result="priorities"></div>
+  <p class="results-disclaimer">…</p>
+  <button data-stage-action="improve_recommendation">Improve My Recommendation</button>
+  <button data-stage-action="see_recommended_system">See the Recommended System</button>
+</div>
+<div class="review-step" data-step="10" data-stage="2" data-stage-name="Fit and Activation Review">
+  <p class="stage-note" data-stage-note hidden></p>
+  …
+</div>
+```
+
+Result hooks are `[data-result="…"]` scoped **inside** the results step, not
+ids — there is one results screen per stage and an id may appear only once in a
+document.
+
+What each stage must contain:
+
+| Stage 1 must have | Stage 2 must have |
+|---|---|
+| Every input the Growth Score and opportunity formula read | Everything close-related |
+| Anything the package threshold reads | `[data-stage-note]` on its first step |
+| `locationCount` and `capacity90Day` | |
+| Contact fields and the required results-delivery consent | |
+
+**Stage 1 delivers a real result, so it collects the consent to deliver it.**
+Everything Stage 2 asks must be genuinely optional: a visitor who never opens
+it still receives a complete Growth Review.
+
+Fields in a stage the visitor has not opened are **disabled**, so they are
+absent from the payload rather than present as empty strings. An unasked
+question is not a blank answer.
+
+### 4b. Intelligence field names are a shared contract
+
+The fields listed in
+[ASSESSMENT_INTELLIGENCE_EXPANSION.md §2](ASSESSMENT_INTELLIGENCE_EXPANSION.md)
+— `locationCount`, `capacity90Day`, `canApprove`, `budgetSignal`,
+`primaryConcern`, and the rest — are read by both the browser and
+`generate-bir.js` through `shared/assessment-engine/intelligence.js`.
+
+**Choose your own question wording. Do not rename these fields.** A vertical
+that renames one silently loses the evidence: the report will score it as
+unknown and cap readiness accordingly, with nothing to indicate why.
+
+`STAGE1_FIELDS` and `STAGE2_FIELDS` in the same module say which stage owns
+which. A vertical may not move a field between stages by itself — the report
+would then call evidence outstanding that was already collected, or the reverse.
+
+Script order on the page, and it matters:
+
+```html
+<script src="../assessment.config.js"></script>
+<script src="../../../../shared/assessment-engine/submission.js"></script>
+<script src="../../../../shared/assessment-engine/intelligence.js"></script>
+<script src="../../../../shared/business-intelligence/report.schema.js"></script>
+<script src="../../../../shared/business-intelligence/generate-bir.js"></script>
+<script src="../../../../shared/assessment-engine/engine.js"></script>
+```
+
+The two report modules are loaded so the page computes its visible opportunity
+range with the **same functions the report uses**. Reimplementing that
+arithmetic in the engine is how the figure on screen and the figure in the
+report drift apart. Omit them and the engine falls back to the point estimate,
+which is a degradation, not a supported configuration.
 
 Order matters — the config must load before the engine. Start from
 [the nails config](../verticals/beauty-wellness-fitness/nails/assessment.config.js)
@@ -222,6 +339,32 @@ than industry-level.
 - [ ] Each package tier is actually reachable from some valid set of answers.
 - [ ] Pause and resume works — reload mid-assessment and confirm the answers and
       step are restored.
+- [ ] Every branch reaches the results screen. Walk each path end to end; a
+      predicate that never passes hides a required question forever.
+- [ ] Resuming into a step that a changed answer removed lands somewhere valid.
+- [ ] **Stage 1 completes and delivers results without Stage 2.** Walk it end
+      to end and stop. One submission, a real Growth Score, a real range, real
+      priorities, a package.
+- [ ] Stage 1 targets 4–6 minutes; Stage 2 adds 3–5. Count the questions
+      actually shown, not the ones in the markup.
+- [ ] Stepping back from the first Stage 2 step returns to the Stage 1 results
+      **without resubmitting them**.
+- [ ] No Stage 2 answer appears in a Stage 1 payload, as an empty string or
+      otherwise.
+- [ ] Resuming mid-Stage-2 restores the stage, the Stage 1 answers, and the
+      Stage 2 answers.
+- [ ] The Stage 2 submission carries a **different** `submissionId` and names
+      the Stage 1 one in `assessmentStage.supersedesSubmissionId`.
+- [ ] The Growth Score, the estimate, and the package are identical in both
+      submissions.
+- [ ] The visible figure is a **range** and equals the report's
+      `financialOpportunityProfile.capacityAdjusted`. Check a capacity-limited
+      salon and an unsure one; the assumptions sentence changes and stays
+      beside the figure.
+- [ ] No intelligence field was renamed (see 4b) — a renamed field is silently
+      scored as unknown.
+- [ ] The Growth Score is unchanged by any new question. Add the vertical to
+      the scoring-parity test if it has its own formulas.
 - [ ] `submission.endpoint` resolves to `/api/assessments` on http(s) and stays
       `null` on `file://` — copy the expression from the nails config rather
       than hard-coding a URL. **A vertical must not launch with this always

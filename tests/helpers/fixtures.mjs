@@ -3,6 +3,9 @@
 
 const BASE_SESSION = '11111111-1111-4111-8111-111111111111';
 const BASE_SUBMISSION = '22222222-2222-4222-8222-222222222222';
+/* The Stage 1 submission a completed Stage 2 continues. Two stages are two
+   submissions, two idempotency keys, and two reports — never one reused. */
+export const STAGE1_SUBMISSION = '33333333-3333-4333-8333-333333333333';
 
 export const DISCLAIMER =
   'This is a preliminary estimate based on your answers and is not a guarantee of revenue or results.';
@@ -38,7 +41,7 @@ export const ENV = {
 /* A complete, valid current-schema submission. */
 export function makePayload(overrides = {}) {
   const payload = {
-    schemaVersion: 3,
+    schemaVersion: 5,
     assessmentVersion: '1.1.0',
     assessmentSessionId: BASE_SESSION,
     submissionId: BASE_SUBMISSION,
@@ -85,6 +88,37 @@ export function makePayload(overrides = {}) {
       honeypotFilled: false,
       challengeToken: null
     },
+    /* Schema 5: a completed Fit and Activation Review, continuing the Growth
+       Review submitted earlier in the same session. */
+    assessmentStage: {
+      stage: 2,
+      stageId: 'stage2',
+      stageName: 'Fit and Activation Review',
+      totalStages: 2,
+      stage1CompletedAt: '2026-08-04T11:52:00.000Z',
+      stage2StartedAt: '2026-08-04T11:53:30.000Z',
+      stage2CompletedAt: SUBMITTED_AT,
+      supersedesSubmissionId: STAGE1_SUBMISSION,
+      trigger: 'see_recommended_system'
+    },
+    /* Which questions this visitor actually saw. The shortest single-location
+       path — step 13 (multi-location) never appeared. */
+    branching: {
+      stage: 2,
+      visibleSteps: [10, 11, 12, 14, 15, 16, 17],
+      totalSteps: 17,
+      stageSteps: [10, 11, 12, 13, 14, 15, 16, 17],
+      /* Everything still on the form once Stage 2 has been opened — Stage 1's
+         fields included, because they remain enabled and answered. Only a
+         question the branching actually hid is absent. */
+      visibleFields: ['salonName', 'email', 'locationCount', 'capacity90Day',
+                      'bookingPlatform', 'canApprove', 'decisionTiming', 'urgency',
+                      'budgetSignal', 'primaryConcern', 'phoneSetup',
+                      'customIntegrationNeeded', 'preferredContact'],
+      skippedFields: ['multiLocationSystems', 'otherApprovers', 'concernDetail'],
+      staleClearedFields: [],
+      questionSetVersion: 'nails-questions-3.0.0'
+    },
     answers: {
       salonName: 'Polished Nail Studio', ownerName: 'Test Owner', email: 'owner@polished.test',
       mobile: '', preferredContact: 'email',
@@ -93,11 +127,34 @@ export function makePayload(overrides = {}) {
       noShowsWeek: '2', cancelsWeek: '3', reminders: '1', waitlist: '0',
       rebooking: '1', reactivation: '0', inactiveClients: '150',
       reviewCount: '65', rating: '4.4', reviewRequests: '1',
-      promotions: '1', challenge: 'Filling open appointments'
+      promotions: '1', challenge: 'Filling open appointments',
+
+      /* Assessment Intelligence Expansion — a single-location owner who can
+         decide alone, has capacity, and raised no concern. The shortest path. */
+      locationCount: '1', yearsInBusiness: '4_10',
+      bookingPlatform: 'square', bookingPlatformStaying: 'keep', migrationConcern: 'none',
+      capacity90Day: '6_10', willingnessToExpand: 'if_proven',
+      staffingExpandable: 'maybe', hoursExpandable: 'yes', spaceConstraint: 'none',
+      respondentRole: 'owner', canApprove: 'yes',
+      decisionTiming: 'this_month', startTiming: 'within_month', urgency: 'important',
+      budgetSignal: 'approve_if_value',
+      phoneSetup: 'mobile_only', keepNumber: 'yes', willingToChangeSoftware: 'maybe',
+      customIntegrationNeeded: 'no',
+      primaryConcern: 'none'
     },
     results: {
       opportunity: 1679.7,
       opportunityFormatted: '$1,680',
+      /* What the visitor was shown: the capacity-aware range, with the
+         assumptions beside it. capacity90Day 6_10 gives ample headroom, so
+         nothing was clamped here. */
+      opportunityRange: {
+        low: 1175.79, point: 1679.7, high: 2183.61,
+        formatted: '$1,176 – $2,184',
+        capacityKnown: true,
+        clampApplied: false,
+        assumptions: 'Based on the answers you gave, and held to about 26 additional appointments a month — the amount you told us you could comfortably take on. Recovering appointments you had already booked is not held to that limit.'
+      },
       score: 26,
       dimensions: {
         missedOpportunity: 28, appointmentProtection: 24,
