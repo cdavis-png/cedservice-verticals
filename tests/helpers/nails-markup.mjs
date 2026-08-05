@@ -168,7 +168,7 @@ export function answer(engine, dom, answers) {
 export function grantResultsConsent(dom) {
   const box = dom.elements.consentResults;
   box.checked = true;
-  dom.form.fire('change');
+  dom.form.fire('change', { target: box });
 }
 
 /* Walks Continue until the current stage's results screen is reached. */

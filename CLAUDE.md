@@ -48,6 +48,7 @@ The governing rule, from the root README:
 | Branching *mechanism* | Branching *rules* (which question, when) |
 | Intelligence dimensions and field names | Question wording and answer labels |
 | Stage *mechanism* and stage field ownership | Which steps sit in which stage |
+| Analytics event names and privacy rules | Which controls are marked for tracking |
 
 **Intelligence field names are a shared contract.** `locationCount`,
 `capacity90Day`, `canApprove`, `budgetSignal`, `primaryConcern` and the rest are
@@ -61,6 +62,14 @@ module decide what the browser asks first and what the report calls still
 outstanding. Two disagreeing copies would report evidence as withheld when it
 was simply not yet requested. A vertical arranges its own steps; it does not
 move a field between stages.
+
+**Analytics is measurement, never participation.** `shared/analytics/` observes
+the assessment and may not affect it: not scoring, not branching, not the
+payload, not the report, not the price. Every engine call goes through a
+wrapper that swallows failures, and there is no foreign key from an analytics
+table to the Business Record. A vertical marks a control with
+`data-analytics-event`; it does not add event names, and it does not widen the
+privacy rules. See section 10.
 
 **Direction of dependency is one-way.** A vertical imports from `shared/` and
 `design-system/`. Shared code must never import from, reference, or special-case
@@ -457,3 +466,68 @@ field names against a prohibited pattern, logs an error, and strips them from
 the payload. Do not weaken that pattern to make a field pass — if a vertical
 seems to need such a field, it needs a different design. This matters most for
 the planned medical/dental family, where the temptation is highest.
+
+---
+
+## 10. Analytics
+
+First-party, pseudonymous, and strictly observational. Full detail in
+[docs/ASSESSMENT_ANALYTICS.md](docs/ASSESSMENT_ANALYTICS.md),
+[docs/ANALYTICS_EVENT_CATALOG.md](docs/ANALYTICS_EVENT_CATALOG.md), and
+[docs/ANALYTICS_PRIVACY.md](docs/ANALYTICS_PRIVACY.md).
+
+### Analytics never affects the assessment
+
+Not scoring, not branching, not the payload, not the report, not the price.
+Every call from the engine goes through a wrapper that swallows anything
+thrown, and a failed flush costs a measurement rather than the visitor's work.
+Two tests hold the line: a complete two-stage journey against a client that
+throws on every call, and a payload comparison with and without a client
+attached.
+
+Nothing analytics writes is ever read back. There is **no foreign key** from an
+analytics table to the Business Record, and no function in migration 0005
+writes outside the analytics tables. That isolation is what makes an
+unauthenticated analytics endpoint an acceptable risk: the worst outcome of
+forged events is a wrong funnel.
+
+### What analytics may never carry
+
+Names, email addresses, phone numbers, free-text answers, full URLs, referrer
+paths, challenge tokens, consent statement text, payment data, health data,
+user agent strings, or exact viewport pixels. Also excluded, though the
+platform collects them: **budget signal, decision authority, objections,
+urgency and timing** — they live in the Business Record under its consent and
+retention rules, and a second copy in a funnel would have a different lifetime
+and no owner.
+
+Enforcement is token-based, not substring-based, and runs on **both** sides of
+the wire. Do not switch it back to a substring test: `capacity90Day` contains
+"city", and that is the bug the token approach exists to prevent.
+
+An answer's **value** never travels unless its question is on
+`SAFE_VALUE_ALLOWLIST`, which holds exactly two coarse branch-deciding fields.
+The allowlist can widen what is kept; it can never override the prohibition.
+
+### Adding a measurement
+
+Mark the control with `data-analytics-event="assessment.…"`. One delegated
+listener handles every control, and one handles every question — do not add a
+listener per field. Event names are a shared contract and the raw table is
+append-only, so a rename orphans history rather than migrating it: add a new
+name, never repurpose an old one.
+
+### Reporting honesty
+
+Postgres counts; `shared/analytics/funnel.js` divides, so every rate has one
+definition. A ratio with a zero denominator is `null`, never zero. A rate below
+the sample floor is withheld with its sample size attached, because "60% of 5
+people" reads as a finding and is noise. The drop-off report names the worst
+step and **makes no recommendation**.
+
+### Known outstanding gaps
+
+Migration 0005 has never been executed. The analytics consent policy is
+**pending professional review** and no compliance claim is made anywhere. There
+is no signed session token, so the endpoint's only real defences are the origin
+allowlist and rate limiting. Abandonment counts are a floor, not a total.

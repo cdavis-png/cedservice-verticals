@@ -471,7 +471,13 @@
           <div class="results-actions">
             <button type="button" class="btn btn-secondary btn-wide" data-stage-action="improve_recommendation">Improve My Recommendation</button>
             <button type="button" class="btn btn-primary btn-wide" data-stage-action="see_recommended_system">See the Recommended System</button>
-            <a class="btn btn-secondary btn-wide" href="mailto:cdavis@cedservice.com?subject=Personal Salon Growth Review">Request a Personal Review</a>
+            <!-- An ordinary link. data-analytics-event counts the click through
+                 the engine's single delegated listener; nothing is prevented
+                 and the visitor goes where they were going. -->
+            <a class="btn btn-secondary btn-wide"
+               href="mailto:cdavis@cedservice.com?subject=Personal Salon Growth Review"
+               data-analytics-event="assessment.personal_review_clicked"
+               data-analytics-label="stage1_results">Request a Personal Review</a>
           </div>
         </div>
 
@@ -817,7 +823,10 @@
           <p class="results-evidence" data-result="evidence-note"></p>
           <p class="results-disclaimer">This is a preliminary estimate based on your answers and is not a guarantee of revenue or results.</p>
           <p class="submission-status" data-result="status" role="status" aria-live="polite"></p>
-          <a class="btn btn-primary btn-wide" href="mailto:cdavis@cedservice.com?subject=My Salon Growth Review Results">Send My Results &amp; Next Steps</a>
+          <a class="btn btn-primary btn-wide"
+             href="mailto:cdavis@cedservice.com?subject=My Salon Growth Review Results"
+             data-analytics-event="assessment.report_requested"
+             data-analytics-label="stage2_results">Send My Results &amp; Next Steps</a>
         </div>
 
         <div class="review-controls">
@@ -840,6 +849,11 @@
   <script src="../../../../shared/assessment-engine/intelligence.js"></script>
   <script src="../../../../shared/business-intelligence/report.schema.js"></script>
   <script src="../../../../shared/business-intelligence/generate-bir.js"></script>
+  <!-- First-party analytics. No vendor, no third-party SDK, nothing leaves
+       this origin. Loaded before the engine so instrumentation is available
+       from the first page view; the engine works unchanged without it. -->
+  <script src="../../../../shared/analytics/events.js"></script>
+  <script src="../../../../shared/analytics/analytics-client.js"></script>
   <script src="../../../../shared/assessment-engine/engine.js"></script>
   <script src="../../../../shared/scripts/site-nav.js"></script>
 </body>

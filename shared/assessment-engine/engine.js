@@ -65,7 +65,10 @@
     stageNote: '[data-stage-note]',
     /* A consent whose availability depends on another answer. Owned by
        syncConsentGates, never by stage or branch logic. */
-    consentGate: '[data-consent-gate]'
+    consentGate: '[data-consent-gate]',
+    /* Any control worth counting. Handled by ONE delegated listener, so a
+       vertical adds a measurement by adding an attribute. */
+    analyticsAction: '[data-analytics-event]'
   };
 
   /* Result hooks are looked up INSIDE the results step being painted, because
@@ -327,6 +330,56 @@
       num: name => Number(readable(name)?.value || 0),
       val: name => readable(name)?.value || ''
     };
+
+    /* ---------- analytics ----------
+
+       A thin adapter over window.CEDAnalytics. Every call goes through it and
+       every call is optional: a page that does not load the analytics client
+       behaves exactly as it did before, and a client that throws cannot reach
+       the assessment.
+
+       ANALYTICS NEVER PARTICIPATES IN THE ASSESSMENT. Nothing below reads a
+       value back into scoring, branching, the payload, or the report. If a
+       future edit needs an analytics call's return value for anything the
+       visitor can see, that is the signal it belongs somewhere else. */
+
+    const analytics = (() => {
+      const client = () => (typeof window !== 'undefined' ? window.CEDAnalytics : null);
+      const call = (method, ...args) => {
+        const api = client();
+        if (!api || typeof api[method] !== 'function') return undefined;
+        try {
+          return api[method](...args);
+        } catch {
+          return undefined;
+        }
+      };
+      return {
+        available: () => Boolean(client()),
+        track: (name, fields) => call('track', name, fields),
+        configure: options => call('configure', options),
+        setSession: id => call('setSession', id),
+        identify: ids => call('identify', ids),
+        setStage: stage => call('setStage', stage),
+        setStep: stepId => call('setStep', stepId),
+        markStarted: () => call('markStarted'),
+        markResumed: () => call('markResumed'),
+        markFirstAnswer: () => call('markFirstAnswer'),
+        markStage1Complete: () => call('markStage1Complete'),
+        markResultsViewed: () => call('markResultsViewed'),
+        sinceMark: mark => call('sinceMark', mark),
+        flush: reason => call('flush', reason),
+        reset: () => call('reset')
+      };
+    })();
+
+    /* Steps whose view has already been recorded, so returning to a step by
+       Back does not inflate the step-view count. A stage change clears it,
+       because entering Stage 2 is a new pass over a new set of steps. */
+    let viewedSteps = new Set();
+    /* Questions already counted as answered, so a select fired twice by the
+       browser is one interaction. */
+    const answeredQuestions = new Set();
 
     /* ---------- session identity and first-touch attribution ---------- */
 
@@ -666,6 +719,24 @@
         node.hidden = !name || stages.length < 2;
       });
 
+      /* One step_viewed per step per stage pass. Back-and-forth navigation is
+         real behaviour and is reported as a resume, not as another view. */
+      const viewKey = `${currentStage}:${target}`;
+      analytics.setStage(currentStage);
+      analytics.setStep(target);
+      if (!viewedSteps.has(viewKey)) {
+        viewedSteps.add(viewKey);
+        analytics.track('assessment.step_viewed', {
+          stepId: String(target),
+          metadata: {
+            position,
+            stepsInStage: total,
+            isResultsStep: target === stageLast,
+            stepName: stepNodeOf(target) ? stepNodeOf(target).dataset.stepName || null : null
+          }
+        });
+      }
+
       /* Back is available across a stage boundary: the previous stage's
          results screen is where it leads, and that screen is not resubmitted. */
       const isFirst = position === 1 && currentStage === firstStage;
@@ -1000,6 +1071,10 @@
         stageState.stage1SubmissionId = payload.submissionId;
         saveState();
       }
+      /* Late-bound so a funnel row can be joined to a submission. Analytics
+         never mints an id and never resolves identity; it only learns the ones
+         the assessment already produced. */
+      analytics.identify({ submissionId: payload.submissionId });
 
       const adapter = window.CEDSubmission;
       if (!adapter) {
@@ -1013,6 +1088,7 @@
       try {
         const outcome = await adapter.submitAssessment(payload, submissionOptions);
         recordSubmission(stage, signature, payload.submissionId, outcome.status, outcome);
+        if (outcome && outcome.businessId) analytics.identify({ businessId: outcome.businessId });
         setStatus(outcome.status === 'sent' ? 'sent' : outcome.status === 'queued' ? 'queued' : 'ready', stage);
       } finally {
         sending = false;
@@ -1025,6 +1101,28 @@
     const renderResults = ({ submit: shouldSubmit = false, stage = currentStage } = {}) => {
       const results = calculate();
       paint(results, stage);
+
+      /* The results screen being painted IS the result being viewed. Recorded
+         on every paint, including a repaint on resume, because "came back to
+         look at their results again" is a real and interesting behaviour.
+         Only the FIRST view sets the mark the later timings measure from. */
+      analytics.markResultsViewed();
+      analytics.track(stage === finalStage && stages.length > 1
+        ? 'assessment.full_results_viewed'
+        : 'assessment.preliminary_results_viewed', {
+        assessmentStage: stage,
+        metadata: {
+          repaint: !shouldSubmit,
+          /* Band and score are OUR figures about the visitor's operation, not
+             personal data, and without them a funnel cannot answer "do people
+             with low scores drop out more?". */
+          growthScore: results.score,
+          recommendedPackageId: results.recommendation.id || null,
+          capacityKnown: results.range.capacityKnown,
+          clampApplied: results.range.clampApplied
+        }
+      });
+
       if (shouldSubmit) void submit(results, stage);
     };
 
@@ -1044,8 +1142,30 @@
        who steps back to a results screen has not completed it a second time. */
     const markStageComplete = stage => {
       const at = nowIso();
+      const firstTime = stage === firstStage
+        ? !stageState.stage1CompletedAt
+        : !stageState.stage2CompletedAt;
       if (stage === firstStage) stageState.stage1CompletedAt ||= at;
       if (stage === finalStage && stages.length > 1) stageState.stage2CompletedAt ||= at;
+
+      if (!firstTime) return;
+      if (stage === firstStage) {
+        analytics.markStage1Complete();
+        analytics.track('assessment.stage1_completed', {
+          assessmentStage: 1,
+          metadata: { stepsCompleted: visibleSteps.length - 1 }
+        });
+      } else if (stages.length > 1) {
+        analytics.track('assessment.stage2_completed', {
+          assessmentStage: 2,
+          metadata: {
+            stepsCompleted: visibleSteps.length - 1,
+            /* Active time from the preliminary result to finishing the fit
+               review. Null when the marks were never set. */
+            activeMsSinceStage1: analytics.sinceMark('stage1CompletedAt') ?? null
+          }
+        });
+      }
     };
 
     /* Opens the next stage. Optional by design: nothing here runs unless the
@@ -1060,6 +1180,24 @@
       currentStage = next;
       maxStageReached = Math.max(maxStageReached, next);
       showStageNote(trigger);
+
+      /* A new stage is a new pass over a new set of steps. */
+      viewedSteps = new Set();
+      analytics.setStage(next);
+      analytics.track('assessment.stage2_started', {
+        assessmentStage: next,
+        metadata: {
+          trigger,
+          /* How long the visitor spent with their preliminary results before
+             deciding to continue — the single most useful number this
+             milestone produces about the two-stage split. */
+          activeMsSinceResultsViewed: analytics.sinceMark('resultsViewedAt') ?? null,
+          activeMsSinceStage1: analytics.sinceMark('stage1CompletedAt') ?? null
+        }
+      });
+      /* A stage boundary is a natural flush point: the visitor has reached a
+         milestone worth having on the server even if they leave next. */
+      analytics.flush('stage_boundary');
 
       /* The step total changes on purpose here, so the "the questions changed"
          announcement would be misleading. The stage label carries the news. */
@@ -1079,6 +1217,16 @@
     /* ---------- modal ---------- */
 
     const openReview = () => {
+      /* Read BEFORE loadState, which is what tells started from resumed:
+         once loadState has run there is always saved state.
+
+         Keys, not truthiness. ensureSession writes `data: {}` on the very
+         first page view so the session id is durable, so an empty object is
+         the NORMAL state of someone who has never answered anything — and
+         testing it for truthiness reported every first-time visitor as a
+         returning one. */
+      const hadSavedState = Object.keys(readStoredState().data || {}).length > 0;
+
       modal.classList.add('open');
       modal.setAttribute('aria-hidden', 'false');
       document.body.style.overflow = 'hidden';
@@ -1088,6 +1236,28 @@
          recomputed from them, and only then is a step chosen. Resuming into a
          step that no longer applies is corrected by showStep. */
       syncBranching();
+
+      /* Started or resumed, decided before anything else is emitted so the
+         session's first event is the right one. */
+      analytics.setStage(currentStage);
+      if (hadSavedState) {
+        analytics.markResumed();
+        analytics.track('assessment.resumed', {
+          assessmentStage: currentStage,
+          stepId: String(currentStep),
+          metadata: { resumedAtStep: currentStep, maxStageReached }
+        });
+      } else {
+        analytics.markStarted();
+        analytics.track('assessment.started', {
+          assessmentStage: currentStage,
+          metadata: { entryStep: currentStep }
+        });
+      }
+      /* Either way the visitor is now working, which is what the abandonment
+         inference needs to know. */
+      analytics.markStarted();
+
       /* A finished stage resumes on its results step, so repopulate it —
          without resubmitting. */
       if (currentStep === resultsStepOf(currentStage)) {
@@ -1101,6 +1271,10 @@
       modal.classList.remove('open');
       modal.setAttribute('aria-hidden', 'true');
       document.body.style.overflow = '';
+      /* Closing the modal is a pause, not an exit — the visitor is still on
+         the page and their work is saved. Worth getting to the server, worth
+         NOT calling abandonment. */
+      analytics.flush('modal_closed');
     };
 
     startButtons.forEach(btn => btn.addEventListener('click', openReview));
@@ -1131,9 +1305,31 @@
          without it, Continue on the results screen would re-enter the same
          step and produce the result a second time. */
       if (currentStep === resultsStepOf(currentStage)) return;
-      if (!currentStepValid()) return;
+      if (!currentStepValid()) {
+        /* Which question stopped them, never what they typed. A rising rate on
+           one field is a question that reads badly, not a careless visitor. */
+        const active = stepNodeOf(currentStep);
+        const blocking = active
+          ? [...active.querySelectorAll('[required]')]
+              .filter(field => !field.disabled && !field.closest('[hidden]'))
+              .filter(field => !field.reportValidity())
+              .map(field => field.name)
+              .filter(Boolean)
+          : [];
+        analytics.track('assessment.validation_failed', {
+          stepId: String(currentStep),
+          questionId: blocking[0] || null,
+          metadata: { blockingFields: blocking.slice(0, 6), blockingCount: blocking.length }
+        });
+        return;
+      }
+      const completedStep = currentStep;
       saveState();
       const next = stepAfter(currentStep);
+      analytics.track('assessment.step_completed', {
+        stepId: String(completedStep),
+        metadata: { nextStepId: next === null ? null : String(next) }
+      });
       /* Results are produced on the transition INTO this stage's results step,
          whichever visible step happened to precede it. */
       if (next === resultsStepOf(currentStage)) {
@@ -1164,16 +1360,83 @@
     /* The three paths offered after a stage's results. Two continue the
        review; anything else on the screen is an ordinary link and is left
        alone. */
+    const STAGE_ACTION_EVENT = {
+      improve_recommendation: 'assessment.improve_recommendation_clicked',
+      see_recommended_system: 'assessment.recommended_system_clicked',
+      checkout_intent: 'assessment.checkout_intent'
+    };
+
     modal.querySelectorAll(SELECTORS.stageAction).forEach(node => {
       node.addEventListener('click', event => {
         const trigger = node.dataset.stageAction;
         if (!trigger || trigger === 'none') return;
         if (event && typeof event.preventDefault === 'function') event.preventDefault();
+        /* The click is recorded BEFORE the stage opens, so the two events are
+           in the order they happened even when they land in one batch. */
+        analytics.track(STAGE_ACTION_EVENT[trigger] || 'assessment.checkout_intent', {
+          metadata: {
+            trigger,
+            activeMsSinceResultsViewed: analytics.sinceMark('resultsViewedAt') ?? null
+          }
+        });
         openNextStage(trigger);
       });
     });
 
-    form.addEventListener('input', () => {
+    /* Everything else worth counting is marked in the markup and handled by a
+       single delegated listener. One listener, any number of controls, and a
+       vertical adds a measurement by adding an attribute rather than by
+       editing this file. */
+    modal.addEventListener('click', event => {
+      const target = event && event.target;
+      const node = target && typeof target.closest === 'function'
+        ? target.closest(SELECTORS.analyticsAction) : null;
+      if (!node) return;
+      const name = node.dataset.analyticsEvent;
+      if (!name) return;
+      analytics.track(name, {
+        metadata: {
+          control: node.dataset.analyticsLabel || null,
+          activeMsSinceResultsViewed: analytics.sinceMark('resultsViewedAt') ?? null
+        }
+      });
+      /* These are ordinary links and buttons. Nothing is prevented; the
+         visitor goes where they were going. */
+      analytics.flush('cta_click');
+    });
+
+    /* One delegated listener for every question, present and future. A
+       per-question listener would be 58 listeners today and a maintenance
+       trap the moment a vertical adds a field. */
+    const recordAnswer = event => {
+      const field = event && event.target;
+      const name = field && field.name;
+      if (!name) return;
+      if (name === HONEYPOT_FIELD || name === CHALLENGE_FIELD) return;
+      if (consents.some(entry => entry.field === name)) return;
+      if (answeredQuestions.has(name)) return;
+
+      const value = field.type === 'checkbox' || field.type === 'radio'
+        ? field.checked : String(field.value || '').trim();
+      if (value === '' || value === false) return;
+      answeredQuestions.add(name);
+
+      const first = analytics.markFirstAnswer();
+      const engine = window.CEDAnalyticsEvents;
+      analytics.track('assessment.question_answered', {
+        stepId: String(currentStep),
+        questionId: name,
+        metadata: {
+          /* The VALUE only when the shared allowlist names the question, and
+             never otherwise. See shared/analytics/events.js. */
+          value: engine && engine.mayRecordValue(name) ? String(field.value || '').slice(0, 40) : null,
+          answeredCount: answeredQuestions.size,
+          isFirstAnswer: first !== null && first !== undefined
+        }
+      });
+    };
+
+    form.addEventListener('input', event => {
       syncConsentGates();
       /* An answer can change which questions apply, so visibility and progress
          are recomputed immediately rather than at the next navigation. */
@@ -1181,22 +1444,33 @@
       syncBranching();
       if (visibleSteps.length !== before) showStep(currentStep);
       saveState();
+      recordAnswer(event);
     });
 
-    form.addEventListener('change', () => {
+    form.addEventListener('change', event => {
       syncConsentGates();
       const before = visibleSteps.length;
       syncBranching();
       if (visibleSteps.length !== before) showStep(currentStep);
       saveState();
+      recordAnswer(event);
     });
 
     /* Remove everything this platform stored on this device. */
     const clearSavedAssessmentData = () => {
+      /* Recorded and flushed BEFORE the analytics queue is cleared, because a
+         deletion nobody can see is a deletion nobody can audit — and after
+         this the client has nothing left to send it with. */
+      analytics.track('assessment.clear_saved_data', {
+        metadata: { requestedAtStep: currentStep, stage: currentStage }
+      });
+      analytics.flush('data_cleared');
+
       localStorage.removeItem(config.storageKey);
       localStorage.removeItem(submissionKey);
       const adapter = window.CEDSubmission;
       if (adapter && adapter.clearQueue) adapter.clearQueue(submissionOptions);
+      analytics.reset();
       /* Start a fresh session in memory; nothing is written until the visitor
          interacts again. */
       session = newSession();
@@ -1206,6 +1480,66 @@
     ensureSession();
     syncConsentGates();
     syncBranching();
+
+    /* ---------- analytics start-up ----------
+       After the session exists, because every event is keyed to it, and after
+       the first branching pass, because the question counts come from it. */
+
+    /* Fields the visitor is actually asked. Excludes the bot trap and the
+       consent checkboxes: consent is a permission, not a question, and
+       counting it would make the completion rate look better than it is. */
+    const questionFieldNames = () => {
+      const consentFields = consents.map(entry => entry.field);
+      return visibleFieldNames(currentStage)
+        .filter(name => name !== HONEYPOT_FIELD && name !== CHALLENGE_FIELD)
+        .filter(name => !consentFields.includes(name));
+    };
+
+    const analyticsContext = () => {
+      const names = questionFieldNames();
+      return {
+        verticalId: meta.verticalId || null,
+        assessmentVersion: meta.assessmentVersion || null,
+        questionSetVersion: meta.questionSetVersion || null,
+        attribution: {
+          firstTouch: session ? session.firstTouch : null,
+          latestTouch: touchNow()
+        },
+        visibleQuestionCount: names.length,
+        completedQuestionCount: names.filter(name => {
+          const field = form.elements[name];
+          if (!field) return false;
+          if (field.type === 'checkbox' || field.type === 'radio') return field.checked === true;
+          return String(field.value || '').trim() !== '';
+        }).length
+      };
+    };
+
+    if (analytics.available()) {
+      const options = config.analytics || {};
+      analytics.configure({
+        ...options,
+        /* Same rule as the submission endpoint: same-origin over http(s),
+           and nothing at all from file://, where the page must keep working
+           with no server to talk to. */
+        endpoint: options.endpoint !== undefined ? options.endpoint
+          : (window.location && (window.location.protocol === 'http:' || window.location.protocol === 'https:')
+              ? '/api/analytics' : null),
+        verticalId: meta.verticalId || null,
+        assessmentSessionId: session ? session.assessmentSessionId : null,
+        context: analyticsContext
+      });
+
+      /* A previously stored businessId lets a funnel row be joined to a
+         Business Record without analytics ever resolving identity itself. */
+      const previous = lastSubmission(firstStage) || lastSubmission(finalStage);
+      if (previous) analytics.identify({ businessId: previous.businessId || null });
+
+      analytics.setStage(null);
+      analytics.track('assessment.page_viewed', {
+        metadata: { resumable: Object.keys(readStoredState().data || {}).length > 0 }
+      });
+    }
 
     window.CEDAssessment = {
       clearSavedAssessmentData,

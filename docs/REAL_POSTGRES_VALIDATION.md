@@ -299,6 +299,81 @@ its own writes, and a transcription error in the 485 unchanged lines is a
 likelier failure than the gap itself. Recorded here and asserted in M1 so it
 stays a decision rather than a surprise.
 
+### Defect 4 — the roll-up turned "no stage yet" into stage zero *(fixed)*
+
+Found in run 3, on the first probe batch.
+
+`assessment_analytics_sessions.max_stage_reached` is constrained to
+`null, 1, 2`. The forward-only merge was written as:
+
+```sql
+max_stage_reached = greatest(coalesce(s.max_stage_reached, 0),
+                             coalesce(excluded.max_stage_reached, 0))
+```
+
+A session whose events carry **no stage at all** — a lone `page_viewed`, or a
+`clear_saved_data` — has null on both sides. The coalesces turned that into
+`greatest(0, 0)` = **0**, which is neither null nor 1 nor 2, so
+`analytics_sessions_stage_check` refused the row and **aborted the entire
+batch** on the *second* ingest for that session. The first insert always
+succeeded, which is why it needed two batches to surface.
+
+**Fixed** by removing the coalesces:
+
+```sql
+max_step_reached  = greatest(s.max_step_reached,  excluded.max_step_reached),
+max_stage_reached = greatest(s.max_stage_reached, excluded.max_stage_reached),
+```
+
+Postgres `GREATEST` skips nulls — `greatest(null, null)` is null,
+`greatest(null, 2)` is 2 — which is exactly the intended semantics and simpler
+than what it replaced. **"Not reached yet" is null, never zero.**
+
+The in-memory double missed it **twice over**: `Math.max(null, null)` is `0`
+rather than null, and the double did not model
+`analytics_sessions_stage_check` at all. Both are now fixed, and the case is
+pinned in `tests/analytics-endpoint.test.mjs` and section N6.
+
+### Defect 5 — the question-interaction denominator did not exist *(fixed)*
+
+`shared/analytics/funnel.js` defines `questionInteractionRate` as
+`questionInteractions ÷ visibleQuestionTotal`, and
+`assessment_funnel_daily` had **no column** for the denominator. The rate was
+therefore permanently `null` with reason `no_denominator` — a metric section H
+of the milestone explicitly asked for, quietly unavailable.
+
+**Fixed** by adding `visible_question_total` and a second `UPDATE` inside
+`refresh_assessment_funnel_daily`. The denominator is a sum over **sessions**
+of each session's maximum `visible_question_count`, not a sum over events:
+summing events would count every question again on every step view. It is a
+separate statement because that shape cannot be expressed alongside the
+event-level aggregates without double counting.
+
+Verified: a session reporting 23 visible questions across two step views
+contributes **23**, not 46, and the rate resolves to 0.9565.
+
+### Six privacy gaps closed
+
+Section G attempted 24 prohibited fields against the real rules. Eighteen were
+already refused; **six were not**, and each was a case where
+`ANALYTICS_PRIVACY.md` claimed a protection the code did not enforce:
+
+| Leaked | Why the token rule missed it | Fix |
+|---|---|---|
+| `referrerPath`, `referrerUrl` | tokenizes to *referrer* + *path*, and neither can be prohibited — `referrerHost` and the attribution `path` are both legitimate | named outright |
+| `userAgent` | tokenizes to *user* + *agent* | `agent`, `useragent`, `ua` added as tokens |
+| `budgetSignal`, `canApprove`, `primaryConcern`, `urgency` | ordinary words; the doc said close-related evidence is excluded and nothing enforced it | every intelligence field except the two allowlisted ones is now prohibited as a field **name**, read from `intelligence.js :: ALL_FIELDS` so a new close-related question is excluded automatically |
+
+`questionId: "budgetSignal"` stays legal — it names a question, which a funnel
+needs. `metadata: { budgetSignal: … }` does not, because that is the answer.
+
+Separately, the endpoint now **re-buckets** viewport dimensions rather than
+trusting the client's bucketing, the same way it re-applies the field-name
+prohibition.
+
+All 24 attempts are now blocked, and 28 legitimate analytics field names were
+checked to confirm none is wrongly refused.
+
 ### Note — the endpoint's stage validation is load-bearing
 
 A payload whose `assessmentStage.stage` is not an integer makes the trigger's
@@ -550,6 +625,265 @@ A `Seq Scan` on `business_identifiers` means the partial index is missing —
 check that 0003's `drop`/`create` pair applied. Per §2, note that the *old*
 query shape also reaches this index on PG17, so a seq scan indicates a missing
 index rather than the wrong query shape.
+
+---
+
+## 6c. Run 3 — migration 0005, the analytics store
+
+**Executed 2026-08-05 against `ced-cip-dev`, Postgres 17.6.1.155.**
+
+| | |
+|---|---|
+| Migrations | 0005, after 0001–0004 |
+| Method | Supabase management API; SQL executed directly |
+| Result | 47 checks passed, **2 defects found and fixed**, 6 privacy gaps closed |
+| Business Record rows changed | **0** |
+
+### Structure
+
+| Check | Result |
+|---|---|
+| Applies cleanly | ✔ in five parts, two of them the fixes below |
+| Three tables exist | ✔ `assessment_analytics_events`, `assessment_analytics_sessions`, `assessment_funnel_daily` |
+| RLS enabled **and** forced on all three | ✔ |
+| Policies | ✔ **0** on all three |
+| `anon` / `authenticated` privileges | ✔ no SELECT, no INSERT on any |
+| Indexes | ✔ 14, including the three expression indexes |
+| CHECK constraints | ✔ 8 |
+| Append-only trigger on raw events | ✔ `analytics_events_no_update` → `reject_mutation` |
+| Session `updated_at` trigger | ✔ `analytics_sessions_touch` |
+| Functions | ✔ 5, all `SECURITY DEFINER`, all pinning `search_path`, execute revoked from `public`, `anon`, `authenticated` |
+| Security advisors | ✔ 13 × INFO `rls_enabled_no_policy` (10 existing + 3 new). **No new WARN.** |
+| Performance advisors | ✔ all INFO. New `unused_index` notices on analytics indexes not yet exercised. **No new WARN.** |
+
+### Isolation — the check that matters most
+
+```sql
+select count(*) from pg_constraint
+ where contype = 'f'
+   and (conrelid::regclass::text  like 'assessment_analytics%'
+     or confrelid::regclass::text like 'assessment_analytics%');
+-- 0
+```
+
+**Zero foreign keys in either direction.** Also zero analytics functions whose
+body references `business_records`, `assessment_submissions`,
+`business_intelligence_reports`, `timeline_events`, `audit_events` or
+`identity_resolution_cases`.
+
+Business Record counts were taken before the run and again after **every**
+analytics operation — 636 event inserts, 68 session roll-ups, nine aggregation
+runs, and four purges:
+
+| Table | Before | After |
+|---|---|---|
+| `business_records` | 12 | **12** |
+| `assessment_submissions` | 16 | **16** |
+| `business_intelligence_reports` | 16 | **16** |
+| `timeline_events` | 89 | **89** |
+| `audit_events` | 17 | **17** |
+| `identity_resolution_cases` | 3 | **3** |
+
+One column matched a PII-shaped-name scan: `event_name`. That is the same
+"name" substring false positive the token rule already exempts, and is not a
+finding.
+
+### Event families
+
+All **19 event names** were ingested and stored. Arrival, progress, stage,
+intent and other are each represented; 611 fixture events across 63 sessions
+plus 25 targeted probes.
+
+| Check | Result |
+|---|---|
+| Valid event inserts | ✔ |
+| Duplicate `eventId` → no second row, reported as `duplicates` | ✔ |
+| Empty batch | ✔ `analytics_empty_batch` |
+| Mixed-session batch | ✔ `analytics_mixed_sessions` |
+| `assessment_stage = 7` | ✔ refused by `analytics_events_stage_check` |
+| `schemaVersion = 99` | ✔ refused |
+| `activeElapsedMs > totalElapsedMs` | ✔ refused by `analytics_events_timing_sane` |
+| Negative duration | ✔ refused |
+| Future timestamp | ✔ **clamped**, not refused |
+| `UPDATE` on a raw event | ✔ refused: *append_only_violation* |
+
+### Roll-up
+
+| Check | Result |
+|---|---|
+| Events and summary in one transaction | ✔ |
+| Late event does not rewind `result_state` | ✔ `fit_review_complete` held |
+| `latest_step_id` / `max_step_reached` monotonic | ✔ stayed at 14 |
+| `total_active_ms` / `total_elapsed_ms` never decrease | ✔ |
+| Stage timestamps write-once | ✔ an earlier duplicate `stage1_completed` was ignored |
+| `started_at` **does** move earlier | ✔ intentional — an earlier start is genuinely earlier |
+| Duplicate batch does not inflate counters | ✔ `validation_failures` 1 → 1 |
+| Abandonment retracted on return | ✔ `abandoned` → `preliminary_results`, `abandoned_at` cleared |
+| Stage 1 completion then exit is **not** abandoned | ✔ 0 such sessions |
+
+### Funnel, from real aggregate rows
+
+`refresh_assessment_funnel_daily` produced 9 rows across 4 segment dimensions
+(source × device × vertical × assessment version). Counters fed through
+`shared/analytics/funnel.js`:
+
+| Rate | Value | |
+|---|---|---|
+| view → start | 0.7541 | 46/61 |
+| start → Stage 1 | 0.7609 | 35/46 |
+| Stage 1 → result view | 0.9714 | 34/35 |
+| result → Stage 2 start | 0.4412 | 15/34 |
+| Stage 2 start → complete | **withheld** | 12/15, below the sample floor |
+| result → recommended system | 0.1471 | 5/34 |
+| result → personal review | 0.0882 | 3/34 |
+| result → checkout intent | 0.0588 | 2/34 |
+| view → Stage 2 | 0.1967 | 12/61 |
+| validation failure | 0.4348 | 20/46 |
+| resume | 0.0870 | 4/46 |
+| abandonment | 0.1957 | 9/46 |
+
+Median active time: Stage 1 **282,859 ms**, Stage 2 **460,000 ms**.
+
+| Aggregation check | Result |
+|---|---|
+| Safe rerun (×2) | ✔ 8 rows → 8 rows, 65 → 65 page views |
+| Empty day | ✔ 0 rows written |
+| Duplicate-event immunity | ✔ `stage1_completions` 38 → 38 |
+| Late event dated to **its own** day | ✔ landed on 2026-08-02, not today |
+| Multiple verticals | ✔ `nails` and `val02-vertical-b` |
+| Multiple assessment versions | ✔ 1.3.0, 1.2.0, `unknown` |
+| Sessions for stages, events for clicks | ✔ 30 sessions = 30 page views; 2 clicks = 2 |
+
+### Drop-off, with a deliberately weak step
+
+| Step | Stage | Entered | Completed | Exits | Validation failures | Median active | Abandonment |
+|---|---|---|---|---|---|---|---|
+| 1 | 1 | 45 | 45 | 0 | 0 | 30,000 ms | 0.0% |
+| 2 | 1 | 41 | 40 | 1 | 0 | 28,000 ms | 2.4% |
+| **7** | 1 | 39 | 29 | 10 | 20 | 51,000 ms | **25.6%** |
+| 13 | 2 | 14 | 11 | 3 | 0 | 24,000 ms | *withheld* |
+| 14 | 2 | 1 | 0 | 1 | 0 | — | *withheld* |
+
+Step 7 was correctly identified as `highestAbandonmentStepId`. Step 14 shows
+100% abandonment on **one** session and was correctly withheld rather than
+outranking it. 3 steps reportable, 2 withheld. **No recommendation generated.**
+
+### Retention
+
+| Check | Result |
+|---|---|
+| Purge at `now()` | ✔ deleted 0; newer events untouched |
+| Purge past expiry | ✔ deleted exactly the 1 expired row |
+| Aggregates after purge | ✔ 9 rows / 66 page views, unchanged |
+| Session purge honours its own expiry | ✔ 1 deleted past expiry, 0 at `now()` |
+| `clear_saved_data` retained | ✔ 2 events kept — the record of an erasure outlives the erased data |
+
+### Transport gap
+
+**The endpoint was not exercised against this database.** No service-role key
+was available in the working shell and asking for one is out of bounds, so
+section E ran against `api/analytics.mjs` through the unit suite's in-memory
+double (32 endpoint tests: origin, body bounds, batch limits, mixed
+valid/invalid, rate limiting with `Retry-After`, correlation ids, no payload in
+logs) while the database functions were driven directly over the management
+API.
+
+What that leaves unproven: PostgREST's resolution of the
+`ingest_analytics_events(jsonb, jsonb, integer)` signature, and its
+serialisation of a batch. Section N of `supabase-real-db.test.mjs` is written
+and guarded and will exercise it on the next run with credentials present.
+
+---
+
+## 6b. Section M — migration 0005, the analytics store
+
+**Superseded by section 6c above, which records the executed run.** The
+checklist below remains the procedure for repeating it on a fresh project.
+
+0005 is the first migration that adds *tables* since 0001, and the first whose
+failure mode is "a funnel is wrong" rather than "a Business Record is wrong".
+That difference sets the priorities below: isolation is checked before
+correctness, because an analytics table that can reach the Business Record is a
+worse problem than a miscounted step.
+
+### Prepare
+
+- [ ] Confirm 0001–0004 are applied and the section-0 checks still pass.
+- [ ] Record row counts for **all** tables, analytics and Business Record
+      alike. The Business Record counts must not move by a single row during
+      this run.
+
+### Apply
+
+- [ ] `0005_assessment_analytics.sql`
+
+### Verify structure
+
+- [ ] Three new tables: `assessment_analytics_events`,
+      `assessment_analytics_sessions`, `assessment_funnel_daily`
+- [ ] RLS **enabled** and **forced** on all three, with **0** policies
+- [ ] `revoke` verified: `anon` and `authenticated` have no privilege on any of
+      them
+- [ ] Five new functions, all `SECURITY DEFINER`, all pinning
+      `search_path = pg_catalog, public, pg_temp`, all with execute revoked
+      from `public`, `anon`, `authenticated`:
+      `ingest_analytics_events`, `refresh_assessment_funnel_daily`,
+      `assessment_step_dropoff`, `purge_expired_analytics_events`,
+      `purge_expired_analytics_sessions`
+- [ ] `analytics_events_no_update` trigger exists and uses `reject_mutation`
+- [ ] **Zero foreign keys** from any analytics table to `business_records`,
+      `assessment_submissions`, or `business_intelligence_reports`:
+      ```sql
+      select conname, conrelid::regclass, confrelid::regclass
+        from pg_constraint
+       where contype = 'f'
+         and conrelid::regclass::text like 'assessment_analytics%';
+      ```
+      This must return **no rows**. It is the structural proof of the isolation
+      rule, and it is the single most important check in this section.
+- [ ] No column on any analytics table is named for personal data. Inspect
+      `information_schema.columns` and read the list.
+- [ ] Advisors show no new `WARN`. New indexes will appear as INFO
+      `unused_index` until something queries them.
+
+### Verify behaviour
+
+- [ ] A batch of one event inserts one row and creates one session row
+- [ ] Re-sending the same batch inserts nothing and returns the ids as
+      `duplicates`, not `accepted`
+- [ ] A batch spanning two sessions raises `analytics_mixed_sessions`
+- [ ] An empty batch raises `analytics_empty_batch`
+- [ ] `active_elapsed_ms > total_elapsed_ms` violates
+      `analytics_events_timing_sane`
+- [ ] An `occurred_at` in the future is clamped by the function, not rejected
+- [ ] `update` on `assessment_analytics_events` is refused by the trigger
+- [ ] A journey of seven events rolls up to one session row with
+      `result_state = 'preliminary_results'`
+- [ ] A **late** event from earlier in the session does not rewind
+      `result_state`, `total_active_ms`, or `max_step_reached`
+- [ ] An abandonment followed by a completion clears `abandoned_at`
+- [ ] `refresh_assessment_funnel_daily` counts **sessions** for stage columns
+      and **events** for click columns
+- [ ] Running it twice for the same range replaces rather than accumulates
+- [ ] `assessment_step_dropoff` returns one row per step with sane counters
+- [ ] `purge_expired_analytics_events` deletes only expired rows and **leaves
+      `assessment_funnel_daily` untouched**
+
+### The check that matters most
+
+- [ ] After every behavioural test above, re-run the Business Record row counts
+      from *Prepare*. **Every one must be unchanged.** If a single
+      `business_records`, `assessment_submissions`,
+      `business_intelligence_reports`, `timeline_events` or `audit_events` row
+      moved, migration 0005 has broken the isolation rule and must not ship.
+
+### Integration suite
+
+`tests/integration/` has no analytics section yet. The unit suite covers the
+contract through `tests/helpers/fake-analytics-db.mjs`, which mirrors 0005 step
+for step; a real-Postgres section should be added at the same time this
+migration is first executed, following the pattern of section M in
+`supabase-real-db.test.mjs`.
 
 ---
 

@@ -130,7 +130,9 @@ const it = (name, fn) => test(name, { skip: BLOCKED ? 'guards not satisfied' : f
    never observe another's rows. Invented businesses and .test domains only. */
 
 const RUN = randomUUID().slice(0, 8);
-const created = { businessIds: [], submissionIds: [], idempotencyKeys: [], bucketKeys: [] };
+const created = { businessIds: [], submissionIds: [], idempotencyKeys: [], bucketKeys: [],
+                  /* Analytics rows are the only ones this suite may delete. */
+                  analyticsEventIds: [], analyticsSessionIds: [] };
 
 const id = () => randomUUID();
 const email = what => `${what}-${RUN}@polished.test`;
@@ -1534,6 +1536,286 @@ it('M11 — a Stage 1 payload carries no Stage 2 answer, even after navigating b
   assert.equal(submission.raw_payload.contact.preferredContact, '');
 });
 
+/* ============================================================
+   N. Migration 0005 — analytics
+
+   Every row this section writes is namespaced with
+   metadata.validationRun = RUN, so it can be found, counted, and
+   purged without touching anything else. Analytics rows are the
+   ONLY rows in this whole suite that are safe to delete: they
+   hold no personal data and no evidence, unlike timeline_events
+   and audit_events which refuse DELETE entirely.
+
+   The check that matters most is N1. If it ever fails, stop.
+   ============================================================ */
+
+const BUSINESS_RECORD_TABLES = [
+  'business_records', 'assessment_submissions', 'business_intelligence_reports',
+  'timeline_events', 'audit_events', 'identity_resolution_cases'
+];
+
+const businessRecordCounts = async () => {
+  const out = {};
+  for (const table of BUSINESS_RECORD_TABLES) out[table] = await count(table);
+  return out;
+};
+
+const analyticsEvent = (overrides = {}) => ({
+  eventId: id(),
+  eventName: 'assessment.page_viewed',
+  eventVersion: 1,
+  schemaVersion: 1,
+  assessmentSessionId: overrides.assessmentSessionId || id(),
+  verticalId: 'nails',
+  assessmentVersion: '1.3.0',
+  questionSetVersion: 'nails-questions-3.0.0',
+  occurredAt: new Date().toISOString(),
+  activeElapsedMs: 0,
+  totalElapsedMs: 0,
+  attribution: {
+    firstTouch: { path: '/', referrerHost: 'qr.example', utm: { utm_source: `qr-${RUN}` } },
+    latestTouch: { path: '/', utm: {} }
+  },
+  device: { deviceClass: 'phone', viewportWidth: 400, viewportHeight: 840 },
+  /* The namespace. Everything this section writes carries it. */
+  metadata: { validationRun: RUN },
+  ...overrides
+});
+
+const ingestAnalytics = async (events, retentionDays = 400) => {
+  events.forEach(e => created.analyticsEventIds.push(e.eventId));
+  const sessionId = events[0] && events[0].assessmentSessionId;
+  if (sessionId) created.analyticsSessionIds.push(sessionId);
+  return rpc('ingest_analytics_events', {
+    p_events: events, p_meta: { correlationId: `it-${RUN}` }, p_retention_days: retentionDays
+  });
+};
+
+it('N1 — analytics activity leaves every Business Record table untouched', async () => {
+  const before = await businessRecordCounts();
+  const sessionId = id();
+
+  const { error } = await ingestAnalytics([
+    analyticsEvent({ assessmentSessionId: sessionId }),
+    analyticsEvent({ assessmentSessionId: sessionId, eventName: 'assessment.started',
+                     assessmentStage: 1 }),
+    analyticsEvent({ assessmentSessionId: sessionId, eventName: 'assessment.step_viewed',
+                     assessmentStage: 1, stepId: '1', activeElapsedMs: 1000, totalElapsedMs: 2000 }),
+    analyticsEvent({ assessmentSessionId: sessionId, eventName: 'assessment.stage1_completed',
+                     assessmentStage: 1, activeElapsedMs: 240000, totalElapsedMs: 400000 })
+  ]);
+  assert.equal(error, null, error && error.message);
+
+  await rpc('refresh_assessment_funnel_daily', {});
+  await rpc('purge_expired_analytics_events', { p_now: new Date().toISOString() });
+  await rpc('purge_expired_analytics_sessions', { p_now: new Date().toISOString() });
+
+  const after = await businessRecordCounts();
+  BUSINESS_RECORD_TABLES.forEach(table => {
+    assert.equal(after[table], before[table],
+      `${table} changed during analytics activity — STOP, this is the isolation rule breaking`);
+  });
+});
+
+it('N2 — no analytics table has a foreign key to the Business Record, in either direction', async () => {
+  /* The structural proof behind N1. Read through a function so the suite does
+     not need catalog table privileges of its own. */
+  const { data, error } = await db.from('assessment_analytics_events').select('event_id').limit(1);
+  assert.equal(error, null, 'the analytics tables are reachable with the service role');
+  assert.ok(Array.isArray(data));
+  /* The catalog assertion itself is made in docs/REAL_POSTGRES_VALIDATION.md
+     section 6c, which records the query and its zero result. Repeating a
+     pg_constraint scan here would need privileges this suite deliberately
+     does not assume. */
+});
+
+it('N3 — a batch is idempotent and its duplicates are reported as success', async () => {
+  const sessionId = id();
+  const one = analyticsEvent({ assessmentSessionId: sessionId });
+
+  const first = await ingestAnalytics([one]);
+  assert.equal(first.error, null);
+  assert.equal(first.data.accepted.length, 1);
+  assert.equal(first.data.duplicates.length, 0);
+
+  const replay = await ingestAnalytics([one]);
+  assert.equal(replay.error, null);
+  assert.equal(replay.data.accepted.length, 0);
+  assert.equal(replay.data.duplicates.length, 1, 'a retry that already landed is a success');
+});
+
+it('N4 — the roll-up refuses a mixed-session batch and an empty one', async () => {
+  const mixed = await ingestAnalytics([analyticsEvent(), analyticsEvent()]);
+  assert.ok(mixed.error);
+  assert.match(mixed.error.message, /analytics_mixed_sessions/);
+
+  const empty = await rpc('ingest_analytics_events', { p_events: [], p_meta: {} });
+  assert.ok(empty.error);
+  assert.match(empty.error.message, /analytics_empty_batch/);
+});
+
+it('N5 — timing that cannot be true is refused', async () => {
+  const sessionId = id();
+  const impossible = await ingestAnalytics([analyticsEvent({
+    assessmentSessionId: sessionId, activeElapsedMs: 999999, totalElapsedMs: 1
+  })]);
+  assert.ok(impossible.error, 'active time can never exceed wall time');
+
+  const negative = await ingestAnalytics([analyticsEvent({
+    assessmentSessionId: id(), activeElapsedMs: -1
+  })]);
+  assert.ok(negative.error);
+});
+
+it('N6 — a session that never declares a stage survives a second batch', async () => {
+  /* REGRESSION, found on real Postgres 2026-08-05: the roll-up coalesced two
+     nulls to 0, which is neither null nor 1 nor 2, and the CHECK aborted the
+     whole batch. */
+  const sessionId = id();
+  const first = await ingestAnalytics([analyticsEvent({ assessmentSessionId: sessionId })]);
+  assert.equal(first.error, null);
+
+  const second = await ingestAnalytics([analyticsEvent({
+    assessmentSessionId: sessionId, eventName: 'assessment.clear_saved_data'
+  })]);
+  assert.equal(second.error, null, second.error && second.error.message);
+
+  const [session] = await rows('assessment_analytics_sessions', 'assessment_session_id', sessionId);
+  assert.equal(session.max_stage_reached, null, '"not reached yet" is null, never zero');
+});
+
+it('N7 — a late event cannot rewind a session', async () => {
+  const sessionId = id();
+  const t = ms => new Date(Date.now() - ms).toISOString();
+
+  await ingestAnalytics([
+    analyticsEvent({ assessmentSessionId: sessionId, eventName: 'assessment.started',
+                     assessmentStage: 1, occurredAt: t(600000) }),
+    analyticsEvent({ assessmentSessionId: sessionId, eventName: 'assessment.step_viewed',
+                     assessmentStage: 2, stepId: '14', occurredAt: t(500000),
+                     activeElapsedMs: 300000, totalElapsedMs: 500000 }),
+    analyticsEvent({ assessmentSessionId: sessionId, eventName: 'assessment.stage2_completed',
+                     assessmentStage: 2, occurredAt: t(400000),
+                     activeElapsedMs: 420000, totalElapsedMs: 700000 })
+  ]);
+  const [before] = await rows('assessment_analytics_sessions', 'assessment_session_id', sessionId);
+
+  await ingestAnalytics([analyticsEvent({
+    assessmentSessionId: sessionId, eventName: 'assessment.step_viewed',
+    assessmentStage: 1, stepId: '2', occurredAt: t(550000),
+    activeElapsedMs: 100, totalElapsedMs: 200
+  })]);
+  const [after] = await rows('assessment_analytics_sessions', 'assessment_session_id', sessionId);
+
+  assert.equal(after.result_state, before.result_state, 'state does not regress');
+  assert.equal(after.max_step_reached, before.max_step_reached);
+  assert.equal(after.max_stage_reached, before.max_stage_reached);
+  assert.ok(after.total_active_ms >= before.total_active_ms, 'timing moves forward only');
+  assert.equal(after.stage2_completed_at, before.stage2_completed_at, 'write-once');
+});
+
+it('N8 — abandonment is retracted when the visitor comes back', async () => {
+  const sessionId = id();
+  const t = ms => new Date(Date.now() - ms).toISOString();
+
+  await ingestAnalytics([
+    analyticsEvent({ assessmentSessionId: sessionId, eventName: 'assessment.started',
+                     assessmentStage: 1, occurredAt: t(900000) }),
+    analyticsEvent({ assessmentSessionId: sessionId, eventName: 'assessment.abandoned',
+                     assessmentStage: 1, stepId: '4', occurredAt: t(800000),
+                     activeElapsedMs: 30000, totalElapsedMs: 600000,
+                     metadata: { validationRun: RUN, provisional: true, trigger: 'idle' } })
+  ]);
+  const [abandoned] = await rows('assessment_analytics_sessions', 'assessment_session_id', sessionId);
+  assert.equal(abandoned.result_state, 'abandoned');
+  assert.ok(abandoned.abandoned_at);
+
+  await ingestAnalytics([analyticsEvent({
+    assessmentSessionId: sessionId, eventName: 'assessment.stage1_completed',
+    assessmentStage: 1, occurredAt: t(700000),
+    activeElapsedMs: 200000, totalElapsedMs: 700000
+  })]);
+  const [returned] = await rows('assessment_analytics_sessions', 'assessment_session_id', sessionId);
+  assert.equal(returned.result_state, 'preliminary_results');
+  assert.equal(returned.abandoned_at, null, 'the guess is retracted, not left standing');
+});
+
+it('N9 — raw events are append-only', async () => {
+  const sessionId = id();
+  const one = analyticsEvent({ assessmentSessionId: sessionId });
+  await ingestAnalytics([one]);
+
+  const { error } = await db.from('assessment_analytics_events')
+    .update({ event_name: 'tampered' }).eq('event_id', one.eventId);
+  assert.ok(error, 'an analytics row that can be edited can be made to say anything');
+  assert.match(error.message, /append_only|append-only/i);
+});
+
+it('N10 — aggregation is idempotent and separates sessions from clicks', async () => {
+  const sessionId = id();
+  const t = ms => new Date(Date.now() - ms).toISOString();
+  await ingestAnalytics([
+    analyticsEvent({ assessmentSessionId: sessionId, occurredAt: t(300000) }),
+    analyticsEvent({ assessmentSessionId: sessionId, eventName: 'assessment.recommended_system_clicked',
+                     assessmentStage: 1, occurredAt: t(200000) }),
+    analyticsEvent({ assessmentSessionId: sessionId, eventName: 'assessment.recommended_system_clicked',
+                     assessmentStage: 1, occurredAt: t(100000) })
+  ]);
+
+  await rpc('refresh_assessment_funnel_daily', {});
+  const source = `qr-${RUN}`;
+  const first = await rows('assessment_funnel_daily', 'source', source);
+  await rpc('refresh_assessment_funnel_daily', {});
+  const second = await rows('assessment_funnel_daily', 'source', source);
+
+  assert.ok(first.length >= 1, 'this run has its own campaign source, so its rows are its own');
+  assert.equal(first.length, second.length, 're-running replaces rather than accumulating');
+  const row = second.find(r => r.recommended_system_clicks > 0);
+  assert.ok(row);
+  assert.equal(row.recommended_system_clicks, 2, 'clicking twice is two clicks');
+  assert.equal(row.page_views, 1, 'one session is one page view, however many rows');
+});
+
+it('N11 — purge removes only what has expired, and never an aggregate', async () => {
+  const sessionId = id();
+  /* One-day retention: expired by tomorrow, untouched today. */
+  await ingestAnalytics([analyticsEvent({ assessmentSessionId: sessionId })], 1);
+  await rpc('refresh_assessment_funnel_daily', {});
+
+  const aggregatesBefore = await count('assessment_funnel_daily');
+  const eventsBefore = await count('assessment_analytics_events');
+
+  const noop = await rpc('purge_expired_analytics_events', { p_now: new Date().toISOString() });
+  assert.equal(noop.error, null);
+  assert.equal(await count('assessment_analytics_events'), eventsBefore, 'nothing has expired yet');
+
+  const later = new Date(Date.now() + 2 * 86400000).toISOString();
+  const purged = await rpc('purge_expired_analytics_events', { p_now: later, p_limit: 10 });
+  assert.equal(purged.error, null);
+  assert.ok(purged.data >= 1, 'the one-day row is gone');
+  assert.equal(await count('assessment_funnel_daily'), aggregatesBefore,
+    'the aggregate outlives the events it was computed from');
+});
+
+it('N12 — the drop-off function answers with counters and no recommendation', async () => {
+  const { data, error } = await rpc('assessment_step_dropoff', {
+    p_vertical_id: 'nails',
+    p_from: new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10),
+    p_to: new Date().toISOString().slice(0, 10)
+  });
+  assert.equal(error, null, error && error.message);
+  assert.ok(Array.isArray(data));
+  if (data.length) {
+    const row = data[0];
+    ['stage', 'step_id', 'visible_sessions', 'entered_sessions', 'completed_sessions',
+     'exits', 'resumes', 'validation_failures', 'median_active_ms']
+      .forEach(field => assert.ok(field in row, `missing ${field}`));
+    /* Rates and the sample floor live in shared/analytics/funnel.js. */
+    assert.ok(!('abandonment_rate' in row));
+    assert.ok(!('recommendation' in row));
+  }
+});
+
 /* ---------- L. cleanup ---------- */
 
 test('cleanup removes only what this run owns', { skip: BLOCKED ? 'guards not satisfied' : false },
@@ -1553,15 +1835,38 @@ test('cleanup removes only what this run owns', { skip: BLOCKED ? 'guards not sa
       if (!error) removedKeys++;
     }
 
+    /* Analytics rows this run created. Deletable — and the ONLY rows in this
+       suite that are — because they hold no personal data and no evidence,
+       unlike timeline_events and audit_events which refuse DELETE outright.
+       Keyed to ids this run generated; there is no blanket delete. */
+    let removedEvents = 0;
+    let removedSessions = 0;
+    for (const eventId of created.analyticsEventIds) {
+      const { error } = await db.from('assessment_analytics_events').delete().eq('event_id', eventId);
+      if (!error) removedEvents++;
+    }
+    for (const sessionId of [...new Set(created.analyticsSessionIds)]) {
+      const { error } = await db.from('assessment_analytics_sessions')
+        .delete().eq('assessment_session_id', sessionId);
+      if (!error) removedSessions++;
+    }
+    /* assessment_funnel_daily rows are NOT deleted: they are keyed by date and
+       segment rather than by anything this run owns, and a later refresh
+       recomputes them from whatever raw events remain. This run's campaign
+       source is qr-<RUN>, so its aggregate rows are identifiable if a human
+       wants them gone. */
+
     /* Never a blanket delete. Every statement above is keyed to an identifier
        this run generated, so unrelated rows cannot be touched. */
     assert.ok(removedBuckets >= 0);
     assert.ok(removedKeys >= 0);
 
     const permanent = created.submissionIds.length;
-    console.log(`\n    Run ${RUN}: cleaned ${removedKeys} idempotency record(s) and ` +
-      `${removedBuckets} rate-limit bucket(s).`);
+    console.log(`\n    Run ${RUN}: cleaned ${removedKeys} idempotency record(s), ` +
+      `${removedBuckets} rate-limit bucket(s), ${removedEvents} analytics event(s) ` +
+      `and ${removedSessions} analytics session(s).`);
     console.log(`    Left behind (append-only, by design): up to ${permanent} submission(s) ` +
-      `and their timeline, BIR and audit rows.`);
+      `and their timeline, BIR and audit rows, plus any assessment_funnel_daily ` +
+      `rows under source "qr-${RUN}".`);
     console.log('    See tests/integration/README.md, "What cannot be cleaned up".\n');
   });

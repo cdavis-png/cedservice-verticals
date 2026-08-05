@@ -297,6 +297,45 @@ arithmetic in the engine is how the figure on screen and the figure in the
 report drift apart. Omit them and the engine falls back to the point estimate,
 which is a degradation, not a supported configuration.
 
+Add the analytics pair before the engine:
+
+```html
+<script src="../../../../shared/analytics/events.js"></script>
+<script src="../../../../shared/analytics/analytics-client.js"></script>
+<script src="../../../../shared/assessment-engine/engine.js"></script>
+```
+
+Both are optional in the strict sense — the assessment works identically with
+neither loaded — but a vertical without them is a vertical nobody can measure.
+No third-party SDK is ever added here; analytics is first-party and same-origin.
+
+### 4c. Marking controls for analytics
+
+The engine already instruments steps, questions, validation failures, stage
+boundaries and result views. A vertical only has to mark its own calls to
+action:
+
+```html
+<a href="mailto:..." data-analytics-event="assessment.personal_review_clicked"
+   data-analytics-label="stage1_results">Request a Personal Review</a>
+```
+
+One delegated listener on the modal handles every such control. Rules:
+
+- **Use an existing event name.** They are in
+  [ANALYTICS_EVENT_CATALOG.md](ANALYTICS_EVENT_CATALOG.md) and are a shared
+  contract; the raw event table is append-only, so a new name orphans nothing
+  but a renamed one orphans history.
+- **Nothing is prevented.** A marked link is still an ordinary link.
+- **Never add a listener per question.** The engine already counts every field
+  through one delegated listener.
+- **Never put visitor content in `data-analytics-label`.** It is a static
+  control name, and the privacy rules will drop it if it looks personal.
+
+Analytics may not carry names, emails, phone numbers, free text, full URLs, or
+any close-related answer. See [ANALYTICS_PRIVACY.md](ANALYTICS_PRIVACY.md)
+before adding a field to any event's metadata.
+
 Order matters — the config must load before the engine. Start from
 [the nails config](../verticals/beauty-wellness-fitness/nails/assessment.config.js)
 and replace the numbers and copy; do not edit the engine to accommodate a
@@ -406,6 +445,26 @@ than industry-level.
 - [ ] End-to-end submission confirmed against the live endpoint, including a
       forced failure to confirm the entry lands in the retry queue.
 - [ ] `meta.packages` prices match the packages section of the page.
+
+**Analytics**
+
+- [ ] `events.js` and `analytics-client.js` are loaded before the engine.
+- [ ] The vertical's production origin is in `CED_ALLOWED_ORIGINS`, or every
+      event is refused with 403.
+- [ ] `CED_RATE_LIMIT_SECRET` is set, or there is no rate limiting at all.
+- [ ] Every call to action carries `data-analytics-event` with a name from the
+      catalog, and still behaves as an ordinary link or button.
+- [ ] A complete run produces `page_viewed`, `started`, `step_viewed` per step,
+      `stage1_completed` and `preliminary_results_viewed` — check the console
+      in debug mode, or the network tab.
+- [ ] No answer value appears in any event except the two allowlisted fields.
+      Search a captured batch for the salon name and the email address.
+- [ ] Opening from `file://` sends nothing at all.
+- [ ] A purge schedule exists: `refresh_assessment_funnel_daily` **then**
+      `purge_expired_analytics_events`, in that order.
+- [ ] **The analytics consent policy has been reviewed**, or the vertical is in
+      a private pilot only. See
+      [ANALYTICS_PRIVACY.md](ANALYTICS_PRIVACY.md) section 6.
 
 **Mobile and accessibility**
 

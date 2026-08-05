@@ -322,7 +322,10 @@ export function loadEngine(dom, config, options = {}) {
       const el = dom.elements[name];
       if (!el) throw new Error(`no such field: ${name}`);
       el.value = value;
-      dom.form.fire('change');
+      /* A real change event carries the control that changed. The engine's
+         single delegated listener reads event.target.name, so the harness
+         must supply it or every question looks unanswered. */
+      dom.form.fire('change', { target: el });
     },
     open() { dom.start.fire('click'); },
     next() { dom.next.fire('click'); },
