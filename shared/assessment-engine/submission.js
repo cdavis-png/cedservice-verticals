@@ -186,6 +186,51 @@
     return entry;
   };
 
+  /* The continuation context, resolved AT SEND TIME.
+
+     A queued submission may be retried hours or days after it was queued,
+     and the context that was current when it failed has almost certainly
+     expired by then. So `continuationToken` may be a function, and a retry
+     calls it on each attempt rather than carrying a value it captured once.
+
+     It is never stored in the queue entry or in the payload. A queue lives
+     in localStorage for up to thirty days; a signed, expiring credential
+     written there is a credential at rest on the visitor's device, long
+     after it stopped being useful for anything except replay. Resolving it
+     late is what makes "the context is never persisted" true rather than
+     merely intended. */
+  const resolveContinuation = (opts, payload) => {
+    const source = opts.continuationToken;
+    if (typeof source !== 'function') return source || null;
+    try {
+      /* The payload is handed to the resolver so it can decide per
+         SUBMISSION, not per page load. A queue may hold one business's review
+         while another business's context is the current one, and the resolver
+         is the only thing positioned to notice. */
+      return source(payload) || null;
+    } catch (err) {
+      /* A context that cannot be read is a submission that does not link,
+         which is a complete and correct outcome. It is never a failure. */
+      console.warn('[CED] Could not read the continuation context; sending without it.', err);
+      return null;
+    }
+  };
+
+  /* A response may carry a REFRESHED context. Handed straight back to the
+     caller, which owns the shared store; this adapter does not parse it, does
+     not store it, and could not mint one. Never logged — the whole point of
+     an opaque bearer value is that it does not appear in places that are
+     kept. */
+  const announceContinuation = (opts, body) => {
+    const token = body && body.continuationToken;
+    if (!token || typeof opts.onContinuation !== 'function') return;
+    try {
+      opts.onContinuation(token);
+    } catch (err) {
+      console.warn('[CED] A continuation context could not be stored.', err);
+    }
+  };
+
   const postJson = async (payload, opts) => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), opts.timeoutMs);
@@ -196,6 +241,17 @@
       );
       /* Lets the server collapse duplicates from timeouts and retries. */
       if (payload && payload.submissionId) headers['Idempotency-Key'] = payload.submissionId;
+
+      /* The continuation context travels as a HEADER, never in the body.
+         A bearer credential inside the payload is a credential inside
+         everything the payload becomes: the request hash, the stored
+         submission, the report. Keeping it out of the JSON is what makes
+         "never enters an assessment payload" a property of the transport
+         rather than a promise the server has to keep by remembering to strip
+         it. The server still strips a body-borne one, as a defence against a
+         client that does it the old way. */
+      const token = resolveContinuation(opts, payload);
+      if (token) headers['X-CED-Continuation'] = token;
 
       const response = await fetch(opts.endpoint, {
         method: 'POST',
@@ -253,12 +309,23 @@
 
     try {
       const { body } = await postJson(payload, opts);
+      /* Deliberately not routed through onContinuation: a caller that
+         submits directly gets the refreshed context in the return value
+         below, and storing it twice under one key would let the second write
+         drop the prefill the first one carried. The retry path has no return
+         value to read, which is why the callback exists there. */
       return {
         status: 'sent',
         endpoint: opts.endpoint,
         submissionId: payload.submissionId || null,
         businessId: (body && body.businessId) || null,
         identityStatus: (body && body.identityStatus) || null,
+        /* An opaque, server-signed, expiring context for continuing into
+           another review type. Passed through untouched: this adapter does
+           not parse it, does not store it, and could not mint one. See
+           shared/security/continuation.js. */
+        continuationToken: (body && body.continuationToken) || null,
+        reviewType: (body && body.reviewType) || null,
         replayed: Boolean(body && body.replayed)
       };
     } catch (err) {
@@ -314,7 +381,12 @@
 
       attempted++;
       try {
-        await postJson(entry.payload, opts);
+        /* The SAME payload, so the same submissionId travels, so the server
+           collapses a retry of one result into a replay rather than storing
+           it twice. The context is the only thing that differs between
+           attempts, and it is not part of the payload. */
+        const { body } = await postJson(entry.payload, opts);
+        announceContinuation(opts, body);
         sent++;                                      /* delivered: dropped immediately */
       } catch (err) {
         const attempts = (entry.attempts || 0) + 1;

@@ -22,6 +22,155 @@ No production system was touched. No credentials were created, printed, or
 stored. The nail-salon page, pricing, scoring, and the assessment itself were
 not modified in either run.
 
+### Run 4 — migration 0006, against a disposable local PostgreSQL
+
+| | Run 4 |
+|---|---|
+| Date | 2026-08-05 |
+| Target | **A disposable PostgreSQL created inside the test process.** No host, no port, no socket, no credential. |
+| Engine | PGlite 0.5.4 — the PostgreSQL server source compiled to WebAssembly |
+| Postgres | **18.3** (the hosted development project is 17.6.1.155) |
+| Migrations | 0001 → 0002 → 0003 → 0004 → 0005 → 0006, applied as a chain |
+| Method | SQL directly, through an adapter presenting the supabase-js surface the suite uses |
+| Result | **59/59 integration tests pass**, **17/17 migration-chain tests pass**, **1 defect found in 0006 and fixed**, 2 defects found in the suite itself and fixed |
+
+No hosted database was touched. Nothing was created, reset, or connected to
+remotely. The cluster's data directory is removed when the run ends.
+
+**Why local rather than hosted.** Neither Docker, Podman, WSL, the Supabase
+CLI, nor a local PostgreSQL server was installed on the machine, and touching
+a hosted project was out of bounds. PGlite is real PostgreSQL and needs none
+of them.
+
+**Why this run mattered more than 0004's.** 0006 turns `ingest_assessment()`
+into a thin wrapper over a new generic `ingest_review()`, which meant
+transcribing the 0003 body. Migration 0004 declined to do exactly this, on the
+grounds that a transcription error in the parts that did *not* change is
+likelier than a bug in the change itself. That reasoning still holds; it was
+overridden only because the alternative was two copies of the
+identity-resolution rules, which CLAUDE.md section 3 treats as the defect.
+Section O is the compensating control, and it has now run.
+
+### Defect 6 — the analytics envelope version was never widened
+
+**Found by the first execution of 0006.** SM-1 added `reviewType` to the
+analytics event envelope and bumped
+`shared/analytics/events.js :: ANALYTICS_SCHEMA_VERSION` to 2. The endpoint
+accepts `[1, 2]`. Migration 0005 pinned the column to
+`check (schema_version between 1 and 1)`, and 0006 never widened it.
+
+```
+new row for relation "assessment_analytics_events"
+violates check constraint "analytics_events_schema_version_check"
+```
+
+Every analytics event a post-SM-1 page emitted would have been refused by the
+database — and because ingestion is one transaction per batch, **the whole
+batch with it**. The browser would have retried, been refused again, and
+eventually dropped the events. Nothing in the unit suite could see it: the
+in-memory double does not model that constraint, and the endpoint's own
+validation happily accepts version 2.
+
+Fixed in 0006 by widening the constraint to `between 1 and 2`, with version 1
+still valid because a page cached before the deploy still emits it. Pinned by
+`tests/migration/0006-upgrade.test.mjs`, which ingests a version-2 event
+immediately after the upgrade.
+
+### Two defects in the integration suite itself
+
+The suite had **never been run end to end** before this. Two of its own tests
+were wrong, and would have failed against a hosted database just as they did
+here:
+
+- **M5 and the section E clock-skew test shared the idempotency key
+  `it-<RUN>-skew` with different request hashes.** Whichever ran second was
+  correctly refused with `idempotency_key_conflict`. The key was the bug; the
+  behaviour was right.
+- **N10 asserted "one session is one page view" against an aggregate row the
+  whole of section N shares.** Every analytics test in the suite writes under
+  one campaign source, so they all land on one row and the count was 5. The
+  assertion was right and needed a group of its own to be about.
+
+### Run 5 — the audit repair pass
+
+| | Run 5 |
+|---|---|
+| Date | 2026-08-05 |
+| Target | A disposable PostgreSQL created inside the test process, as run 4 |
+| Postgres | 18.3 (PGlite 0.5.4) |
+| Result | **60/60 integration**, **35/35 migration** (clean install 7, rerun/RLS 7, **RPC roles 11**, upgrade 10, **concurrency 7**) |
+
+Added by this pass:
+
+- **`tests/migration/0006-rpc-roles.test.mjs`** — every check runs after
+  `SET ROLE`, not as the database owner. Previous runs proved only that the
+  owner could call everything, which is true of any function and says nothing
+  about either role.
+- **`tests/migration/0006-concurrency.test.mjs`** — the advisory lock that
+  stops two concurrent first submissions creating two supersession roots.
+
+### Defect 7 — server RPC execute was never granted, only revoked
+
+Every migration through 0005 revoked `EXECUTE` from `public`, `anon` and
+`authenticated`, and then relied on `service_role` *happening* to have it
+through a Supabase project's default privileges. Nothing in the schema said
+so. A project created differently, or one whose default privileges were later
+tightened, would leave the Vercel Function unable to call its own ingestion
+function — and no test could have caught it, because every test ran as the
+owner.
+
+0006 now grants `EXECUTE` explicitly to `service_role` on all eleven server
+RPCs, after revoking from `PUBLIC` (order matters: PostgreSQL grants EXECUTE
+to PUBLIC on every new function, and revoking after granting takes it from
+nobody useful). Trigger and helper functions are granted to nobody.
+
+### PostgREST — still not executed
+
+Local mode speaks SQL directly. A local PostgREST run was attempted and is
+**not achievable here**: PostgREST is a Haskell binary distributed through
+GitHub releases rather than npm — the `postgrest` npm package is an unrelated
+JavaScript library with no executable — and supabase-js speaks PostgREST's
+HTTP API rather than the PostgreSQL wire protocol, so bridging PGlite to a TCP
+socket would not help without also fetching and running that binary.
+
+What that leaves unproven, precisely:
+
+- resolution of `ingest_review`'s ten-argument signature **by argument name
+  over HTTP**. Locally the signature is proven unique and correctly granted,
+  and the adapter binds by name; PostgREST's own resolution is not exercised.
+- JSON serialisation of a full payload across the wire.
+- that the `service_role` key actually reaches the function as `service_role`.
+
+**Successful PostgREST execution remains a deployment blocker.** Section O is
+written and will exercise it on the first run with credentials.
+
+### Concurrency — proven structurally, not by racing
+
+PGlite is a single connection, so two transactions cannot interleave. The
+concurrency tests prove the advisory lock exists, is transaction-scoped, is
+keyed on `(business, review type)`, is taken **before** the review state is
+read, and that the serialised outcome is a single supersession root.
+Reproducing the race itself needs two simultaneous connections to a server
+Postgres and remains outstanding.
+
+### What run 4 did not validate
+
+- **PostgREST.** Local mode speaks SQL directly. Argument binding, function
+  overload resolution over HTTP, and JSON serialisation of a full payload
+  remain the hosted path's to prove. `ingest_review`'s ten-argument signature
+  resolves correctly *as SQL*; that it resolves through PostgREST does not
+  follow from this run.
+- **PostgreSQL 17.6.** This ran on 18.3. A behaviour that differs between the
+  two majors would not be caught.
+- **pgcrypto.** Unavailable in PGlite; 0001's `create extension` was tolerated.
+  Nothing in the chain uses a function only pgcrypto provides, and
+  `assertNoPgcryptoDependency()` checks that rather than assuming it.
+- **Concurrency and scale.** Unchanged from previous runs: neither was
+  exercised.
+
+**Migration 0006 is validated as SQL and as a migration. It has still never
+been applied to a hosted database, and the hosted run remains outstanding.**
+
 ---
 
 ## 0. Run 2 — migration 0004 and the two-stage assessment

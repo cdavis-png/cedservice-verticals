@@ -36,6 +36,14 @@
      docs/PRODUCTION_HARDENING.md, "Version compatibility". */
   const PAYLOAD_SCHEMA_VERSION = 5;
 
+  /* Where a server-issued continuation context is left for another review
+     type to find. Deliberately NOT namespaced by vertical or by storage key:
+     the whole point is that a second review, with its own config and its own
+     saved state, can pick it up. It is opaque, expiring, and useless without
+     the server-only secret that signed it — but it is still a bearer token,
+     so clearSavedAssessmentData() removes it along with everything else. */
+  const CONTINUATION_KEY = 'ced:continuation';
+
   /* Shared markup contract. Every vertical's index.html uses these hooks. */
   const SELECTORS = {
     modal: '.review-modal',
@@ -1089,6 +1097,27 @@
         const outcome = await adapter.submitAssessment(payload, submissionOptions);
         recordSubmission(stage, signature, payload.submissionId, outcome.status, outcome);
         if (outcome && outcome.businessId) analytics.identify({ businessId: outcome.businessId });
+        /* An opaque, server-signed context that lets a SECOND review type
+           attach to the same Business Record without this browser ever
+           holding a businessId. Stored through the platform's shared store so
+           another review's page can find it; never parsed here, and never
+           minted here.
+
+           The prefill stored beside it is the contact this visitor typed on
+           this device moments ago — names and an email, nothing the server
+           holds and nothing they have not seen. It saves the next review
+           asking the same questions again. */
+        const continuation = window.CEDContinuation;
+        if (continuation && outcome && outcome.continuationToken) {
+          continuation.storeContinuation({
+            token: outcome.continuationToken,
+            prefill: {
+              salonName: read.val('salonName'),
+              ownerName: read.val('ownerName'),
+              email: read.val('email')
+            }
+          });
+        }
         setStatus(outcome.status === 'sent' ? 'sent' : outcome.status === 'queued' ? 'queued' : 'ready', stage);
       } finally {
         sending = false;
@@ -1468,6 +1497,11 @@
 
       localStorage.removeItem(config.storageKey);
       localStorage.removeItem(submissionKey);
+      /* The continuation context is a bearer token, and the prefill stored
+         with it is contact data. "Delete my data" must not leave either
+         behind for the next review to pick up. */
+      if (window.CEDContinuation) window.CEDContinuation.clearContinuation();
+      else localStorage.removeItem(CONTINUATION_KEY);
       const adapter = window.CEDSubmission;
       if (adapter && adapter.clearQueue) adapter.clearQueue(submissionOptions);
       analytics.reset();

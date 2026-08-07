@@ -60,7 +60,10 @@ test('a tracked event carries the full envelope and a unique id', () => {
   assert.match(event.eventId, /^[0-9a-f-]{36}$/);
   assert.equal(event.eventName, 'assessment.step_viewed');
   assert.equal(event.eventVersion, 1);
-  assert.equal(event.schemaVersion, 1);
+  /* 2 since SM-1 added reviewType to the envelope. */
+  assert.equal(event.schemaVersion, 2);
+  assert.equal(event.reviewType, 'growth_review',
+    'an event from a page that declares nothing is a Growth Review event');
   assert.equal(event.assessmentSessionId, SESSION);
   assert.equal(event.verticalId, 'nails');
   assert.equal(event.assessmentVersion, '1.3.0');

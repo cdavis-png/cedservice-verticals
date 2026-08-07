@@ -83,11 +83,20 @@ test('a queued older submission survives a version bump', async () => {
   assert.equal(db.state.assessment_submissions.length, 1, 'not lost to a version bump');
 });
 
-test('the supported set is a contiguous range ending at the current version', () => {
+test('the supported set is a contiguous range ending at the newest review shape', () => {
   const supported = [...VERSIONS.SUPPORTED_PAYLOAD_SCHEMAS].sort((a, b) => a - b);
-  assert.equal(supported[supported.length - 1], VERSIONS.CURRENT_PAYLOAD_SCHEMA);
   assert.equal(supported[0], VERSIONS.MIN_KNOWN_PAYLOAD_SCHEMA);
   supported.forEach((v, i) => { if (i) assert.equal(v, supported[i - 1] + 1, 'no gaps'); });
+
+  /* SM-1 made "current" review-specific: 5 is the current GROWTH payload and
+     6 is the Quick Service Mix Review's shape, not a newer Growth one. The
+     range must still end at the newest shape any review type produces, and
+     every per-review current must be inside it. */
+  const currents = Object.values(VERSIONS.CURRENT_PAYLOAD_SCHEMA_BY_REVIEW);
+  assert.equal(supported[supported.length - 1], Math.max(...currents));
+  currents.forEach(v => assert.ok(supported.includes(v), `current ${v} must be supported`));
+  assert.equal(VERSIONS.CURRENT_PAYLOAD_SCHEMA_BY_REVIEW.growth_review,
+    VERSIONS.CURRENT_PAYLOAD_SCHEMA, 'the bare constant remains the Growth current');
 });
 
 test('the database records only versions the endpoint accepts', async () => {

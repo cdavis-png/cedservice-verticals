@@ -118,12 +118,19 @@ because on a public endpoint anyone can type anything into a form.
 
 | Situation | Result | Business created? |
 |---|---|---|
-| Session already linked | link to that business, `linkMethod: session` | no |
+| Session already linked, **and uncontradicted** | link to that business, `linkMethod: session` | no |
+| Session already linked, **materially contradicted** | `resolution_pending`, case opened | **no** |
 | Exactly one candidate with a **verified** strong identifier | link automatically | no |
 | No candidate at all | create a new `businessId` (UUID v4) | **yes** |
+| No candidate, but a saved proposal was vetoed | `resolution_pending`, case opened | **no** |
 | One candidate on weak signals only | `resolution_pending`, case opened | **no** |
 | A **claimed** (unverified) strong identifier matches | `resolution_pending`, case opened | **no** |
 | Two or more verified strong candidates | `resolution_pending`, case opened | **no** |
+
+**Superseded by rule B0 (SM-1).** A session id and a continuation context are
+both *proposals*, compared with what the record they name actually holds
+before either is honoured. This table describes the milestone as shipped; the
+current rule is in [SERVICE_MIX_REVIEW.md](SERVICE_MIX_REVIEW.md) §10a.
 
 Strong types: `gbp_place_id`, `external_customer_id`, `payment_customer_id` —
 auto-linking only when `verified = true` **and** the source is one of
@@ -243,10 +250,20 @@ decisions for every branch, the trust model, BIR generation and the
 supersession chain, replay, rollback, append-only shape, redaction, and
 maintenance.
 
-**What the tests do not cover:** the PL/pgSQL function is *not executed*. There
-is no Postgres in the test environment, so `tests/helpers/fake-db.mjs`
-implements the same contract in memory, step for step. It proves the endpoint
-and the contract; it does not prove the SQL.
+**What the tests do not cover** — *historical, and superseded.* This paragraph
+read: "the PL/pgSQL function is *not executed*. There is no Postgres in the
+test environment." Both statements were true of this milestone's suite and are
+no longer true of the repository.
+
+`tests/helpers/fake-db.mjs` still implements the same contract in memory, step
+for step, and the unit suite still proves the endpoint rather than the SQL. But
+there is now a real PostgreSQL in the test environment: `tests/migration/` and
+`npm run test:integration:local` run the whole migration chain against a
+disposable local PostgreSQL 18.3 through PGlite, and migrations 0001–0005 have
+additionally been executed against a hosted development PostgreSQL 17 project.
+Migration 0006 has **not** run against PostgreSQL 17, hosted Supabase, or
+PostgREST. See [REAL_POSTGRES_VALIDATION.md](REAL_POSTGRES_VALIDATION.md),
+which is the one place execution status is maintained.
 
 It **does** now enforce the CHECK constraints that ingestion can violate. That
 change was not cosmetic: the review found a live conflict between the
@@ -291,8 +308,13 @@ assessments then log locally and nothing is sent.
 
 ## 10. Known limitations
 
-1. **The SQL is unverified at runtime.** It has never been executed. First run
-   against a real project remains the highest-risk step in this milestone.
+1. ~~**The SQL is unverified at runtime.** It has never been executed.~~
+   *Historical, superseded.* Migrations 0001–0005 have since been executed
+   against Supabase PostgreSQL 17.6.1.155, and 0006 against a disposable local
+   PostgreSQL 18.3 through PGlite. 0006 has **not** run against PostgreSQL 17,
+   hosted Supabase, or PostgREST. See
+   [REAL_POSTGRES_VALIDATION.md](REAL_POSTGRES_VALIDATION.md), which is the one
+   place execution status is stated.
 2. **No manual identity-resolution surface.** `identity_resolution_cases` rows
    accumulate with nothing to work them. Ambiguous submissions are stored safely
    but nobody can resolve them yet — and Milestone 1.1 sends *more* to that

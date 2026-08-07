@@ -313,10 +313,17 @@ test('the real markup carries the attributes the delegated listener needs', () =
     .readFileSync(new URL('../verticals/beauty-wellness-fitness/nails/site/index.html', import.meta.url), 'utf8');
   assert.match(html, /data-analytics-event="assessment\.personal_review_clicked"/);
   assert.match(html, /data-analytics-event="assessment\.report_requested"/);
-  /* And they are still ordinary links, not buttons the engine hijacks. */
+  /* And they are still ordinary links, not buttons the engine hijacks. The
+     destination is incidental — SM-1 added one that goes to the Quick Service
+     Mix Review rather than to a mail client. What matters is that every
+     instrumented anchor has a real href and the click is counted on the way
+     through, never intercepted. */
   const anchors = html.match(/<a\b[^>]*data-analytics-event[^>]*>/gs) || [];
-  assert.equal(anchors.length, 2);
-  anchors.forEach(tag => assert.match(tag, /href="mailto:/));
+  assert.ok(anchors.length >= 2);
+  anchors.forEach(tag => {
+    assert.match(tag, /href="[^"#][^"]*"/, 'an instrumented link must actually go somewhere');
+    assert.equal(/onclick=/.test(tag), false, 'nothing is prevented');
+  });
 });
 
 /* ---------- resume and deletion ---------- */

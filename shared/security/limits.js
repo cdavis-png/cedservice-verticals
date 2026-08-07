@@ -298,10 +298,18 @@
 
   /* Identifier-specific gate, applied before a value is allowed to become
      identity evidence. Length AND format, because an identifier that is the
-     right size but the wrong shape is still not an identifier. */
+     right size but the wrong shape is still not an identifier.
+
+     Length is counted in Unicode CODE POINTS, matching
+     resolve-identity.js :: isAcceptableValue and PostgreSQL `length()`. This
+     is the third parallel copy of one predicate — the duplication is
+     deliberate so each file stays loadable as a classic script — so all three
+     have to answer identically for the same input, including above U+FFFF
+     where `String.prototype.length` counts surrogate halves. */
   const isAcceptableIdentifier = (type, value) => {
     if (typeof value !== 'string') return false;
-    if (value.length === 0 || value.length > LIMITS.identifierValue) return false;
+    const length = [...value].length;
+    if (length === 0 || length > LIMITS.identifierValue) return false;
     const format = FORMATS[type];
     return format ? format.test(value) : true;
   };

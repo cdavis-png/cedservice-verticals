@@ -569,9 +569,17 @@
   /* businessId may be null ONLY while identity is unresolved. */
   const IDENTITY_STATUSES_ALLOWING_NULL_BUSINESS_ID = ['legacy_unresolved', 'resolution_pending'];
 
-  const validateBirIdentity = (identity, schemaVersion) => {
+  /* The identity contract is shared by every review type; the STRUCTURAL
+     version is not. A Growth report is v4 and a Service Mix report is v5, so
+     the caller says which versions it is entitled to produce rather than this
+     function assuming there is only one. Defaulting to the Growth version
+     keeps every existing call site behaving exactly as before. */
+  const validateBirIdentity = (identity, schemaVersion, options = {}) => {
     const errors = [];
     const push = (code, message) => errors.push({ code, message });
+    const supported = Array.isArray(options.supportedVersions) && options.supportedVersions.length
+      ? options.supportedVersions
+      : [BIR_SCHEMA_VERSION];
 
     if (!identity || typeof identity !== 'object') {
       return { valid: false, errors: [{ code: 'not_an_object', message: 'identity must be an object.' }] };
@@ -583,7 +591,7 @@
       if (identity.businessId) push('legacy_with_business_id', 'A v1 report must not carry a businessId; migrate it to v2 instead.');
       return { valid: errors.length === 0, errors, legacy: true };
     }
-    if (schemaVersion !== BIR_SCHEMA_VERSION) {
+    if (!supported.includes(schemaVersion)) {
       push('unsupported_schema_version', `Unsupported BIR schemaVersion: ${schemaVersion}`);
     }
 

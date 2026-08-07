@@ -20,14 +20,15 @@ Every event, without exception, carries these fields.
 | Field | Type | Notes |
 |---|---|---|
 | `eventId` | UUID | Generated client-side. The idempotency key: a retry of the same event is a no-op, not a duplicate row. |
-| `eventName` | enum | One of the 19 below. Anything else is refused. |
+| `eventName` | enum | One of the 29 below. Anything else is refused. |
 | `eventVersion` | integer | Per event. Bump when an event's *meaning* changes. |
-| `schemaVersion` | integer | Of the envelope. Currently 1. |
+| `schemaVersion` | integer | Of the envelope. Currently 2. Version 1 stays accepted — a page cached before the Service Mix deploy has no `reviewType` to send. |
 | `occurredAt` | ISO 8601 | Client clock, clamped server-side to receive time. |
 | `assessmentSessionId` | UUID | The pseudonymous key for everything. Minted by the assessment, never by analytics. |
 | `submissionId` | UUID or null | Known only after a stage is submitted. |
 | `businessId` | UUID or null | Known only after the server resolves identity. Analytics never resolves it. |
 | `verticalId` | string | e.g. `nails`. |
+| `reviewType` | enum | `growth_review` or `service_mix`. Absent means `growth_review`, because every event written before SM-1 is one. The event NAME wins when it settles the matter, so a `service_mix.*` event can never be filed under the Growth funnel by a misconfigured page. |
 | `assessmentVersion` | string | Content version of the assessment. |
 | `questionSetVersion` | string | Question inventory version, independent of scoring. |
 | `assessmentStage` | 1, 2, or null | Null before the review is opened. |
@@ -102,6 +103,59 @@ to continue.
 
 A CTA click is recorded **before** the stage it opens, so the two land in the
 right order even inside one batch.
+
+### Quick Service Mix Review (SM-1)
+
+New names, never repurposed ones. The raw event table is append-only, so
+renaming an existing event orphans its history rather than migrating it.
+
+| Event | Category | Fired when |
+|---|---|---|
+| `service_mix.review_viewed` | product | The review page is opened. Once per session. |
+| `service_mix.review_started` | product | The visitor begins. Once per session. |
+| `service_mix.offering_added` | product | An offering is added, from the starter list or typed. |
+| `service_mix.offering_removed` | product | An offering is removed **before submission** — the only trace such an offering ever leaves anywhere. |
+| `service_mix.stage1_completed` | product | The review is submitted. Once per session. |
+| `service_mix.results_viewed` | product | The results screen is shown. |
+| `service_mix.pricing_detail_requested` | product | The visitor asks why no profit figure is shown. |
+| `service_mix.bundle_recommendation_viewed` | product | A bundle section is opened. Reserved for SM-2; declared now so the name is stable before anything depends on it. |
+| `service_mix.growth_review_clicked` | product | The visitor moves to the free Growth Review. |
+| `service_mix.ai_analysis_clicked` | product | The visitor asks about the AI Opportunity Analysis. |
+
+**Drop-off by step is deliberately not duplicated here.**
+`assessment.step_viewed`, `assessment.step_completed` and
+`assessment.validation_failed` carry `reviewType` and are the shared
+mechanism. Separating the funnels is a `GROUP BY`, not a second catalog to
+keep in step.
+
+Service Mix `metadata` may carry exactly these and nothing else:
+`reviewType`, `stage`, `stepId`, `trigger`, `offeringSource` (starter or
+custom), `offeringCountBand`, `resultKind`. An offering's **name, id, price,
+cost, revenue, volume and duration are all refused** — see
+[ANALYTICS_PRIVACY.md](ANALYTICS_PRIVACY.md).
+
+This is **enforced, by key and by value**, not merely documented. Each of the
+seven is checked against its own enum or type: `stepId` must be slug-shaped
+and must not be a UUID, `trigger` must be one of the six trigger words, and so
+on. A name-based rule cannot catch `stepId: "owner@example.com"`, because the
+key names itself and the leak is in the value. Unapproved keys and unapproved
+values are removed in the browser and **refused** at the endpoint with
+`unapproved_service_mix_metadata`. Nothing is truncated into a shorter version
+of itself — a shortened value is a different value, not a safer one.
+
+A short separate list of **platform annotations** may accompany them on
+events the two funnels share: `provisional`, `quietForMs`, `resumedCount`,
+`reachedStage1`, `reachedStage2`, `clockSkewClamped`, `claimedOccurredAt`.
+Every one is written by shared code, never by a page, and every one is a
+boolean, a number, or a timestamp the platform generated. `provisional` is
+what marks an abandonment count as a floor rather than a total; dropping it on
+this funnel alone would have made the funnel dishonest.
+
+`service_mix.bundle_recommendation_viewed` is **declared and not emitted**.
+The Quick Review recommends no bundles, so no session may report one as
+viewed; the name is reserved for the Detailed Review, which will.
+
+---
 
 ### Inference and erasure
 

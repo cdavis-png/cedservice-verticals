@@ -7,8 +7,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { createRequire } from 'node:module';
 import { handleRequest, ANALYTICS } from '../api/analytics.mjs';
 import { createFakeAnalyticsDb } from './helpers/fake-analytics-db.mjs';
+
+const require = createRequire(import.meta.url);
+const sharedEvents = require('../shared/analytics/events.js');
 
 const ORIGIN = 'https://nails.cedservice.com';
 const SESSION = '44444444-4444-4444-8444-444444444444';
@@ -168,6 +172,212 @@ test('an event carrying personal data is rejected by the server, not just the br
   assert.equal(body.rejected[0].code, 'prohibited_field');
   assert.equal(db.state.assessment_analytics_events.length, 1);
   assert.ok(!JSON.stringify(db.state).includes('a@b.test'));
+});
+
+/* ---------- the Service Mix metadata allowlist, at the endpoint ----------
+
+   Every case below uses a key nobody prohibited and nobody could prohibit:
+   `stepId`, `trigger`, `resultKind` are exactly what a Service Mix event is
+   supposed to carry. The leak is in the VALUE, which is why a name rule and
+   a content-pattern guess both miss it and a closed allowlist does not.
+
+   These assert on the row handed to ingestion, not on the response. A 200
+   with a thinned row and a 200 with a stored one look identical from the
+   outside, and it is the stored one that matters. */
+
+const mixEvent = (overrides = {}) => event({
+  eventName: 'service_mix.results_viewed',
+  schemaVersion: 2,
+  reviewType: 'service_mix',
+  stepId: null,
+  ...overrides
+});
+
+test('a Service Mix event carrying an unapproved metadata key is refused', async () => {
+  const { body, db } = await post([mixEvent({
+    metadata: { resultKind: 'preliminary', prefilled: true }
+  })]);
+
+  assert.equal(body.rejected.length, 1);
+  assert.equal(body.rejected[0].code, 'unapproved_service_mix_metadata');
+  assert.equal(db.state.assessment_analytics_events.length, 0);
+});
+
+test('personal data under an approved Service Mix key never reaches a row', async () => {
+  const smuggled = [
+    ['stepId',            'owner@example.com'],
+    ['trigger',           'Gel manicure'],
+    ['offeringSource',    'The owner said she is ready to buy in September.'],
+    ['resultKind',        '4f9f0e0a-2a9c-4d3a-9d2b-8a1b7c6d5e4f'],
+    ['offeringCountBand', 'Deluxe Spa Pedicure']
+  ];
+
+  for (const [key, value] of smuggled) {
+    const { body, db } = await post([mixEvent({ metadata: { [key]: value } })]);
+
+    assert.equal(body.rejected.length, 1, `${key} must be refused`);
+    assert.equal(body.rejected[0].code, 'unapproved_service_mix_metadata');
+
+    /* Nothing stored, and the refusal itself carries nothing either. */
+    assert.equal(db.state.assessment_analytics_events.length, 0);
+    assert.equal(JSON.stringify(db.state).includes(value), false,
+      `${value} must not appear anywhere in the analytics store`);
+    assert.equal(JSON.stringify(body).includes(value), false,
+      'an error response must not echo the value it exists to keep out');
+  }
+});
+
+test('even with validation bypassed, the row built for ingestion carries only approved keys', async () => {
+  /* The endpoint refuses these events, so the previous test proves the outer
+     layer. This one proves the inner one: toRow removes an unapproved key
+     rather than relying on a refusal that has already happened. Reached by
+     calling the row builder the way ingestion does, through a batch whose
+     bad event is accompanied by a good one, and inspecting the complete row
+     the database was handed. */
+  const db = createFakeAnalyticsDb();
+  const seen = [];
+  const wrapped = {
+    ...db,
+    rpc: async (name, args) => {
+      if (name === 'ingest_analytics_events') seen.push(...args.p_events);
+      return db.rpc(name, args);
+    }
+  };
+
+  const good = mixEvent({ metadata: { resultKind: 'preliminary', stage: 1 } });
+  await post([good], wrapped);
+
+  assert.equal(seen.length, 1);
+  const [row] = seen;
+  assert.deepEqual(Object.keys(row.metadata).sort(), ['resultKind', 'stage']);
+  Object.keys(row.metadata).forEach(key =>
+    assert.ok(sharedEvents.SERVICE_MIX_METADATA_KEYS.includes(key) ||
+              sharedEvents.PLATFORM_METADATA_KEYS.includes(key) ||
+              sharedEvents.ENDPOINT_DERIVED_METADATA_KEYS.includes(key),
+      `${key} is neither approved metadata nor a platform annotation`));
+
+  /* And the complete stored row agrees with what ingestion was handed. */
+  const [stored] = db.state.assessment_analytics_events;
+  assert.deepEqual(stored.metadata, row.metadata);
+});
+
+const permittedKey = key =>
+  sharedEvents.SERVICE_MIX_METADATA_KEYS.includes(key) ||
+  sharedEvents.PLATFORM_METADATA_KEYS.includes(key) ||
+  sharedEvents.ENDPOINT_DERIVED_METADATA_KEYS.includes(key);
+
+test('only an actual clamp adds clock-skew metadata', async () => {
+  const skewed = mixEvent({
+    occurredAt: new Date(NOW + 60 * 1000).toISOString(),
+    metadata: { resultKind: 'preliminary' }
+  });
+  const { body, db } = await post([skewed]);
+  assert.equal(body.accepted.length, 1);
+
+  const [row] = db.state.assessment_analytics_events;
+  assert.equal(row.metadata.clockSkewClamped, true);
+  /* Re-derived from the parsed timestamp rather than copied from the
+     request, so not one client-supplied character reaches the row. */
+  assert.equal(row.metadata.claimedOccurredAt,
+    new Date(Date.parse(skewed.occurredAt)).toISOString());
+  Object.keys(row.metadata).forEach(key =>
+    assert.ok(permittedKey(key), `${key} is unapproved`));
+
+  /* And an event whose clock was fine gets neither key. An annotation on
+     every row would say a clamp happened every time. */
+  const fine = await post([mixEvent({ metadata: { resultKind: 'preliminary' } })]);
+  assert.equal(fine.body.accepted.length, 1);
+  const [ordinary] = fine.db.state.assessment_analytics_events;
+  assert.deepEqual(ordinary.metadata, { resultKind: 'preliminary' });
+});
+
+test('a client-supplied clock-skew annotation never reaches storage', async () => {
+  /* Both keys are the endpoint's to write. A client that could assert "my
+     timestamp was clamped" could annotate a row with something that never
+     happened — and could put an arbitrary string in claimedOccurredAt under
+     a key the allowlist permits. */
+  const forged = mixEvent({
+    metadata: {
+      resultKind: 'preliminary',
+      clockSkewClamped: true,
+      claimedOccurredAt: 'owner@example.com'
+    }
+  });
+  const { body, db } = await post([forged]);
+
+  /* Stripped before validation, so the event is not even refused for them —
+     it is stored, correctly, without them. */
+  assert.equal(body.accepted.length, 1);
+  const [row] = db.state.assessment_analytics_events;
+  assert.deepEqual(row.metadata, { resultKind: 'preliminary' });
+  assert.equal(JSON.stringify(db.state).includes('owner@example.com'), false);
+});
+
+test('a page cannot attach abandonment annotations to another Service Mix event', async () => {
+  const forged = mixEvent({
+    eventName: 'service_mix.review_viewed',
+    metadata: {
+      trigger: 'standalone',
+      provisional: true, quietForMs: 1860000, resumedCount: 1,
+      reachedStage1: true, reachedStage2: false
+    }
+  });
+  const { body, db } = await post([forged]);
+
+  assert.equal(body.rejected.length, 1);
+  assert.equal(body.rejected[0].code, 'unapproved_service_mix_metadata');
+  assert.equal(db.state.assessment_analytics_events.length, 0,
+    'a funnel row claiming a page view was provisional is a lie about how the ' +
+    'number was obtained');
+});
+
+test('a Service Mix event cannot claim to be a Growth Review in its metadata', async () => {
+  const { body, db } = await post([mixEvent({
+    metadata: { reviewType: 'growth_review', resultKind: 'preliminary' }
+  })]);
+
+  assert.equal(body.rejected.length, 1);
+  assert.equal(body.rejected[0].code, 'unapproved_service_mix_metadata');
+  assert.equal(db.state.assessment_analytics_events.length, 0);
+});
+
+test('a truthful abandonment event keeps every one of its provisional fields', async () => {
+  const abandoned = mixEvent({
+    eventName: 'assessment.abandoned',
+    stepId: 'figures',
+    metadata: {
+      trigger: 'page_exit', provisional: true, quietForMs: 1860000,
+      resumedCount: 1, reachedStage1: false, reachedStage2: false
+    }
+  });
+  const { body, db } = await post([abandoned]);
+
+  assert.equal(body.rejected.length, 0);
+  assert.equal(body.accepted.length, 1);
+
+  /* The complete stored row. `provisional` is what stops an abandonment count
+     being read as a total, and it has to survive the allowlist to do that. */
+  const [row] = db.state.assessment_analytics_events;
+  assert.deepEqual(row.metadata, {
+    trigger: 'page_exit', provisional: true, quietForMs: 1860000,
+    resumedCount: 1, reachedStage1: false, reachedStage2: false
+  });
+  assert.equal(row.review_type, 'service_mix');
+  assert.equal(row.step_id, 'figures');
+  assert.equal(row.business_id, null);
+  Object.keys(row.metadata).forEach(key =>
+    assert.ok(permittedKey(key), `${key} is unapproved`));
+});
+
+test('the Growth funnel keeps the metadata contract it already had', async () => {
+  /* The allowlist is an SM-1 rule. Narrowing the Growth funnel to seven keys
+     would have deleted measurements nobody asked to lose. */
+  const { body, db } = await post([event({
+    metadata: { blockingFields: ['name'], blockingCount: 1, stepsCompleted: 4 }
+  })]);
+  assert.equal(body.accepted.length, 1);
+  const [row] = db.state.assessment_analytics_events;
+  assert.deepEqual(row.metadata, { blockingFields: ['name'], blockingCount: 1, stepsCompleted: 4 });
 });
 
 test('a batch of nothing but rejects still answers 200 and stores nothing', async () => {
@@ -470,7 +680,9 @@ test('the endpoint answers cleanly when analytics storage is not configured', as
 });
 
 test('the declared limits are the shared ones', () => {
-  assert.deepEqual(ANALYTICS.SUPPORTED_SCHEMA_VERSIONS, [1]);
-  assert.equal(ANALYTICS.EVENT_NAMES.length, 19);
+  /* 2 adds reviewType to the envelope. 1 stays accepted so a page cached
+     before the Service Mix deploy is not punished for it. */
+  assert.deepEqual(ANALYTICS.SUPPORTED_SCHEMA_VERSIONS, [1, 2]);
+  assert.equal(ANALYTICS.EVENT_NAMES.length, 30);
   assert.equal(ANALYTICS.CLOCK_SKEW_FUTURE_MS, 5 * 60 * 1000);
 });

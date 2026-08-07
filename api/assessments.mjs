@@ -35,19 +35,28 @@
 
 import { createHash, createHmac, randomUUID } from 'node:crypto';
 import bie from '../shared/business-intelligence/generate-bir.js';
+import registry from '../shared/business-intelligence/review-registry.js';
+import offeringSchema from '../shared/service-mix-engine/offering.schema.js';
 import identity from '../shared/business-record/resolve-identity.js';
 import memoryFact from '../shared/business-record/memory-fact.schema.js';
 import limitsModule from '../shared/security/limits.js';
 import bodyReader from '../shared/security/read-body.js';
 import challenge from '../shared/security/verify-challenge.js';
+import continuation from '../shared/security/continuation.js';
 import rateLimit from '../shared/security/rate-limit.js';
 
-const { generateBir, validateGeneratedBir, stableStringify } = bie;
+const { stableStringify } = bie;
+const { REVIEW_TYPES, DEFAULT_REVIEW_TYPE, readReviewType, entryFor } = registry;
+const { validateServiceMix } = offeringSchema;
 const { extractIdentitySignals, persistableSignals } = identity;
 const { PROHIBITED_PREDICATE_PATTERN } = memoryFact;
 const { checkPayloadLimits } = limitsModule;
 const { readBoundedBody, parseJsonSafely, OUTCOME: BODY } = bodyReader;
 const { verifyChallenge, OUTCOME: CHALLENGE } = challenge;
+const {
+  issueContinuationContext, verifyContinuationContext, stripContinuationToken,
+  OUTCOME: CONTINUATION
+} = continuation;
 const { buildRateLimitKeys, rateLimitPolicy } = rateLimit;
 
 /* ---------- version compatibility ----------
@@ -56,10 +65,36 @@ const { buildRateLimitKeys, rateLimitPolicy } = rateLimit;
    sitting in a browser retry queue — built by a page loaded before the
    deploy — are still delivered instead of being rejected as "unsupported".
    Policy and window: docs/PRODUCTION_HARDENING.md. */
+/* The GROWTH current. SM-1 did not change the Growth payload, so this stayed
+   at 5 — the page still builds 5 and the two must agree on what "current"
+   means. Version 6 is a different review's shape, not a newer Growth one,
+   which is why it is declared per review type below rather than here. */
 const CURRENT_PAYLOAD_SCHEMA = 5;
-const SUPPORTED_PAYLOAD_SCHEMAS = Object.freeze([2, 3, 4, 5]);
+const SUPPORTED_PAYLOAD_SCHEMAS = Object.freeze([2, 3, 4, 5, 6]);
 /* Versions below this were never persisted by a released page. */
 const MIN_KNOWN_PAYLOAD_SCHEMA = 2;
+
+/* Which payload versions each review type may declare. 6 is the Quick
+   Service Mix Review's shape and carries no Growth results block at all; a
+   Growth payload claiming 6, or a Service Mix payload claiming 5, is a
+   confused client rather than a version to accommodate. */
+const PAYLOAD_SCHEMAS_BY_REVIEW = Object.freeze({
+  growth_review: Object.freeze([2, 3, 4, 5]),
+  service_mix: Object.freeze([6])
+});
+
+const CURRENT_PAYLOAD_SCHEMA_BY_REVIEW = Object.freeze({
+  growth_review: 5,
+  service_mix: 6
+});
+
+/* Sections each review type must carry. A Service Mix submission has no
+   Growth Score, no opportunity figure, and no package — asking it for a
+   `results` block would mean inventing one. */
+const REQUIRED_SECTIONS_BY_REVIEW = Object.freeze({
+  growth_review: Object.freeze(['vertical', 'contact', 'consent', 'answers', 'results', 'attribution']),
+  service_mix: Object.freeze(['vertical', 'contact', 'consent', 'serviceMix', 'attribution'])
+});
 
 const SUPPORTED_VERTICALS = new Set(['nails']);
 const DEFAULT_MAX_BYTES = 65536;
@@ -89,7 +124,9 @@ const DEFAULT_DB_TIMEOUT_MS = 6000;
    rate limiting instead. Documented trade-off — see PRODUCTION_HARDENING.md. */
 const CHALLENGE_MAX_SUBMISSION_AGE_MS = 15 * 60 * 1000;
 
-const REQUIRED_SECTIONS = ['vertical', 'contact', 'consent', 'answers', 'results', 'attribution'];
+/* Retained for the documentation generator and for anything still reading the
+   Growth contract by that name. REQUIRED_SECTIONS_BY_REVIEW is the authority. */
+const REQUIRED_SECTIONS = REQUIRED_SECTIONS_BY_REVIEW.growth_review;
 
 /* Advertised to clients on transient refusals so a retry is scheduled
    sensibly rather than immediately. */
@@ -158,7 +195,8 @@ const corsHeaders = (origin, env, correlationId) => {
   if (isAllowedOrigin(origin, env)) {
     headers['Access-Control-Allow-Origin'] = origin;
     headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS';
-    headers['Access-Control-Allow-Headers'] = 'Content-Type, Idempotency-Key, Accept, X-CED-Challenge';
+    headers['Access-Control-Allow-Headers'] =
+      'Content-Type, Idempotency-Key, Accept, X-CED-Challenge, X-CED-Continuation';
     headers['Access-Control-Max-Age'] = '86400';
   }
   return headers;
@@ -246,7 +284,7 @@ const validateTiming = (payload, now, env) => {
   };
 };
 
-const validateVersion = payload => {
+const validateVersion = (payload, reviewType) => {
   const version = payload.schemaVersion;
   if (!Number.isInteger(version)) {
     fail(400, 'unsupported_version', 'schemaVersion must be an integer.', {
@@ -263,7 +301,48 @@ const validateVersion = payload => {
         reason: version < MIN_KNOWN_PAYLOAD_SCHEMA ? 'retired' : 'unrecognised'
       });
   }
+  const permitted = PAYLOAD_SCHEMAS_BY_REVIEW[reviewType];
+  if (permitted && !permitted.includes(version)) {
+    fail(400, 'version_review_type_mismatch',
+      `Payload schemaVersion ${version} is not valid for a ${reviewType} submission.`,
+      { received: version, reviewType, supported: permitted });
+  }
   return version;
+};
+
+/* The Quick Service Mix Review's own block. Validated with the SAME module
+   the browser uses, because a browser and a server that disagree about what a
+   valid offering is will disagree in the direction that stores the invalid
+   one. Offering-count limits are enforced here and not only in the page. */
+const validateServiceMixPayload = payload => {
+  const result = validateServiceMix(payload.serviceMix);
+  if (!result.valid) {
+    fail(422, 'invalid_service_mix',
+      'The service mix could not be accepted.',
+      { violations: result.errors.slice(0, 10) });
+  }
+
+  /* Results still reach the visitor by email, so the disclaimer still travels
+     with them. A figure whose disclaimer was left behind is the one thing
+     CLAUDE.md section 4 refuses outright. */
+  const results = payload.results;
+  if (results !== undefined) {
+    if (!results || typeof results !== 'object' || Array.isArray(results)) {
+      fail(400, 'invalid_results', 'results must be an object when present.');
+    }
+    if (typeof results.disclaimer !== 'string' || results.disclaimer.trim().length < 10) {
+      fail(400, 'missing_disclaimer', 'results.disclaimer must carry the wording shown to the visitor.');
+    }
+  }
+
+  /* SM-1 collects no direct costs. A payload carrying one is a client from a
+     milestone that does not exist yet, or a tampered one; either way the
+     engine must not analyse a cost as though it were evidence. */
+  const offerings = payload.serviceMix.offerings || [];
+  if (offerings.some(o => o && o.directCost !== undefined)) {
+    fail(422, 'direct_cost_not_collected',
+      'Direct costs are not collected in the Quick Service Mix Review.');
+  }
 };
 
 const validatePayload = (payload, idempotencyKey, now, env) => {
@@ -271,7 +350,20 @@ const validatePayload = (payload, idempotencyKey, now, env) => {
     fail(400, 'invalid_body', 'Request body must be a JSON object.');
   }
 
-  const schemaVersion = validateVersion(payload);
+  /* Which review this is. A payload that declares nothing is a Growth
+     Review, which is what every payload written before review types existed
+     was. An unrecognised declaration is refused rather than defaulted: a
+     client naming a review type we do not have is confused about something,
+     and guessing on its behalf would file its submission under the wrong
+     engine. */
+  if (payload.reviewType !== undefined && payload.reviewType !== null &&
+      !REVIEW_TYPES.includes(payload.reviewType)) {
+    fail(400, 'unsupported_review_type', 'reviewType is not a supported review.',
+      { supported: REVIEW_TYPES });
+  }
+  const reviewType = readReviewType(payload);
+
+  const schemaVersion = validateVersion(payload, reviewType);
 
   if (typeof payload.assessmentVersion !== 'string' || !SEMVER_RE.test(payload.assessmentVersion)) {
     fail(400, 'invalid_assessment_version', 'assessmentVersion must be a semantic version string.');
@@ -286,7 +378,7 @@ const validatePayload = (payload, idempotencyKey, now, env) => {
     fail(409, 'idempotency_key_mismatch', 'Idempotency-Key must equal payload.submissionId.');
   }
 
-  REQUIRED_SECTIONS.forEach(section => {
+  (REQUIRED_SECTIONS_BY_REVIEW[reviewType] || REQUIRED_SECTIONS).forEach(section => {
     if (!payload[section] || typeof payload[section] !== 'object') {
       fail(400, 'missing_section', `Required payload section missing or invalid: ${section}`);
     }
@@ -315,38 +407,46 @@ const validatePayload = (payload, idempotencyKey, now, env) => {
     fail(400, 'invalid_contact_email', 'contact.email must be a valid email address.');
   }
 
-  const results = payload.results;
-  const score = results.score;
-  if (!Number.isInteger(score) || score < 0 || score > 100) {
-    fail(400, 'invalid_score', 'results.score must be an integer between 0 and 100.');
-  }
-  const opportunity = results.opportunity;
-  if (typeof opportunity !== 'number' || !Number.isFinite(opportunity) ||
-      opportunity < 0 || opportunity > MAX_OPPORTUNITY) {
-    fail(400, 'invalid_opportunity', 'results.opportunity must be a finite, non-negative number.');
-  }
-  if (!results.dimensions || typeof results.dimensions !== 'object') {
-    fail(400, 'invalid_dimensions', 'results.dimensions must be an object.');
-  }
-  for (const [key, value] of Object.entries(results.dimensions)) {
-    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 100) {
-      fail(400, 'invalid_dimension_value', `results.dimensions.${key} must be a number between 0 and 100.`);
+  /* Everything below this point is review-specific. The Growth checks are
+     byte-for-byte what they were; they are now reached through a branch
+     rather than unconditionally, because a Service Mix submission has no
+     Growth Score, no opportunity figure, and no package to check. */
+  if (reviewType !== DEFAULT_REVIEW_TYPE) {
+    validateServiceMixPayload(payload);
+  } else {
+    const results = payload.results;
+    const score = results.score;
+    if (!Number.isInteger(score) || score < 0 || score > 100) {
+      fail(400, 'invalid_score', 'results.score must be an integer between 0 and 100.');
     }
-  }
-  if (!Array.isArray(results.priorities) || results.priorities.length === 0 ||
-      results.priorities.some(p => typeof p !== 'string')) {
-    fail(400, 'invalid_priorities', 'results.priorities must be a non-empty array of strings.');
-  }
-  if (typeof results.disclaimer !== 'string' || results.disclaimer.trim().length < 10) {
-    fail(400, 'missing_disclaimer', 'results.disclaimer must carry the wording shown to the visitor.');
-  }
-  const pkg = results.recommendedPackage;
-  if (!pkg || typeof pkg.id !== 'string' || typeof pkg.label !== 'string') {
-    fail(400, 'invalid_package', 'results.recommendedPackage must include id and label.');
-  }
-  if (pkg.price !== null && pkg.price !== undefined &&
-      (typeof pkg.price !== 'number' || !Number.isFinite(pkg.price) || pkg.price < 0)) {
-    fail(400, 'invalid_package_price', 'results.recommendedPackage.price must be a non-negative number.');
+    const opportunity = results.opportunity;
+    if (typeof opportunity !== 'number' || !Number.isFinite(opportunity) ||
+        opportunity < 0 || opportunity > MAX_OPPORTUNITY) {
+      fail(400, 'invalid_opportunity', 'results.opportunity must be a finite, non-negative number.');
+    }
+    if (!results.dimensions || typeof results.dimensions !== 'object') {
+      fail(400, 'invalid_dimensions', 'results.dimensions must be an object.');
+    }
+    for (const [key, value] of Object.entries(results.dimensions)) {
+      if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 100) {
+        fail(400, 'invalid_dimension_value', `results.dimensions.${key} must be a number between 0 and 100.`);
+      }
+    }
+    if (!Array.isArray(results.priorities) || results.priorities.length === 0 ||
+        results.priorities.some(p => typeof p !== 'string')) {
+      fail(400, 'invalid_priorities', 'results.priorities must be a non-empty array of strings.');
+    }
+    if (typeof results.disclaimer !== 'string' || results.disclaimer.trim().length < 10) {
+      fail(400, 'missing_disclaimer', 'results.disclaimer must carry the wording shown to the visitor.');
+    }
+    const pkg = results.recommendedPackage;
+    if (!pkg || typeof pkg.id !== 'string' || typeof pkg.label !== 'string') {
+      fail(400, 'invalid_package', 'results.recommendedPackage must include id and label.');
+    }
+    if (pkg.price !== null && pkg.price !== undefined &&
+        (typeof pkg.price !== 'number' || !Number.isFinite(pkg.price) || pkg.price < 0)) {
+      fail(400, 'invalid_package_price', 'results.recommendedPackage.price must be a non-negative number.');
+    }
   }
 
   /* Schema 4 carries the intelligence dimensions and the branching record.
@@ -432,7 +532,7 @@ const validatePayload = (payload, idempotencyKey, now, env) => {
     fail(422, 'prohibited_data', 'Payload contains prohibited data categories.', { fields: prohibited });
   }
 
-  return { schemaVersion, timing };
+  return { schemaVersion, timing, reviewType };
 };
 
 /* ---------- honeypot ----------
@@ -594,7 +694,17 @@ export async function handleRequest(request, deps = {}) {
     const challengeToken = stripChallengeToken(payload) ||
       request.headers.get('x-ced-challenge');
 
-    const { schemaVersion, timing } = validatePayload(payload, idempotencyKey, now, env);
+    /* The continuation context is a bearer credential too.
+       It arrives as a HEADER, so it never enters the payload — and therefore
+       never enters the request hash, the stored submission, or the report.
+       The body is still stripped, because a client that puts it there anyway
+       must not have it stored; stripping also deletes any businessId a client
+       tried to supply, refused rather than ignored so nobody can believe it
+       was honoured. */
+    const bodyContinuation = stripContinuationToken(payload);
+    const continuationToken = request.headers.get('x-ced-continuation') || bodyContinuation;
+
+    const { schemaVersion, timing, reviewType } = validatePayload(payload, idempotencyKey, now, env);
 
     /* Honeypot. Refused before any database work, and answered generically:
        the response says nothing about why, so a bot learns nothing about the
@@ -699,22 +809,71 @@ export async function handleRequest(request, deps = {}) {
     const birId = newId();
     const generatedAt = new Date(now).toISOString();
 
-    const bir = generateBir({
-      submission: payload,
-      birId,
-      businessId: null,
-      identityStatus: 'resolution_pending',
-      generatedAt,
-      hashFn: sha256
-    });
+    /* ---------- connected reviews ----------
 
-    const birCheck = validateGeneratedBir(bir);
+       The ONLY path by which a second review attaches to an existing
+       Business Record without re-resolving identity, and it works because
+       the server signed the context itself. A client-supplied businessId was
+       already deleted by stripContinuationToken and is never consulted.
+
+       Every failure mode falls through to ordinary identity resolution.
+       Refusing the submission instead would punish a visitor whose token
+       aged out for something they cannot see or fix. */
+    const continuationSecret = env.CED_CONTINUATION_SECRET || null;
+    const continuationVerdict = continuationToken
+      ? verifyContinuationContext({
+          token: continuationToken,
+          secret: continuationSecret,
+          hmacFn: hmac,
+          nowMs: now,
+          expectedVerticalId: payload.vertical.id
+        })
+      : { status: CONTINUATION.absent, businessId: null };
+
+    if (continuationToken && continuationVerdict.status !== CONTINUATION.valid) {
+      /* Logged as a fact, never echoed to the caller: telling a client which
+         part of a signed token failed is telling it how to forge one. */
+      log('warn', 'continuation_rejected', {
+        submissionId: payload.submissionId,
+        reviewType,
+        reason: continuationVerdict.status
+      });
+    }
+
+    const continuationBusinessId = continuationVerdict.status === CONTINUATION.valid
+      ? continuationVerdict.businessId : null;
+
+    const reviewEntry = entryFor(reviewType);
+
+    let bir;
+    try {
+      bir = reviewEntry.generate({
+        submission: payload,
+        birId,
+        /* Still null here. The database injects the resolved id inside the
+           ingestion transaction, because that is the only place identity is
+           actually decided. */
+        businessId: null,
+        identityStatus: 'resolution_pending',
+        generatedAt,
+        hashFn: sha256
+      });
+    } catch (err) {
+      log('error', 'bir_generation_threw', {
+        submissionId: payload.submissionId, reviewType, name: err && err.name
+      });
+      return json(500, errorBody('bir_generation_failed', 'The review could not be processed.',
+        undefined, correlationId), headers);
+    }
+
+    const birCheck = reviewEntry.validate(bir);
     if (!birCheck.valid) {
       log('error', 'bir_generation_invalid', {
         submissionId: payload.submissionId,
+        reviewType,
         errorCodes: birCheck.errors.map(e => e.code)
       });
-      return json(500, errorBody('bir_generation_failed', 'The assessment could not be processed.',
+      return json(500, errorBody('bir_generation_failed', 'The review could not be processed.',
         undefined, correlationId), headers);
     }
 
@@ -725,11 +884,20 @@ export async function handleRequest(request, deps = {}) {
       correlationId,
       receivedAt: generatedAt,
       payloadSchemaVersion: schemaVersion,
+      reviewType,
       originalSubmittedAt: timing.submittedAt,
       timelineOccurredAt: timing.timelineOccurredAt,
       clockSkewDetected: timing.clockSkewDetected,
       clockSkewMs: timing.clockSkewMs,
-      timelineTimestampClamped: timing.clamped
+      timelineTimestampClamped: timing.clamped,
+      /* The outcome, never the token. Recorded so a link that did not happen
+         is explainable years later without holding the credential.
+
+         `continuationOffered` is what this endpoint proposed. Whether it was
+         APPLIED is the database's decision — rule B0 may set a valid context
+         aside — and is recorded by the ingestion function itself. */
+      continuationStatus: continuationVerdict.status,
+      continuationOffered: Boolean(continuationBusinessId)
     };
 
     if (timing.clockSkewDetected) {
@@ -741,7 +909,12 @@ export async function handleRequest(request, deps = {}) {
     const dbTimeout = Number(env.CED_DB_TIMEOUT_MS) > 0
       ? Number(env.CED_DB_TIMEOUT_MS) : DEFAULT_DB_TIMEOUT_MS;
 
-    const ingestion = await runWithTimeout(signal => callRpc(db, 'ingest_assessment', {
+    /* Growth keeps calling ingest_assessment with its original signature, so
+       a queued submission built before this deploy, the existing tests, and
+       any external caller are untouched. Migration 0006 makes that function a
+       thin wrapper over ingest_review, so both paths run one body. */
+    const rpcName = reviewType === DEFAULT_REVIEW_TYPE ? 'ingest_assessment' : 'ingest_review';
+    const rpcArgs = {
       p_idempotency_key: idempotencyKey,
       p_request_hash: requestHash,
       p_payload: payload,
@@ -751,7 +924,16 @@ export async function handleRequest(request, deps = {}) {
       p_retention_days: Number(env.CED_IDEMPOTENCY_RETENTION_DAYS) > 0
         ? Number(env.CED_IDEMPOTENCY_RETENTION_DAYS) : 30,
       p_meta: meta
-    }, signal), dbTimeout, 'ingest');
+    };
+    if (rpcName === 'ingest_review') {
+      rpcArgs.p_review_type = reviewType;
+      /* Server-decided, or null. This is the whole of the continuation
+         mechanism as the database sees it: an id we signed ourselves. */
+      rpcArgs.p_continuation_business_id = continuationBusinessId;
+    }
+
+    const ingestion = await runWithTimeout(signal =>
+      callRpc(db, rpcName, rpcArgs, signal), dbTimeout, 'ingest');
 
     if (ingestion && ingestion.__timedOut) {
       /* The transaction may still commit after we stop waiting. That is safe:
@@ -786,15 +968,100 @@ export async function handleRequest(request, deps = {}) {
       businessId: data.businessId,
       birId: data.birId,
       identityStatus: data.identityStatus,
+      reviewType,
       replayed: data.replayed === true,
       verticalId: payload.vertical.id,
       payloadSchemaVersion: schemaVersion,
       clockSkewDetected: timing.clockSkewDetected,
+      /* What the endpoint OFFERED, and what the database DID with it.
+
+         `continuationApplied` is read from the LINK METHOD the database
+         returned, which is the only place the answer exists. It used to be
+         derived here as "offered, and that one proposal was not
+         contradicted", and that is a different question: under rule B0b an
+         uncontradicted context is still set aside when the session
+         contradicts, and when two surviving proposals name different
+         records. Both cases logged `true` while the stored submission said
+         `continuationApplied: false` — the log claimed to report the
+         database's decision and reported the endpoint's assumption instead.
+
+         Anything that needs to know whether the context was used reads this
+         one fact: `linkMethod === 'continuation_context'`. */
+      continuationOffered: Boolean(continuationBusinessId),
+      continuationApplied: data.linkMethod === 'continuation_context',
+      linkMethod: data.linkMethod ?? null,
       timelineEvents: Array.isArray(data.timelineEventIds) ? data.timelineEventIds.length : 0,
       durationMs: Date.now() - started
     });
 
-    return json(data.replayed === true ? 200 : 201, { ...data, correlationId }, headers);
+    /* A saved proposal — a signed context, or the assessment session — that
+       named a record the submitted identity contradicts. Logged as a fact,
+       never echoed to the caller, and never with a value or a business id. A
+       client that learns WHICH evidence differed learns what the record
+       holds, which is precisely what a borrowed pointer must not reveal. */
+    if (data.continuationContradicted === true || data.sessionContradicted === true ||
+        data.proposalsDisagreed === true) {
+      log('warn', 'identity_proposal_set_aside', {
+        submissionId: data.submissionId,
+        reviewType,
+        identityStatus: data.identityStatus,
+        continuationContradicted: data.continuationContradicted === true,
+        sessionContradicted: data.sessionContradicted === true,
+        proposalsDisagreed: data.proposalsDisagreed === true,
+        verticalId: payload.vertical.id
+      });
+    }
+
+    /* A fresh context for whatever the visitor does next. Minted only when
+       identity is actually resolved — a token pointing at null would be a
+       capability to link nothing — and only from an id the database returned,
+       never from anything the client sent. */
+    const nextContext = data.businessId
+      ? issueContinuationContext({
+          businessId: data.businessId,
+          verticalId: payload.vertical.id,
+          reviewType,
+          issuedAtMs: now,
+          secret: continuationSecret,
+          hmacFn: hmac
+        })
+      : null;
+
+    /* ---------- what the browser is told ----------
+
+       GROWTH keeps its existing contract, businessId included. The engine
+       stores it beside the saved state so a later reassessment from this
+       browser is recognised, and analytics joins a funnel row to a record
+       with it. That is a published contract with a shipped page and is not
+       changed here.
+
+       SERVICE MIX gets an ALLOWLIST, and businessId is not on it. A permanent
+       Business Record identifier in a browser is a permanent identifier in
+       every analytics event that browser then emits, and the whole point of
+       the continuation context is that the client never needs one: it holds
+       an opaque, expiring, signed string instead. Nothing else the client
+       does requires knowing which record it attached to. */
+    const body = reviewType === DEFAULT_REVIEW_TYPE
+      ? { ...data, reviewType, correlationId }
+      : {
+          ok: data.ok === true,
+          replayed: data.replayed === true,
+          /* The client's own idempotency key, echoed back. */
+          submissionId: data.submissionId,
+          assessmentSessionId: data.assessmentSessionId,
+          reviewType,
+          /* Whether identity is settled or a person must look. The client
+             shows different words; it never learns WHICH record. */
+          identityResolved: data.identityStatus === 'linked' ||
+                            data.identityStatus === 'manually_verified',
+          nextAction: data.nextAction,
+          receivedAt: data.receivedAt,
+          correlationId
+        };
+
+    if (nextContext) body.continuationToken = nextContext;
+
+    return json(data.replayed === true ? 200 : 201, body, headers);
 
   } catch (err) {
     const headers = corsHeaders(origin, env, correlationId);
@@ -827,7 +1094,11 @@ export const config = { runtime: 'nodejs' };
 export const VERSIONS = {
   CURRENT_PAYLOAD_SCHEMA,
   SUPPORTED_PAYLOAD_SCHEMAS,
-  MIN_KNOWN_PAYLOAD_SCHEMA
+  MIN_KNOWN_PAYLOAD_SCHEMA,
+  PAYLOAD_SCHEMAS_BY_REVIEW,
+  CURRENT_PAYLOAD_SCHEMA_BY_REVIEW,
+  REQUIRED_SECTIONS_BY_REVIEW,
+  REVIEW_TYPES
 };
 export const TIMEOUTS = {
   DEFAULT_CHALLENGE_TIMEOUT_MS,

@@ -33,7 +33,11 @@ export function createFakeAnalyticsDb(options = {}) {
     if (row.assessment_stage !== null && ![1, 2].includes(row.assessment_stage)) {
       throw new ConstraintViolation('analytics_events_stage_check');
     }
-    if (row.schema_version < 1 || row.schema_version > 1) {
+    /* 1 as shipped in 0005, widened to 2 by 0006 when the envelope gained
+       reviewType. A fake still pinned at 1 would have refused every
+       post-SM-1 batch — which is exactly the defect real-Postgres validation
+       found in the migration itself. */
+    if (row.schema_version < 1 || row.schema_version > 2) {
       throw new ConstraintViolation('analytics_events_schema_version_check');
     }
     if (Date.parse(row.received_at) < Date.parse(row.occurred_at)) {
@@ -143,6 +147,13 @@ export function createFakeAnalyticsDb(options = {}) {
         assessment_version: event.assessmentVersion ?? null,
         question_set_version: event.questionSetVersion ?? null,
         assessment_stage: event.assessmentStage ?? null,
+        /* 0006 added review_type, resolved from the event NAME first so a
+           service_mix.* event can never be filed under the Growth funnel by a
+           misconfigured page. Mirrored here so a test can inspect the complete
+           stored row rather than most of it. */
+        review_type: event.eventName && event.eventName.startsWith('service_mix.')
+          ? 'service_mix'
+          : (event.reviewType === 'service_mix' ? 'service_mix' : 'growth_review'),
         step_id: event.stepId ?? null,
         question_id: event.questionId ?? null,
         occurred_at: occurred,

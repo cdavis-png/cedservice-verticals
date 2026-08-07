@@ -52,7 +52,20 @@ test('every event named by the milestone exists in the catalog', () => {
     'assessment.full_results_viewed', 'assessment.abandoned',
     'assessment.personal_review_clicked', 'assessment.recommended_system_clicked',
     'assessment.improve_recommendation_clicked', 'assessment.checkout_intent',
-    'assessment.report_requested', 'assessment.clear_saved_data'
+    'assessment.report_requested', 'assessment.clear_saved_data',
+
+    /* SM-1. New names, never repurposed ones: the raw event table is
+       append-only, so renaming an existing event orphans its history rather
+       than migrating it. Movement through the questions is deliberately NOT
+       duplicated — assessment.step_viewed and friends carry reviewType. */
+    'service_mix.review_viewed', 'service_mix.review_started',
+    'service_mix.offering_added', 'service_mix.offering_removed',
+    'service_mix.stage1_completed', 'service_mix.results_viewed',
+    'service_mix.pricing_detail_requested',
+    'service_mix.bundle_recommendation_viewed',
+    'service_mix.growth_review_clicked', 'service_mix.ai_analysis_clicked',
+    /* The visitor said the review they are continuing from is not theirs. */
+    'service_mix.continuation_rejected'
   ];
   required.forEach(name => assert.ok(events.EVENTS[name], `missing ${name}`));
   assert.equal(events.EVENT_NAMES.length, required.length,
@@ -85,7 +98,10 @@ test('once-per-session events are the ones a funnel would double-count', () => {
     'assessment.stage1_completed',
     'assessment.stage2_completed',
     'assessment.stage2_started',
-    'assessment.started'
+    'assessment.started',
+    'service_mix.review_viewed',
+    'service_mix.review_started',
+    'service_mix.stage1_completed'
   ].sort());
 });
 

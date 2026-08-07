@@ -51,23 +51,48 @@ const need = (name, why) => {
   return env[name];
 };
 
+/* ---------- local mode ----------
+
+   A disposable PostgreSQL created inside this process, with no host, no port,
+   no socket, and no credential. See tests/helpers/local-pg.mjs.
+
+   It is a SEPARATE mode, not a relaxation: when it is on, the hosted path is
+   not taken at all, and every guard below still applies to the hosted path
+   when it is off. A shell that sets both is refused, because a run that could
+   go either way is a run nobody can reason about afterwards.
+
+   What local mode does NOT prove is PostgREST: it speaks SQL directly. The
+   hosted guards exist to protect a real project and are untouched. */
+const LOCAL = env.CED_LOCAL_PG === 'true';
+
+if (LOCAL && (env.SUPABASE_URL || env.SUPABASE_SERVICE_ROLE_KEY)) {
+  failures.push(
+    'CED_LOCAL_PG is "true" but hosted credentials are also present — refusing to run ' +
+    'a suite that could reach either. Unset SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.');
+}
+
 /* 1. Explicit, unambiguous opt-in. Not a truthy string; the exact word. */
 if (env.CED_ALLOW_INTEGRATION_TESTS !== 'true') {
   failures.push('CED_ALLOW_INTEGRATION_TESTS must be exactly "true" to run against a real database');
 }
 
-/* 2. Never in production, by any signal. */
+/* 2. Never in production, by any signal. Applies to both modes. */
 if (String(env.NODE_ENV || '').toLowerCase() === 'production') {
   failures.push('NODE_ENV is "production" — this suite never runs against production');
 }
 
-const url = need('SUPABASE_URL', 'the target database URL is required');
-const key = need('SUPABASE_SERVICE_ROLE_KEY', 'server-only credentials are required');
+/* Guards 3 to 5 protect a HOSTED project. In local mode there is no project,
+   no URL and no credential, so they have nothing to protect and are not run —
+   which is why local mode refuses to start when credentials are present. */
+const url = LOCAL ? null : need('SUPABASE_URL', 'the target database URL is required');
+const key = LOCAL ? null : need('SUPABASE_SERVICE_ROLE_KEY', 'server-only credentials are required');
 
 /* 3. The caller must name the project ref they intend, and it must match the
       URL. This is the guard that stops a stale SUPABASE_URL in a shell from
       quietly pointing the suite somewhere unintended. */
-const declaredRef = need('CED_TEST_PROJECT_REF', 'name the development project you intend to write to');
+const declaredRef = LOCAL
+  ? null
+  : need('CED_TEST_PROJECT_REF', 'name the development project you intend to write to');
 
 let host = '';
 let urlRef = '';
@@ -99,7 +124,8 @@ for (const bad of [...DENY_SUBSTRINGS, ...configuredDeny]) {
 
 /* 5. The suite must be able to name a development project positively, not just
       fail to match production. */
-if (declaredRef && !/dev|test|staging|scratch|sandbox/i.test(`${declaredRef} ${env.CED_TEST_PROJECT_LABEL || ''}`)) {
+if (!LOCAL && declaredRef &&
+    !/dev|test|staging|scratch|sandbox/i.test(`${declaredRef} ${env.CED_TEST_PROJECT_LABEL || ''}`)) {
   failures.push(
     'Neither CED_TEST_PROJECT_REF nor CED_TEST_PROJECT_LABEL identifies this as a development project. ' +
     'Set CED_TEST_PROJECT_LABEL (e.g. "ced-cip-dev") to confirm the target intentionally.');
@@ -118,9 +144,22 @@ if (BLOCKED) {
 /* ---------- client ---------- */
 
 let db = null;
-if (!BLOCKED) {
+let localEnv = null;
+if (!BLOCKED && LOCAL) {
+  const { startLocalPg, disposableDataDir } = await import('../helpers/local-pg.mjs');
+  localEnv = await startLocalPg({ dataDir: disposableDataDir('suite') });
+  db = localEnv.db;
+  console.log(`\n    Local PostgreSQL: ${localEnv.version.split(' on ')[0]}`);
+  console.log(`    Migrations applied: ${localEnv.applied.map(a => a.file.slice(0, 4)).join(' → ')}\n`);
+} else if (!BLOCKED) {
   const { createClient } = await import('@supabase/supabase-js');
   db = createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
+}
+
+/* Local mode holds the whole database in this process. Node keeps the worker
+   alive while it exists, so it is closed when the file's tests are done. */
+if (localEnv) {
+  test.after(async () => { await localEnv.close(); });
 }
 
 const it = (name, fn) => test(name, { skip: BLOCKED ? 'guards not satisfied' : false }, fn);
@@ -1278,8 +1317,13 @@ it('M5 — staged events satisfy the timeline constraint under maximum tolerated
                             submittedAt: future, supersedesSubmissionId: id() });
   p.assessmentStage.stage2StartedAt = started;
 
+  /* FOUND BY THE FIRST RUN OF THIS SUITE, 2026-08-05. This test and section
+     E's clock-skew test both used `it-<RUN>-skew` with DIFFERENT request
+     hashes, so whichever ran second was correctly refused with
+     idempotency_key_conflict. The key is the bug, not the behaviour: two
+     different bodies under one key is exactly what that error is for. */
   const { data, error } = await stagedIngest({
-    key: `it-${RUN}-skew`, hash: `h-${RUN}-skew`, payload: p,
+    key: `it-${RUN}-stage2-skew`, hash: `h-${RUN}-stage2-skew`, payload: p,
     meta: { clockSkewDetected: true }
   });
   assert.equal(error, null, error && error.message);
@@ -1754,16 +1798,27 @@ it('N9 — raw events are append-only', async () => {
 it('N10 — aggregation is idempotent and separates sessions from clicks', async () => {
   const sessionId = id();
   const t = ms => new Date(Date.now() - ms).toISOString();
+
+  /* FOUND BY THE FIRST RUN OF THIS SUITE, 2026-08-05. Every other test in
+     section N emits under the shared campaign source `qr-<RUN>`, so they all
+     aggregate onto ONE row — and "one session is one page view" was then
+     counting the whole section rather than this test. The assertion is right;
+     it needed a group of its own to be about. */
+  const source = `qr-${RUN}-n10`;
+  const touch = {
+    firstTouch: { path: '/', referrerHost: 'qr.example', utm: { utm_source: source } },
+    latestTouch: { path: '/', utm: {} }
+  };
+
   await ingestAnalytics([
-    analyticsEvent({ assessmentSessionId: sessionId, occurredAt: t(300000) }),
+    analyticsEvent({ assessmentSessionId: sessionId, occurredAt: t(300000), attribution: touch }),
     analyticsEvent({ assessmentSessionId: sessionId, eventName: 'assessment.recommended_system_clicked',
-                     assessmentStage: 1, occurredAt: t(200000) }),
+                     assessmentStage: 1, occurredAt: t(200000), attribution: touch }),
     analyticsEvent({ assessmentSessionId: sessionId, eventName: 'assessment.recommended_system_clicked',
-                     assessmentStage: 1, occurredAt: t(100000) })
+                     assessmentStage: 1, occurredAt: t(100000), attribution: touch })
   ]);
 
   await rpc('refresh_assessment_funnel_daily', {});
-  const source = `qr-${RUN}`;
   const first = await rows('assessment_funnel_daily', 'source', source);
   await rpc('refresh_assessment_funnel_daily', {});
   const second = await rows('assessment_funnel_daily', 'source', source);
@@ -1814,6 +1869,2369 @@ it('N12 — the drop-off function answers with counters and no recommendation', 
     assert.ok(!('abandonment_rate' in row));
     assert.ok(!('recommendation' in row));
   }
+});
+
+/* ============================================================
+   O. Migration 0006 — review types and the Service Mix review
+   ------------------------------------------------------------
+   EXECUTION STATUS, stated here because this comment is what a
+   reader of these tests will believe:
+
+     · EXECUTED against a disposable local PostgreSQL 18.3
+       through PGlite 0.5.4, by `CED_LOCAL_PG=true`. Every test
+       in this section passes there.
+     · NOT executed against PostgreSQL 17. The hosted
+       development project is 17.6.1.155, and a behaviour that
+       differs between the two majors would not be caught here.
+     · NOT executed against hosted Supabase.
+     · NOT executed through PostgREST, so signature resolution
+       by argument name over HTTP remains unproven.
+
+   An earlier revision of this comment said the SQL had never
+   run against any Postgres. That stopped being true when the
+   local harness was added, and a stale claim in a test file is
+   worse than none: it is read as current.
+
+   The compensating control for the ingest_assessment ->
+   ingest_review transcription is exactly this section. It must
+   pass before 0006 is applied anywhere.
+   ============================================================ */
+
+/* A Service Mix report, structurally faithful to what the engine produces —
+   only the fields ingest_review and the 0006 triggers actually read. */
+const serviceMixBir = (health = 'generally_healthy') => ({
+  schemaVersion: 5,
+  reportType: 'service_mix',
+  reportVersion: 1,
+  identity: { businessId: null, identityStatus: 'resolution_pending', birId: null,
+              legacyBusinessKey: null, reviewType: 'service_mix' },
+  provenance: { generatedBy: 'service-mix-engine-v1.0.0', supersedes: null, isCurrent: true },
+  businessProfile: { displayName: 'Polished Nail Studio' },
+  dataConfidence: { confidence: 0.93, completeness: 1 },
+  serviceMixHealth: { classification: health, classifierVersion: 'service-mix-health-v1' },
+  portfolioCoverage: { declared: 'all_offerings', offeringsEntered: 3, offeringsAnalysed: 3 },
+  measurementGaps: [],
+  relatedGrowthReview: null
+});
+
+const serviceMixPayload = ({ submissionId, sessionId, offerings = 3,
+                             coverage = 'all_offerings',
+                             submittedAt = new Date().toISOString() }) => ({
+  schemaVersion: 6,
+  reviewType: 'service_mix',
+  assessmentVersion: '1.0.0',
+  submissionId,
+  assessmentSessionId: sessionId,
+  vertical: { id: 'nails', name: 'Nail Salons' },
+  submittedAt,
+  contact: { salonName: 'Polished Nail Studio', ownerName: 'Test Owner', email: email('mix') },
+  consent: { resultsDeliveryConsent: { granted: true, statement: 'Send me my Service Mix results...' } },
+  attribution: { firstTouch: { url: 'https://nails.cedservice.com/service-mix' } },
+  serviceMix: {
+    coverage,
+    offerings: Array.from({ length: offerings }, (_, i) => ({
+      offeringId: id(), offeringSnapshotId: id(), replacesOfferingId: null,
+      name: `Offering ${i}`, category: 'core_service', source: 'starter',
+      sellingPrice: { kind: 'exact', value: 60 + i, low: null, high: null },
+      durationMinutes: { kind: 'exact', value: 60, low: null, high: null },
+      monthlyVolume: { kind: 'exact', value: 40, low: null, high: null },
+      demand: 'steady', role: 'primary_revenue'
+    }))
+  },
+  results: { disclaimer: 'This is a diagnostic analysis based on the information provided...' }
+});
+
+const ingestMix = async ({ submissionId, sessionId, birId, continuationBusinessId = null,
+                           payloadOverrides = {} }) => {
+  created.submissionIds.push(submissionId);
+  created.idempotencyKeys.push(submissionId);
+  return rpc('ingest_review', {
+    p_idempotency_key: submissionId,
+    p_request_hash: createHash('sha256').update(submissionId).digest('hex'),
+    p_payload: { ...serviceMixPayload({ submissionId, sessionId }), ...payloadOverrides },
+    p_signals: [],
+    p_bir: serviceMixBir(),
+    p_bir_id: birId,
+    p_retention_days: 30,
+    p_meta: { correlationId: `mix-${RUN}`, reviewType: 'service_mix' },
+    p_review_type: 'service_mix',
+    p_continuation_business_id: continuationBusinessId
+  });
+};
+
+it('O1 — ingest_review resolves under its 10-argument signature', async () => {
+  const { data, error } = await rpc('ingest_review', {
+    p_idempotency_key: '', p_request_hash: 'x', p_payload: {}, p_signals: [],
+    p_bir: {}, p_bir_id: id(), p_retention_days: 30, p_meta: {},
+    p_review_type: 'service_mix', p_continuation_business_id: null
+  });
+  assert.equal(data, null);
+  assert.ok(error, 'an empty idempotency key must raise');
+  assert.match(error.message, /missing_idempotency_key/);
+});
+
+it('O2 — ingest_assessment is still resolvable and still means growth_review', async () => {
+  const submissionId = id();
+  const sessionId = id();
+  created.submissionIds.push(submissionId);
+  created.idempotencyKeys.push(submissionId);
+
+  const { data, error } = await rpc('ingest_assessment', {
+    p_idempotency_key: submissionId,
+    p_request_hash: createHash('sha256').update(submissionId).digest('hex'),
+    p_payload: payload({ submissionId, sessionId }),
+    p_signals: [], p_bir: bir(), p_bir_id: id(), p_retention_days: 30,
+    p_meta: { correlationId: `wrap-${RUN}` }
+  });
+  assert.equal(error, null);
+  assert.equal(data.reviewType, 'growth_review',
+    'the wrapper must not change what an existing caller gets');
+
+  const [row] = await rows('assessment_submissions', 'submission_id', submissionId);
+  assert.equal(row.review_type, 'growth_review');
+});
+
+it('O3 — an invented review type is refused by the function', async () => {
+  const submissionId = id();
+  const { error } = await rpc('ingest_review', {
+    p_idempotency_key: submissionId, p_request_hash: 'x',
+    p_payload: serviceMixPayload({ submissionId, sessionId: id() }),
+    p_signals: [], p_bir: serviceMixBir(), p_bir_id: id(), p_retention_days: 30,
+    p_meta: {}, p_review_type: 'vibes_review', p_continuation_business_id: null
+  });
+  assert.ok(error);
+  assert.match(error.message, /unsupported_review_type/);
+});
+
+it('O4 — a Service Mix submission stores a v5 report and its own timeline events', async () => {
+  const submissionId = id();
+  const birId = id();
+  const { data, error } = await ingestMix({ submissionId, sessionId: id(), birId });
+  assert.equal(error, null);
+  assert.equal(data.reviewType, 'service_mix');
+  created.businessIds.push(data.businessId);
+
+  const [report] = await rows('business_intelligence_reports', 'bir_id', birId);
+  assert.equal(report.schema_version, 5);
+  assert.equal(report.review_type, 'service_mix');
+  assert.equal(report.confidence_band, 'high', 'a 0.93 confidence bands as high');
+
+  const events = await rows('timeline_events', 'correlation_id', submissionId);
+  const names = events.map(e => e.event_name);
+  assert.ok(names.includes('service_mix.completed'));
+  assert.ok(names.includes('service_mix_bir.generated'));
+  /* The generic events are ADDITIONAL facts, never replaced. */
+  assert.ok(names.includes('assessment.completed'));
+  assert.ok(names.includes('bir.generated'));
+
+  const completed = events.find(e => e.event_name === 'service_mix.completed');
+  assert.equal(completed.payload.offeringCount, 3);
+  assert.equal(completed.payload.coverage, 'all_offerings');
+  /* No offering name, no price, no revenue reaches an append-only table. */
+  const text = JSON.stringify(completed.payload);
+  assert.equal(/Offering \d/.test(text), false);
+  assert.equal(/sellingPrice|monthlyRevenue/.test(text), false);
+});
+
+it('O5 — a v5 report may not claim to be a Growth Review, and vice versa', async () => {
+  const submissionId = id();
+  created.submissionIds.push(submissionId);
+  created.idempotencyKeys.push(submissionId);
+
+  const { error } = await rpc('ingest_review', {
+    p_idempotency_key: submissionId,
+    p_request_hash: createHash('sha256').update(submissionId).digest('hex'),
+    p_payload: payload({ submissionId, sessionId: id() }),
+    p_signals: [], p_bir: serviceMixBir(), p_bir_id: id(), p_retention_days: 30,
+    p_meta: {}, p_review_type: 'growth_review', p_continuation_business_id: null
+  });
+  assert.ok(error, 'bir_service_mix_version_check must refuse a v5 growth report');
+  assert.match(error.message, /bir_service_mix_version_check|violates check constraint/);
+});
+
+it('O6 — Growth and Service Mix stay independently current for one business', async () => {
+  /* Connected by the SERVER-ISSUED continuation businessId, not by a shared
+     session: reusing one session under a second review type is refused
+     outright, because it would attribute a Service Mix submission to a
+     Growth session's funnel and to its first-touch attribution. */
+  const growthSubmission = id();
+  const growthBir = id();
+  created.submissionIds.push(growthSubmission);
+  created.idempotencyKeys.push(growthSubmission);
+
+  const growth = await rpc('ingest_assessment', {
+    p_idempotency_key: growthSubmission,
+    p_request_hash: createHash('sha256').update(growthSubmission).digest('hex'),
+    p_payload: payload({ submissionId: growthSubmission, sessionId: id() }),
+    p_signals: [], p_bir: bir(), p_bir_id: growthBir, p_retention_days: 30, p_meta: {}
+  });
+  assert.equal(growth.error, null);
+  const businessId = growth.data.businessId;
+  created.businessIds.push(businessId);
+
+  const mixSubmission = id();
+  const mixBir = id();
+  const mix = await ingestMix({
+    submissionId: mixSubmission, sessionId: id(), birId: mixBir,
+    continuationBusinessId: businessId
+  });
+  assert.equal(mix.error, null);
+  assert.equal(mix.data.businessId, businessId, 'one business, two reviews');
+  assert.equal(mix.data.linkMethod, 'continuation_context');
+
+  const states = await rows('business_review_states', 'business_id', businessId);
+  assert.equal(states.length, 2);
+  const growthState = states.find(s => s.review_type === 'growth_review');
+  const mixState = states.find(s => s.review_type === 'service_mix');
+  assert.equal(growthState.current_bir_id, growthBir);
+  assert.equal(mixState.current_bir_id, mixBir);
+
+  /* The approved fields, present and meaningful. */
+  assert.equal(mixState.original_submission_id, mixSubmission);
+  assert.equal(mixState.latest_submission_id, mixSubmission);
+  assert.equal(mixState.next_reassessment_kind, 'quick_recheck');
+  assert.ok(mixState.next_reassessment_due_at);
+
+  const [record] = await rows('business_records', 'business_id', businessId);
+  assert.equal(record.current_bir_id, growthBir,
+    'the legacy pointer keeps meaning "the current GROWTH report"');
+
+  /* And the stored Service Mix report names the Growth report it continues
+     from — a reference, never a copy. */
+  const [mixReport] = await rows('business_intelligence_reports', 'bir_id', mixBir);
+  const related = mixReport.report.relatedGrowthReview;
+  assert.ok(related, 'a connected review must name the Growth report');
+  assert.equal(related.birId, growthBir);
+  assert.equal(related.freshness, 'fresh');
+  assert.equal(related.usedInCalculations, false);
+  /* Exactly the five approved fields. */
+  assert.deepEqual(Object.keys(related).sort(),
+    ['birId', 'freshness', 'generatedAt', 'prefilledFields', 'usedInCalculations']);
+  assert.equal(/growthScore|closeReadiness|financialOpportunity/.test(JSON.stringify(mixReport.report)),
+    false, 'no Growth analysis crosses over');
+});
+
+it('O6b — real Postgres filters prefilledFields against the approved enum', async () => {
+  /* prefilledFields names FIELDS, never values. The endpoint refuses an
+     unapproved entry, and ingest_review — which a future server-to-server
+     caller can reach without passing through the endpoint — filters again.
+     Called directly here, exactly as such a caller would. */
+  const growthSubmission = id();
+  const growthBir = id();
+  created.submissionIds.push(growthSubmission);
+  created.idempotencyKeys.push(growthSubmission);
+
+  const growth = await rpc('ingest_assessment', {
+    p_idempotency_key: growthSubmission,
+    p_request_hash: createHash('sha256').update(growthSubmission).digest('hex'),
+    p_payload: payload({ submissionId: growthSubmission, sessionId: id() }),
+    p_signals: [], p_bir: bir(), p_bir_id: growthBir, p_retention_days: 30, p_meta: {}
+  });
+  assert.equal(growth.error, null);
+  created.businessIds.push(growth.data.businessId);
+
+  const mixSubmission = id();
+  const mixBir = id();
+  const base = serviceMixPayload({ submissionId: mixSubmission, sessionId: id() });
+  const mix = await ingestMix({
+    submissionId: mixSubmission, sessionId: id(), birId: mixBir,
+    continuationBusinessId: growth.data.businessId,
+    payloadOverrides: {
+      serviceMix: {
+        ...base.serviceMix,
+        prefilledFields: [
+          'owner@example.com', 'Gel manicure', 'email', 'email',
+          'She will buy in September.', 'salonName'
+        ]
+      }
+    }
+  });
+  assert.equal(mix.error, null, 'the review still completes; the list is filtered, not fatal');
+
+  const [mixReport] = await rows('business_intelligence_reports', 'bir_id', mixBir);
+  const related = mixReport.report.relatedGrowthReview;
+  assert.deepEqual(related.prefilledFields, ['salonName', 'email'],
+    'kept in enum order, de-duplicated, with every unapproved entry gone');
+
+  const text = JSON.stringify(mixReport.report);
+  ['owner@example.com', 'Gel manicure', 'September'].forEach(value =>
+    assert.equal(text.includes(value), false,
+      'nothing unapproved reaches the append-only report'));
+});
+
+it('O7 — a Service Mix report never enters the Growth supersession chain', async () => {
+  const growthSubmission = id();
+  const growthBir = id();
+  created.submissionIds.push(growthSubmission);
+  created.idempotencyKeys.push(growthSubmission);
+
+  const growth = await rpc('ingest_assessment', {
+    p_idempotency_key: growthSubmission,
+    p_request_hash: createHash('sha256').update(growthSubmission).digest('hex'),
+    p_payload: payload({ submissionId: growthSubmission, sessionId: id() }),
+    p_signals: [], p_bir: bir(), p_bir_id: growthBir, p_retention_days: 30, p_meta: {}
+  });
+  const businessId = growth.data.businessId;
+  created.businessIds.push(businessId);
+
+  const mixBir = id();
+  await ingestMix({ submissionId: id(), sessionId: id(), birId: mixBir,
+                    continuationBusinessId: businessId });
+  const [mixReport] = await rows('business_intelligence_reports', 'bir_id', mixBir);
+  assert.equal(mixReport.supersedes_bir_id, null,
+    'the first report of a review type supersedes nothing');
+
+  /* And a second Service Mix review chains to the first, not to Growth. */
+  const secondMixBir = id();
+  await ingestMix({ submissionId: id(), sessionId: id(), birId: secondMixBir,
+                    continuationBusinessId: businessId });
+  const [second] = await rows('business_intelligence_reports', 'bir_id', secondMixBir);
+  assert.equal(second.supersedes_bir_id, mixBir);
+
+  /* Exactly one root per review type — the property the advisory lock in
+     ingest_review exists to guarantee. */
+  const mixReports = (await rows('business_intelligence_reports', 'business_id', businessId))
+    .filter(r => r.review_type === 'service_mix');
+  assert.equal(mixReports.filter(r => r.supersedes_bir_id === null).length, 1);
+});
+
+it('O7b — a session may not be reused under a second review type', async () => {
+  const sessionId = id();
+  const growthSubmission = id();
+  created.submissionIds.push(growthSubmission);
+  created.idempotencyKeys.push(growthSubmission);
+
+  const growth = await rpc('ingest_assessment', {
+    p_idempotency_key: growthSubmission,
+    p_request_hash: createHash('sha256').update(growthSubmission).digest('hex'),
+    p_payload: payload({ submissionId: growthSubmission, sessionId }),
+    p_signals: [], p_bir: bir(), p_bir_id: id(), p_retention_days: 30, p_meta: {}
+  });
+  created.businessIds.push(growth.data.businessId);
+
+  const conflicting = id();
+  created.idempotencyKeys.push(conflicting);
+  const { error } = await ingestMix({ submissionId: conflicting, sessionId, birId: id() });
+
+  assert.ok(error, 'a Growth session may not carry a Service Mix submission');
+  assert.match(error.message, /session_review_type_conflict/);
+
+  const stored = await rows('assessment_submissions', 'submission_id', conflicting);
+  assert.deepEqual(stored, [], 'and nothing is stored');
+});
+
+it('O8 — the supersession guard refuses a cross-review-type chain outright', async () => {
+  /* Written directly, not through ingestion: the point is that the DATABASE
+     refuses it even when a caller tries. */
+  const sessionId = id();
+  const growthSubmission = id();
+  const growthBir = id();
+  created.submissionIds.push(growthSubmission);
+  created.idempotencyKeys.push(growthSubmission);
+
+  const growth = await rpc('ingest_assessment', {
+    p_idempotency_key: growthSubmission,
+    p_request_hash: createHash('sha256').update(growthSubmission).digest('hex'),
+    p_payload: payload({ submissionId: growthSubmission, sessionId }),
+    p_signals: [], p_bir: bir(), p_bir_id: growthBir, p_retention_days: 30, p_meta: {}
+  });
+  const businessId = growth.data.businessId;
+  created.businessIds.push(businessId);
+
+  const { error } = await db.from('business_intelligence_reports').insert({
+    bir_id: id(), business_id: businessId,
+    assessment_submission_id: growthSubmission,
+    schema_version: 5, review_type: 'service_mix',
+    report: serviceMixBir(), confidence_band: 'high',
+    supersedes_bir_id: growthBir
+  });
+  assert.ok(error, 'a Service Mix report may never supersede a Growth report');
+  assert.match(error.message, /supersedes_review_type_mismatch|bir_one_per_submission/);
+});
+
+it('O9 — the legacy current_bir_id refuses a non-Growth report', async () => {
+  const mixBir = id();
+  const mix = await ingestMix({ submissionId: id(), sessionId: id(), birId: mixBir });
+  const businessId = mix.data.businessId;
+  created.businessIds.push(businessId);
+
+  const { error } = await db.from('business_records')
+    .update({ current_bir_id: mixBir }).eq('business_id', businessId);
+  assert.ok(error, 'business_records.current_bir_id is the Growth pointer');
+  assert.match(error.message, /current_bir_must_be_growth/);
+});
+
+it('O10 — a server-issued continuation businessId links across device sessions', async () => {
+  const growthSubmission = id();
+  created.submissionIds.push(growthSubmission);
+  created.idempotencyKeys.push(growthSubmission);
+  const growth = await rpc('ingest_assessment', {
+    p_idempotency_key: growthSubmission,
+    p_request_hash: createHash('sha256').update(growthSubmission).digest('hex'),
+    p_payload: payload({ submissionId: growthSubmission, sessionId: id() }),
+    p_signals: [], p_bir: bir(), p_bir_id: id(), p_retention_days: 30, p_meta: {}
+  });
+  const businessId = growth.data.businessId;
+  created.businessIds.push(businessId);
+
+  /* A different session id — nothing but the continuation connects them. */
+  const { data, error } = await ingestMix({
+    submissionId: id(), sessionId: id(), birId: id(),
+    continuationBusinessId: businessId
+  });
+  assert.equal(error, null);
+  assert.equal(data.businessId, businessId);
+  assert.equal(data.linkMethod, 'continuation_context');
+});
+
+it('O11 — a continuation pointing at a merged-away record does not link', async () => {
+  const survivorSubmission = id();
+  created.submissionIds.push(survivorSubmission);
+  created.idempotencyKeys.push(survivorSubmission);
+  const survivor = await rpc('ingest_assessment', {
+    p_idempotency_key: survivorSubmission,
+    p_request_hash: createHash('sha256').update(survivorSubmission).digest('hex'),
+    p_payload: payload({ submissionId: survivorSubmission, sessionId: id() }),
+    p_signals: [], p_bir: bir(), p_bir_id: id(), p_retention_days: 30, p_meta: {}
+  });
+  const survivorId = survivor.data.businessId;
+  created.businessIds.push(survivorId);
+
+  const goneSubmission = id();
+  created.submissionIds.push(goneSubmission);
+  created.idempotencyKeys.push(goneSubmission);
+  const gone = await rpc('ingest_assessment', {
+    p_idempotency_key: goneSubmission,
+    p_request_hash: createHash('sha256').update(goneSubmission).digest('hex'),
+    p_payload: payload({ submissionId: goneSubmission, sessionId: id(),
+                         contactEmail: email('gone') }),
+    p_signals: [], p_bir: bir(), p_bir_id: id(), p_retention_days: 30, p_meta: {}
+  });
+  const goneId = gone.data.businessId;
+  created.businessIds.push(goneId);
+
+  await db.from('business_records')
+    .update({ merged_into_business_id: survivorId }).eq('business_id', goneId);
+
+  const { data } = await ingestMix({
+    submissionId: id(), sessionId: id(), birId: id(),
+    continuationBusinessId: goneId
+  });
+  assert.notEqual(data.businessId, goneId,
+    'a record merged away since the token was issued must not be linked to');
+});
+
+it('O12 — replaying a Service Mix submission creates nothing', async () => {
+  const submissionId = id();
+  const birId = id();
+  const first = await ingestMix({ submissionId, sessionId: id(), birId });
+  assert.equal(first.error, null);
+  assert.equal(first.data.replayed, false);
+  created.businessIds.push(first.data.businessId);
+
+  const second = await rpc('ingest_review', {
+    p_idempotency_key: submissionId,
+    p_request_hash: createHash('sha256').update(submissionId).digest('hex'),
+    p_payload: serviceMixPayload({ submissionId, sessionId: first.data.assessmentSessionId }),
+    p_signals: [], p_bir: serviceMixBir(), p_bir_id: birId, p_retention_days: 30,
+    p_meta: {}, p_review_type: 'service_mix', p_continuation_business_id: null
+  });
+  assert.equal(second.error, null);
+  assert.equal(second.data.replayed, true);
+
+  const states = await rows('business_review_states', 'business_id', first.data.businessId);
+  assert.equal(states.find(s => s.review_type === 'service_mix').completed_count, 1,
+    'a replay must not increment the completion count');
+});
+
+it('O13 — analytics rows and aggregates carry review_type', async () => {
+  const sessionId = id();
+  const eventId = id();
+  created.analyticsEventIds.push(eventId);
+  created.analyticsSessionIds.push(sessionId);
+
+  const { error } = await rpc('ingest_analytics_events', {
+    p_events: [{
+      eventId, eventName: 'service_mix.review_viewed', eventVersion: 1, schemaVersion: 2,
+      assessmentSessionId: sessionId, verticalId: 'nails',
+      /* Deliberately mislabelled: the event NAME must win. */
+      reviewType: 'growth_review',
+      occurredAt: new Date().toISOString(),
+      activeElapsedMs: 0, totalElapsedMs: 0,
+      attribution: { firstTouch: { utm: { utm_source: `qr-${RUN}` } } },
+      device: { deviceClass: 'phone' }, metadata: {}
+    }],
+    p_meta: { correlationId: `mixa-${RUN}` }, p_retention_days: 400
+  });
+  assert.equal(error, null);
+
+  const [row] = await rows('assessment_analytics_events', 'event_id', eventId);
+  assert.equal(row.review_type, 'service_mix',
+    'a service_mix.* event can never be filed under the Growth funnel');
+
+  const [session] = await rows('assessment_analytics_sessions', 'assessment_session_id', sessionId);
+  assert.equal(session.review_type, 'service_mix');
+});
+
+it('O14 — the daily funnel separates the two review types', async () => {
+  const { error } = await rpc('refresh_assessment_funnel_daily', {
+    p_from: new Date(Date.now() - 86400000).toISOString().slice(0, 10),
+    p_to: new Date().toISOString().slice(0, 10)
+  });
+  assert.equal(error, null);
+
+  const { data } = await db.from('assessment_funnel_daily')
+    .select('*').eq('source', `qr-${RUN}`);
+  const mixRows = (data || []).filter(r => r.review_type === 'service_mix');
+  assert.ok(mixRows.length >= 1, 'the Service Mix events must land on their own aggregate row');
+  mixRows.forEach(r => assert.ok(r.page_views >= 1,
+    'service_mix.review_viewed counts as a page view for its own funnel'));
+});
+
+/* ============================================================
+   P. Rule B0 — a proposal is not a decision
+   ------------------------------------------------------------
+   The same case table tests/continuation-conflict.test.mjs runs
+   through the shared rule and the fake database, run here through
+   the real ingest_review in real PostgreSQL. The SQL is a genuine
+   second implementation of that rule, and this is what stops the
+   two drifting.
+
+   The defect: a valid Salon A context plus a Salon B identity
+   stored Salon B's submission, report, email, domain and business
+   name under Salon A — permanently, in tables that refuse UPDATE
+   and refuse DELETE.
+   ============================================================ */
+
+/* Two salons with nothing whatsoever in common — and a FRESH pair per test.
+   Reusing one pair across tests would make the second test's Growth Review
+   match the first's identifiers, resolve as ambiguous, and return a null
+   business id; every assertion after that would then pass by comparing null
+   with null. Uniqueness per test is what keeps these tests from passing
+   vacuously. */
+const salonNames = tag => ({
+  a: `polished nail studio ${tag} ${RUN}`,
+  b: `riverside barber co ${tag} ${RUN}`,
+  aEmail: email(`salon-a-${tag}`),
+  bEmail: email(`salon-b-${tag}`)
+});
+
+/* A Growth Review that establishes a business, with the identifiers a real
+   one would leave: a business name and an email. */
+const establishBusiness = async (name, contactEmail) => {
+  const submissionId = id();
+  const birId = id();
+  created.submissionIds.push(submissionId);
+  created.idempotencyKeys.push(submissionId);
+
+  const { data, error } = await rpc('ingest_assessment', {
+    p_idempotency_key: submissionId,
+    p_request_hash: createHash('sha256').update(submissionId).digest('hex'),
+    p_payload: payload({ submissionId, sessionId: id(), name, contactEmail }),
+    p_signals: [signal('business_name', name), signal('email_exact', contactEmail),
+                signal('vertical', 'nails')],
+    p_bir: bir(name), p_bir_id: birId, p_retention_days: 30, p_meta: {}
+  });
+  assert.equal(error, null);
+  assert.ok(data.businessId,
+    'the Growth Review must actually create a record, or everything below ' +
+    'compares null with null and proves nothing');
+  created.businessIds.push(data.businessId);
+  return { businessId: data.businessId, birId, submissionId };
+};
+
+const mixAs = async ({ name, contactEmail, continuationBusinessId }) => {
+  const submissionId = id();
+  const birId = id();
+  const base = serviceMixPayload({ submissionId, sessionId: id() });
+  created.submissionIds.push(submissionId);
+  created.idempotencyKeys.push(submissionId);
+
+  const { data, error } = await rpc('ingest_review', {
+    p_idempotency_key: submissionId,
+    p_request_hash: createHash('sha256').update(submissionId).digest('hex'),
+    p_payload: { ...base, contact: { ...base.contact, salonName: name, email: contactEmail } },
+    p_signals: [signal('business_name', name), signal('email_exact', contactEmail),
+                signal('vertical', 'nails')],
+    p_bir: serviceMixBir(), p_bir_id: birId, p_retention_days: 30,
+    p_meta: { correlationId: `b1a-${RUN}` },
+    p_review_type: 'service_mix',
+    p_continuation_business_id: continuationBusinessId
+  });
+  return { data, error, submissionId, birId };
+};
+
+it("P1 — a consistent continuation still links, in real PostgreSQL", async () => {
+  const s = salonNames("p1");
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const { data, error } = await mixAs({
+    name: s.a, contactEmail: s.aEmail, continuationBusinessId: salonA.businessId
+  });
+
+  assert.equal(error, null);
+  assert.equal(data.businessId, salonA.businessId, 'the feature must still work');
+  assert.equal(data.linkMethod, 'continuation_context');
+  assert.equal(data.continuationContradicted, false);
+  assert.equal(data.identityStatus, 'linked');
+});
+
+it('P2 — a rebrand is not another business', async () => {
+  const s = salonNames('p2');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const { data, error } = await mixAs({
+    /* New name, same email. A name change alone is a rebrand. */
+    name: `${s.a} and spa`, contactEmail: s.aEmail,
+    continuationBusinessId: salonA.businessId
+  });
+
+  assert.equal(error, null);
+  assert.equal(data.continuationContradicted, false);
+  assert.equal(data.businessId, salonA.businessId);
+});
+
+it('P3 — a new email address alone is not another business', async () => {
+  const s = salonNames('p3');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const { data, error } = await mixAs({
+    name: s.a, contactEmail: email('salon-a-new-p3'),
+    continuationBusinessId: salonA.businessId
+  });
+
+  assert.equal(error, null);
+  assert.equal(data.continuationContradicted, false);
+  assert.equal(data.businessId, salonA.businessId);
+});
+
+it('P4 — Salon A token plus Salon B identity does not link to Salon A', async () => {
+  const s = salonNames('p4');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const { data, error, submissionId, birId } = await mixAs({
+    name: s.b, contactEmail: s.bEmail,
+    continuationBusinessId: salonA.businessId
+  });
+
+  assert.equal(error, null, 'the visitor still gets a result');
+  assert.equal(data.continuationContradicted, true);
+  assert.equal(data.businessId, null, 'not filed under Salon A');
+  assert.equal(data.identityStatus, 'resolution_pending');
+  assert.equal(data.linkMethod, null);
+  assert.equal(data.nextAction, 'identity_review_pending');
+
+  /* The submission and report exist, attached to nobody. */
+  const [submission] = await rows('assessment_submissions', 'submission_id', submissionId);
+  assert.equal(submission.business_id, null);
+  assert.equal(submission.identity_status, 'resolution_pending');
+  assert.equal(submission.ingest_meta.continuationApplied, false);
+  assert.equal(submission.ingest_meta.continuationContradicted, true);
+
+  const [report] = await rows('business_intelligence_reports', 'bir_id', birId);
+  assert.equal(report.business_id, null);
+  assert.equal(report.supersedes_bir_id, null);
+  assert.equal(report.report.relatedGrowthReview, null,
+    'a report that continues from nothing names nothing');
+});
+
+it('P5 — Salon B identifiers never reach Salon A', async () => {
+  const s = salonNames('p5');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  await mixAs({
+    name: s.b, contactEmail: s.bEmail,
+    continuationBusinessId: salonA.businessId
+  });
+
+  const held = await rows('business_identifiers', 'business_id', salonA.businessId);
+  const values = held.filter(i => i.valid_to === null).map(i => i.normalized_value);
+
+  assert.equal(values.includes(s.b), false, 'business name');
+  assert.equal(values.includes(s.bEmail), false, 'email');
+  assert.ok(values.includes(s.a), 'and Salon A keeps what it had');
+  assert.ok(values.includes(s.aEmail));
+
+  /* Nowhere else either: no record anywhere holds Salon B's identifiers,
+     because the veto refuses to create one on contradicted evidence. */
+  const { data: anywhere } = await db.from('business_identifiers')
+    .select('business_id, identifier_type, normalized_value')
+    .eq('normalized_value', s.bEmail);
+  assert.deepEqual(anywhere || [], []);
+});
+
+it('P6 — no Salon B report enters Salon A supersession chain', async () => {
+  const s = salonNames('p6');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const { birId } = await mixAs({
+    name: s.b, contactEmail: s.bEmail,
+    continuationBusinessId: salonA.businessId
+  });
+
+  const aReports = await rows('business_intelligence_reports', 'business_id', salonA.businessId);
+  assert.deepEqual(aReports.map(r => r.bir_id).sort(), [salonA.birId].sort(),
+    "Salon A's chain holds exactly its own Growth report");
+  assert.equal(aReports.some(r => r.bir_id === birId), false);
+
+  const states = await rows('business_review_states', 'business_id', salonA.businessId);
+  assert.deepEqual(states.map(s => s.review_type).sort(), ['growth_review'],
+    'and Salon A gained no Service Mix review state');
+
+  const [record] = await rows('business_records', 'business_id', salonA.businessId);
+  assert.equal(record.current_bir_id, salonA.birId);
+});
+
+it('P7 — the mismatch opens a case that names types, never values', async () => {
+  const s = salonNames('p7');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const { submissionId } = await mixAs({
+    name: s.b, contactEmail: s.bEmail,
+    continuationBusinessId: salonA.businessId
+  });
+
+  const cases = await rows('identity_resolution_cases', 'assessment_submission_id', submissionId);
+  assert.equal(cases.length, 1);
+  const [openCase] = cases;
+  assert.equal(openCase.resolution_status, 'manual_review_required');
+  assert.equal(openCase.recommended_action, 'queue_for_review');
+  assert.equal(openCase.resolved_at, null);
+
+  const contradiction = (openCase.conflicting_signals || [])
+    .find(c => c.kind === 'continuation_context_contradicted');
+  assert.ok(contradiction, 'the case must record that a signed context was set aside');
+  assert.equal(contradiction.proposedBusinessId, salonA.businessId);
+  assert.ok(contradiction.contradictedTypes.includes('business_name'));
+  assert.ok(contradiction.contradictedTypes.includes('email_exact'));
+  assert.deepEqual(contradiction.agreedTypes, []);
+
+  const text = JSON.stringify(openCase);
+  assert.equal(text.includes(s.bEmail), false, 'no identifier value in a review queue');
+  assert.equal(text.includes(s.b), false);
+
+  /* And a timeline event a human can find it by. */
+  const { data: events } = await db.from('timeline_events')
+    .select('event_name, payload, summary')
+    .eq('correlation_id', submissionId);
+  const review = (events || []).find(e => e.event_name === 'identity.review_required');
+  assert.ok(review);
+  assert.equal(review.payload.continuationContradicted, true);
+  assert.equal(review.payload.sessionContradicted, false);
+  assert.match(review.summary, /saved identity proposal was set aside/i);
+});
+
+it('P8 — a queued review sent with another business current context contaminates neither', async () => {
+  /* Salon A's review was queued offline. Salon B then completed a review on
+     the same device, so Salon B's token is what the browser now holds. The
+     browser declines to send it; this proves what happens if it does. */
+  const s = salonNames('p8');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const salonB = await establishBusiness(s.b, s.bEmail);
+
+  const { data, error } = await mixAs({
+    name: s.a, contactEmail: s.aEmail,
+    continuationBusinessId: salonB.businessId
+  });
+
+  assert.equal(error, null);
+  assert.equal(data.continuationContradicted, true);
+  assert.notEqual(data.businessId, salonB.businessId, 'not filed under Salon B');
+  assert.equal(data.businessId, null,
+    'and not auto-filed under Salon A either — weak evidence never links by itself');
+
+  /* Both records hold exactly what they held. */
+  const bHeld = (await rows('business_identifiers', 'business_id', salonB.businessId))
+    .filter(i => i.valid_to === null).map(i => i.normalized_value);
+  assert.equal(bHeld.includes(s.aEmail), false);
+  assert.equal(bHeld.includes(s.a), false);
+
+  const aReports = await rows('business_intelligence_reports', 'business_id', salonA.businessId);
+  assert.deepEqual(aReports.map(r => r.bir_id), [salonA.birId]);
+  const bReports = await rows('business_intelligence_reports', 'business_id', salonB.businessId);
+  assert.deepEqual(bReports.map(r => r.bir_id), [salonB.birId]);
+});
+
+it('P9 — a context naming a record that holds nothing comparable still links', async () => {
+  /* A record with no identifiers cannot contradict anything, and a rule that
+     vetoed on absent evidence would refuse every legitimate continuation from
+     a record whose identifiers were redacted. */
+  const businessId = id();
+  created.businessIds.push(businessId);
+  const { error: seedError } = await db.from('business_records').insert({
+    business_id: businessId, schema_version: 1, identity_status: 'linked',
+    display_name: `bare record ${RUN}`, vertical_id: 'nails', lifecycle_state: 'lead_assessed'
+  });
+  assert.equal(seedError, null);
+
+  const s = salonNames('p9');
+  const { data, error } = await mixAs({
+    name: s.b, contactEmail: s.bEmail, continuationBusinessId: businessId
+  });
+
+  assert.equal(error, null);
+  assert.equal(data.continuationContradicted, false);
+  assert.equal(data.businessId, businessId);
+});
+
+
+/* ---------- P10-P16. The same rule, through the SESSION ----------
+
+   No continuation argument anywhere below: p_continuation_business_id is
+   null. The session id alone used to be enough to attach one business's
+   review to another's record. */
+
+const mixInSession = async ({ name, contactEmail, sessionId, submissionId, birId }) => {
+  const sid = submissionId || id();
+  const bid = birId || id();
+  const base = serviceMixPayload({ submissionId: sid, sessionId });
+  created.submissionIds.push(sid);
+  created.idempotencyKeys.push(sid);
+
+  const { data, error } = await rpc('ingest_review', {
+    p_idempotency_key: sid,
+    p_request_hash: createHash('sha256').update(sid).digest('hex'),
+    p_payload: { ...base, contact: { ...base.contact, salonName: name, email: contactEmail } },
+    p_signals: [signal('business_name', name), signal('email_exact', contactEmail),
+                signal('vertical', 'nails')],
+    p_bir: serviceMixBir(), p_bir_id: bid, p_retention_days: 30,
+    p_meta: { correlationId: `b0-${RUN}` },
+    p_review_type: 'service_mix',
+    p_continuation_business_id: null
+  });
+  return { data, error, submissionId: sid, birId: bid };
+};
+
+it('P10 — a second submission for the same business in one session still links and chains', async () => {
+  const s = salonNames('p10');
+  const sessionId = id();
+
+  const first = await mixInSession({ name: s.a, contactEmail: s.aEmail, sessionId });
+  assert.equal(first.error, null);
+  assert.ok(first.data.businessId);
+  created.businessIds.push(first.data.businessId);
+
+  const second = await mixInSession({ name: s.a, contactEmail: s.aEmail, sessionId });
+  assert.equal(second.error, null);
+  assert.equal(second.data.businessId, first.data.businessId,
+    'a saved journey is still deterministic for itself');
+  assert.equal(second.data.linkMethod, 'session');
+  assert.equal(second.data.sessionContradicted, false);
+  assert.equal(second.data.supersedesBirId, first.birId, 'and it chains');
+
+  const states = await rows('business_review_states', 'business_id', first.data.businessId);
+  const mixState = states.find(st => st.review_type === 'service_mix');
+  assert.equal(mixState.current_bir_id, second.birId);
+  assert.equal(mixState.completed_count, 2);
+});
+
+it('P11 — a rebrand or a new email in one session still links', async () => {
+  const s = salonNames('p11');
+  const sessionA = id();
+  const first = await mixInSession({ name: s.a, contactEmail: s.aEmail, sessionId: sessionA });
+  created.businessIds.push(first.data.businessId);
+
+  const renamed = await mixInSession({
+    name: `${s.a} and spa`, contactEmail: s.aEmail, sessionId: sessionA });
+  assert.equal(renamed.data.businessId, first.data.businessId, 'a rebrand');
+  assert.equal(renamed.data.sessionContradicted, false);
+
+  const sessionB = id();
+  const other = await mixInSession({ name: s.b, contactEmail: s.bEmail, sessionId: sessionB });
+  created.businessIds.push(other.data.businessId);
+  const moved = await mixInSession({
+    name: s.b, contactEmail: email('p11-new'), sessionId: sessionB });
+  assert.equal(moved.data.businessId, other.data.businessId, 'a new email address');
+  assert.equal(moved.data.sessionContradicted, false);
+});
+
+it('P12 — Business B in Business A session does not link to A', async () => {
+  const s = salonNames('p12');
+  const sessionId = id();
+
+  const a = await mixInSession({ name: s.a, contactEmail: s.aEmail, sessionId });
+  created.businessIds.push(a.data.businessId);
+
+  const b = await mixInSession({ name: s.b, contactEmail: s.bEmail, sessionId });
+
+  assert.equal(b.error, null, 'the visitor still gets a result');
+  assert.equal(b.data.sessionContradicted, true);
+  assert.equal(b.data.continuationContradicted, false);
+  assert.equal(b.data.businessId, null, 'not filed under Business A');
+  assert.equal(b.data.identityStatus, 'resolution_pending');
+  assert.equal(b.data.linkMethod, null);
+  assert.equal(b.data.nextAction, 'identity_review_pending');
+
+  const [submission] = await rows('assessment_submissions', 'submission_id', b.submissionId);
+  assert.equal(submission.business_id, null);
+  assert.equal(submission.identity_status, 'resolution_pending');
+  assert.equal(submission.ingest_meta.sessionContradicted, true);
+  assert.equal(submission.ingest_meta.continuationApplied, false);
+});
+
+it('P13 — B identifiers never reach A, and no record is created for B', async () => {
+  const s = salonNames('p13');
+  const sessionId = id();
+  const a = await mixInSession({ name: s.a, contactEmail: s.aEmail, sessionId });
+  created.businessIds.push(a.data.businessId);
+
+  await mixInSession({ name: s.b, contactEmail: s.bEmail, sessionId });
+
+  const held = (await rows('business_identifiers', 'business_id', a.data.businessId))
+    .filter(i => i.valid_to === null).map(i => i.normalized_value);
+  assert.equal(held.includes(s.b), false, 'business name');
+  assert.equal(held.includes(s.bEmail), false, 'exact email');
+  assert.ok(held.includes(s.a));
+  assert.ok(held.includes(s.aEmail));
+
+  const { data: anywhere } = await db.from('business_identifiers')
+    .select('business_id').eq('normalized_value', s.bEmail);
+  assert.deepEqual(anywhere || [], [],
+    'a vetoed proposal may not create a record either');
+});
+
+it('P14 — B report never enters A chain, and A pointers do not move', async () => {
+  const s = salonNames('p14');
+  const sessionId = id();
+  const a = await mixInSession({ name: s.a, contactEmail: s.aEmail, sessionId });
+  created.businessIds.push(a.data.businessId);
+
+  const b = await mixInSession({ name: s.b, contactEmail: s.bEmail, sessionId });
+
+  const [bReport] = await rows('business_intelligence_reports', 'bir_id', b.birId);
+  assert.equal(bReport.business_id, null, 'stored, attached to nobody');
+  assert.equal(bReport.supersedes_bir_id, null);
+
+  const aReports = await rows('business_intelligence_reports', 'business_id', a.data.businessId);
+  assert.deepEqual(aReports.map(r => r.bir_id), [a.birId]);
+
+  const states = await rows('business_review_states', 'business_id', a.data.businessId);
+  const mixState = states.find(st => st.review_type === 'service_mix');
+  assert.equal(mixState.current_bir_id, a.birId, 'the current pointer did not move');
+  assert.equal(mixState.latest_submission_id, a.submissionId);
+  assert.equal(mixState.completed_count, 1);
+
+  /* And the session row still points where it always did — which is exactly
+     why the submission must not be attached elsewhere. */
+  const [session] = await rows('assessment_sessions', 'assessment_session_id', sessionId);
+  assert.equal(session.business_id, a.data.businessId);
+  assert.equal(session.review_type, 'service_mix');
+});
+
+it('P15 — the case names types and never values, and the audit agrees', async () => {
+  const s = salonNames('p15');
+  const sessionId = id();
+  const a = await mixInSession({ name: s.a, contactEmail: s.aEmail, sessionId });
+  created.businessIds.push(a.data.businessId);
+
+  const b = await mixInSession({ name: s.b, contactEmail: s.bEmail, sessionId });
+
+  const cases = await rows('identity_resolution_cases', 'assessment_submission_id', b.submissionId);
+  assert.equal(cases.length, 1);
+  const [openCase] = cases;
+  assert.equal(openCase.resolution_status, 'manual_review_required');
+  assert.equal(openCase.recommended_action, 'queue_for_review');
+  assert.equal(openCase.resolved_at, null);
+
+  const contradiction = (openCase.conflicting_signals || [])
+    .find(c => c.kind === 'session_contradicted');
+  assert.ok(contradiction, 'the case must record that the session was set aside');
+  assert.equal(contradiction.proposedBusinessId, a.data.businessId);
+  assert.ok(contradiction.contradictedTypes.includes('business_name'));
+  assert.ok(contradiction.contradictedTypes.includes('email_exact'));
+  assert.deepEqual(contradiction.agreedTypes, []);
+
+  const text = JSON.stringify(openCase);
+  assert.equal(text.includes(s.bEmail), false, 'no identifier value in a review queue');
+  assert.equal(text.includes(s.b), false);
+
+  const { data: events } = await db.from('timeline_events')
+    .select('event_name, payload, summary, business_id')
+    .eq('correlation_id', b.submissionId);
+  const review = (events || []).find(e => e.event_name === 'identity.review_required');
+  assert.ok(review);
+  assert.equal(review.payload.sessionContradicted, true);
+  assert.match(review.summary, /saved identity proposal was set aside/i);
+  assert.equal(review.business_id, null, 'the event is not filed under A either');
+
+  /* The audit row is correlated by the caller's correlationId, not by the
+     submission id, so it is found by what it recorded. */
+  const { data: audits } = await db.from('audit_events')
+    .select('business_id, new_value').eq('action', 'assessment.ingested');
+  const ingested = (audits || [])
+    .find(e => e.new_value && e.new_value.submissionId === b.submissionId);
+  assert.ok(ingested);
+  assert.equal(ingested.business_id, null);
+  assert.equal(ingested.new_value.sessionContradicted, true);
+  assert.equal(ingested.new_value.identityStatus, 'resolution_pending');
+});
+
+it('P16 — a stale-session queued retry contaminates neither record', async () => {
+  /* Business B's review was queued on a device whose session had already
+     resolved to Business A. The retry carries the same payload and the same
+     session id, and no continuation context at all. */
+  const s = salonNames('p16');
+  const sessionId = id();
+  const a = await mixInSession({ name: s.a, contactEmail: s.aEmail, sessionId });
+  created.businessIds.push(a.data.businessId);
+
+  const queuedSubmission = id();
+  const queuedBir = id();
+  const first = await mixInSession({
+    name: s.b, contactEmail: s.bEmail, sessionId,
+    submissionId: queuedSubmission, birId: queuedBir });
+  assert.equal(first.error, null);
+  assert.equal(first.data.businessId, null);
+
+  /* The retry: same idempotency key, same content. */
+  const retry = await mixInSession({
+    name: s.b, contactEmail: s.bEmail, sessionId,
+    submissionId: queuedSubmission, birId: queuedBir });
+  assert.equal(retry.error, null);
+  assert.equal(retry.data.replayed, true, 'a retry of one result is a replay');
+  assert.equal(retry.data.businessId, null);
+
+  /* One submission, one report, one case. */
+  const submissions = await rows('assessment_submissions', 'submission_id', queuedSubmission);
+  assert.equal(submissions.length, 1);
+  const cases = await rows('identity_resolution_cases', 'assessment_submission_id', queuedSubmission);
+  assert.equal(cases.length, 1);
+
+  /* A is exactly as it was. */
+  const aReports = await rows('business_intelligence_reports', 'business_id', a.data.businessId);
+  assert.deepEqual(aReports.map(r => r.bir_id), [a.birId]);
+  const held = (await rows('business_identifiers', 'business_id', a.data.businessId))
+    .filter(i => i.valid_to === null).map(i => i.normalized_value);
+  assert.equal(held.includes(s.bEmail), false);
+});
+
+it('P17 — a consistent continuation cannot rescue a contradicted session', async () => {
+  /* Linking by context would attach the submission to B while the session row
+     still says A — permanently, because that column is written once. */
+  const s = salonNames('p17');
+  const sessionId = id();
+
+  const a = await mixInSession({ name: s.a, contactEmail: s.aEmail, sessionId });
+  created.businessIds.push(a.data.businessId);
+  const businessB = await establishBusiness(s.b, s.bEmail);
+
+  const submissionId = id();
+  const birId = id();
+  const base = serviceMixPayload({ submissionId, sessionId });
+  created.submissionIds.push(submissionId);
+  created.idempotencyKeys.push(submissionId);
+
+  const { data, error } = await rpc('ingest_review', {
+    p_idempotency_key: submissionId,
+    p_request_hash: createHash('sha256').update(submissionId).digest('hex'),
+    p_payload: { ...base, contact: { ...base.contact, salonName: s.b, email: s.bEmail } },
+    p_signals: [signal('business_name', s.b), signal('email_exact', s.bEmail),
+                signal('vertical', 'nails')],
+    p_bir: serviceMixBir(), p_bir_id: birId, p_retention_days: 30,
+    p_meta: { correlationId: `b0b-${RUN}` },
+    p_review_type: 'service_mix',
+    p_continuation_business_id: businessB.businessId
+  });
+
+  assert.equal(error, null);
+  assert.equal(data.sessionContradicted, true);
+  assert.equal(data.continuationContradicted, false);
+  assert.equal(data.businessId, null, 'neither record is chosen');
+  assert.equal(data.identityStatus, 'resolution_pending');
+
+  /* Neither gained anything. */
+  const aHeld = (await rows('business_identifiers', 'business_id', a.data.businessId))
+    .filter(i => i.valid_to === null).map(i => i.normalized_value);
+  assert.equal(aHeld.includes(s.bEmail), false);
+  const bReports = await rows('business_intelligence_reports', 'business_id', businessB.businessId);
+  assert.deepEqual(bReports.map(r => r.bir_id), [businessB.birId]);
+});
+
+it('P18 — two consistent proposals naming different records go to review', async () => {
+  /* Business A's name with Business B's email: A agrees on the name, B agrees
+     on the email, so neither is contradicted and neither can be chosen. */
+  const s = salonNames('p18');
+  const sessionId = id();
+
+  const a = await mixInSession({ name: s.a, contactEmail: s.aEmail, sessionId });
+  created.businessIds.push(a.data.businessId);
+  const businessB = await establishBusiness(s.b, s.bEmail);
+
+  const submissionId = id();
+  const birId = id();
+  const base = serviceMixPayload({ submissionId, sessionId });
+  created.submissionIds.push(submissionId);
+  created.idempotencyKeys.push(submissionId);
+
+  const { data, error } = await rpc('ingest_review', {
+    p_idempotency_key: submissionId,
+    p_request_hash: createHash('sha256').update(submissionId).digest('hex'),
+    p_payload: { ...base, contact: { ...base.contact, salonName: s.a, email: s.bEmail } },
+    p_signals: [signal('business_name', s.a), signal('email_exact', s.bEmail),
+                signal('vertical', 'nails')],
+    p_bir: serviceMixBir(), p_bir_id: birId, p_retention_days: 30,
+    p_meta: { correlationId: `b0c-${RUN}` },
+    p_review_type: 'service_mix',
+    p_continuation_business_id: businessB.businessId
+  });
+
+  assert.equal(error, null);
+  assert.equal(data.sessionContradicted, false);
+  assert.equal(data.continuationContradicted, false);
+  assert.equal(data.proposalsDisagreed, true);
+  assert.equal(data.businessId, null);
+  assert.equal(data.identityStatus, 'resolution_pending');
+
+  const cases = await rows('identity_resolution_cases', 'assessment_submission_id', submissionId);
+  const disagreement = (cases[0].conflicting_signals || [])
+    .find(c => c.kind === 'proposals_disagree');
+  assert.ok(disagreement, 'the case must say the two proposals disagreed');
+  assert.deepEqual(
+    [...disagreement.proposedBusinessIds].sort(),
+    [businessB.businessId, a.data.businessId].sort());
+});
+
+
+/* ============================================================
+   Q. Analytics date ranges are UTC, on both sides
+   ------------------------------------------------------------
+   Events are bucketed by `(occurred_at at time zone 'utc')::date`. The
+   default bounds inherited from 0005 were `current_date`, which is the
+   DATABASE SESSION's calendar. The two agree for most of the day and disagree
+   exactly at the edge — the worst possible failure shape, because a nightly
+   refresh silently writes nothing rather than failing.
+
+   Reproduced at 00:05 UTC from an America/New_York session: now() said
+   August 6, current_date said August 5, both events bucketed to August 6, and
+   the aggregate table stayed empty.
+
+   These tests do not wait for midnight. They set the session time zone to one
+   deliberately behind UTC and one deliberately ahead, so that on most of the
+   day at least one of them disagrees with UTC — and they assert the catalog's
+   default expressions directly, which cannot pass by coincidence at all.
+   ============================================================ */
+
+/* Far enough either side that the local date differs from the UTC date for
+   most of the day, and the two never agree with each other. */
+
+/* Local mode only: these need control of the DATABASE SESSION's time zone,
+   which means a raw connection. Skipped rather than silently weakened when
+   the suite runs against a hosted project through PostgREST. */
+const utcIt = (name, fn) => test(name, {
+  skip: BLOCKED ? 'guards not satisfied'
+    : (!localEnv ? 'needs the local PostgreSQL harness for session time-zone control' : false)
+}, fn);
+
+const BEHIND_UTC = 'Pacific/Niue';        /* UTC-11 */
+const AHEAD_OF_UTC = 'Pacific/Kiritimati'; /* UTC+14 */
+
+const inSession = async (timeZone, sql, params = []) => {
+  await localEnv.pg.query(`set time zone '${timeZone}'`);
+  try {
+    return await localEnv.pg.query(sql, params);
+  } finally {
+    await localEnv.pg.query("set time zone 'UTC'");
+  }
+};
+
+utcIt('Q1 — the declared defaults are UTC expressions, not session-local ones', async () => {
+  /* The strongest form of this assertion: read the catalog. It cannot pass
+     because a local date happened to equal the UTC one when the suite ran. */
+  const { rows } = await localEnv.pg.query(`
+    select p.proname,
+           pg_get_expr(p.proargdefaults, 0) as defaults
+      from pg_proc p
+      join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'public'
+       and p.proname in ('refresh_assessment_funnel_daily', 'assessment_step_dropoff')
+     order by p.proname`);
+
+  assert.equal(rows.length, 2, 'both date-ranged analytics functions');
+  rows.forEach(row => {
+    assert.match(row.defaults, /utc/i,
+      `${row.proname} must default from the UTC calendar`);
+    assert.equal(/current_date/i.test(row.defaults), false,
+      `${row.proname} must not default from the session calendar`);
+  });
+});
+
+utcIt('Q2 — the two session zones really do disagree, so the rest is a real test', async () => {
+  const behind = await inSession(BEHIND_UTC,
+    "select current_date as local, (now() at time zone 'utc')::date as utc");
+  const ahead = await inSession(AHEAD_OF_UTC,
+    "select current_date as local, (now() at time zone 'utc')::date as utc");
+
+  const asDate = v => (v instanceof Date ? v.toISOString().slice(0, 10) : String(v).slice(0, 10));
+
+  /* Both sessions agree about UTC, and at least one differs from it locally —
+     Niue is 25 hours behind Kiritimati, so their local dates can never both
+     equal the UTC date. */
+  assert.equal(asDate(behind.rows[0].utc), asDate(ahead.rows[0].utc));
+  const localsDiffer = asDate(behind.rows[0].local) !== asDate(ahead.rows[0].local);
+  assert.ok(localsDiffer,
+    'the two session calendars must differ, or this section proves nothing');
+
+  console.log(`\n    UTC date ${asDate(behind.rows[0].utc)} | ` +
+    `${BEHIND_UTC} ${asDate(behind.rows[0].local)} | ` +
+    `${AHEAD_OF_UTC} ${asDate(ahead.rows[0].local)}\n`);
+});
+
+/* One analytics event, stamped NOW, so it lands in today's UTC bucket
+   whatever the wall clock says. */
+const seedAnalyticsEvent = async ({ eventName, sessionId, reviewType, source }) => {
+  const eventId = id();
+  created.analyticsEventIds.push(eventId);
+  created.analyticsSessionIds.push(sessionId);
+  const { error } = await rpc('ingest_analytics_events', {
+    p_events: [{
+      eventId, eventName, eventVersion: 1, schemaVersion: 2,
+      assessmentSessionId: sessionId, verticalId: 'nails',
+      reviewType,
+      occurredAt: new Date().toISOString(),
+      activeElapsedMs: 1000, totalElapsedMs: 2000,
+      assessmentStage: 1, stepId: 'figures',
+      attribution: { firstTouch: { utm: { utm_source: source } } },
+      device: { deviceClass: 'phone' }, metadata: {}
+    }],
+    p_meta: { correlationId: `utc-${RUN}` }, p_retention_days: 400
+  });
+  assert.equal(error, null);
+  return eventId;
+};
+
+const funnelRows = async source => {
+  const { data } = await db.from('assessment_funnel_daily').select('*').eq('source', source);
+  return data || [];
+};
+
+utcIt('Q3 — zero-argument aggregation includes today from a session BEHIND UTC', async () => {
+  const source = `utcb-${RUN}`;
+  await seedAnalyticsEvent({
+    eventName: 'assessment.page_viewed', sessionId: id(),
+    reviewType: 'growth_review', source });
+  await seedAnalyticsEvent({
+    eventName: 'assessment.started', sessionId: id(),
+    reviewType: 'growth_review', source });
+
+  /* Zero arguments, from a session eleven hours behind UTC. Before the fix
+     this wrote nothing whenever the local date had not yet caught up. */
+  const { rows } = await inSession(BEHIND_UTC,
+    'select public.refresh_assessment_funnel_daily() as n');
+  assert.ok(Number(rows[0].n) >= 1, 'rows must be written');
+
+  const aggregated = await funnelRows(source);
+  assert.ok(aggregated.length >= 1, 'the aggregate table must not stay empty');
+
+  /* The complete row, not merely its existence. */
+  const [row] = aggregated;
+  const utcToday = (await localEnv.pg.query(
+    "select (now() at time zone 'utc')::date as d")).rows[0].d;
+  const asDate = v => (v instanceof Date ? v.toISOString().slice(0, 10) : String(v).slice(0, 10));
+
+  assert.equal(asDate(row.aggregate_date), asDate(utcToday),
+    'bucketed on the UTC calendar');
+  assert.equal(row.vertical_id, 'nails');
+  assert.equal(row.review_type, 'growth_review');
+  assert.equal(row.device_class, 'phone');
+  assert.equal(row.source, source);
+  assert.equal(Number(row.page_views), 1);
+  assert.equal(Number(row.starts), 1);
+});
+
+utcIt('Q4 — and from a session AHEAD of UTC', async () => {
+  const source = `utca-${RUN}`;
+  await seedAnalyticsEvent({
+    eventName: 'assessment.page_viewed', sessionId: id(),
+    reviewType: 'growth_review', source });
+
+  const { rows } = await inSession(AHEAD_OF_UTC,
+    'select public.refresh_assessment_funnel_daily() as n');
+  assert.ok(Number(rows[0].n) >= 1);
+
+  const aggregated = await funnelRows(source);
+  assert.equal(aggregated.length, 1);
+  assert.equal(Number(aggregated[0].page_views), 1);
+});
+
+utcIt('Q5 — the two review types stay separated across the UTC boundary', async () => {
+  const source = `utcm-${RUN}`;
+  await seedAnalyticsEvent({
+    eventName: 'assessment.page_viewed', sessionId: id(),
+    reviewType: 'growth_review', source });
+  await seedAnalyticsEvent({
+    eventName: 'service_mix.review_viewed', sessionId: id(),
+    reviewType: 'service_mix', source });
+
+  await inSession(BEHIND_UTC, 'select public.refresh_assessment_funnel_daily()');
+
+  const aggregated = await funnelRows(source);
+  const byType = Object.fromEntries(aggregated.map(r => [r.review_type, r]));
+  assert.ok(byType.growth_review, 'a Growth row');
+  assert.ok(byType.service_mix, 'and a separate Service Mix row');
+  assert.equal(Number(byType.growth_review.page_views), 1);
+  assert.equal(Number(byType.service_mix.page_views), 1,
+    'service_mix.review_viewed counts as a page view for its own funnel');
+});
+
+utcIt('Q6 — repeated zero-argument aggregation is idempotent', async () => {
+  const source = `utci-${RUN}`;
+  await seedAnalyticsEvent({
+    eventName: 'assessment.page_viewed', sessionId: id(),
+    reviewType: 'growth_review', source });
+
+  await inSession(BEHIND_UTC, 'select public.refresh_assessment_funnel_daily()');
+  const first = await funnelRows(source);
+  await inSession(AHEAD_OF_UTC, 'select public.refresh_assessment_funnel_daily()');
+  await localEnv.pg.query('select public.refresh_assessment_funnel_daily()');
+  const third = await funnelRows(source);
+
+  assert.equal(third.length, first.length, 'no duplicate rows');
+  assert.equal(Number(third[0].page_views), Number(first[0].page_views),
+    'and no double counting, whatever the session calendar');
+});
+
+utcIt('Q7 — explicit bounds still mean exactly what they say', async () => {
+  const source = `utce-${RUN}`;
+  await seedAnalyticsEvent({
+    eventName: 'assessment.page_viewed', sessionId: id(),
+    reviewType: 'growth_review', source });
+
+  const utcToday = (await localEnv.pg.query(
+    "select (now() at time zone 'utc')::date as d")).rows[0].d;
+  const asDate = v => (v instanceof Date ? v.toISOString().slice(0, 10) : String(v).slice(0, 10));
+  const today = asDate(utcToday);
+  const longAgo = '2020-01-01';
+
+  /* A window that excludes today writes nothing for this source. */
+  await localEnv.pg.query(
+    'select public.refresh_assessment_funnel_daily($1::date, $2::date)',
+    [longAgo, '2020-01-08']);
+  assert.deepEqual(await funnelRows(source), [],
+    'an explicit past window must not sweep in today');
+
+  /* A window that includes it does. */
+  await localEnv.pg.query(
+    'select public.refresh_assessment_funnel_daily($1::date, $2::date)',
+    [today, today]);
+  const included = await funnelRows(source);
+  assert.equal(included.length, 1);
+  assert.equal(Number(included[0].page_views), 1);
+});
+
+utcIt('Q8 — assessment_step_dropoff uses the same UTC convention', async () => {
+  const sessionId = id();
+  await seedAnalyticsEvent({
+    eventName: 'assessment.step_viewed', sessionId,
+    reviewType: 'growth_review', source: `utcd-${RUN}` });
+  await seedAnalyticsEvent({
+    eventName: 'assessment.step_completed', sessionId,
+    reviewType: 'growth_review', source: `utcd-${RUN}` });
+
+  /* Zero range arguments, from both opposing session calendars. */
+  for (const zone of [BEHIND_UTC, AHEAD_OF_UTC]) {
+    const { rows } = await inSession(zone,
+      "select * from public.assessment_step_dropoff('nails')");
+    const step = rows.find(r => r.step_id === 'figures');
+    assert.ok(step, `${zone}: today's steps must be inside the default window`);
+    assert.ok(Number(step.entered_sessions) >= 1);
+    assert.ok(Number(step.completed_sessions) >= 1);
+  }
+});
+
+
+/* ---------- R. The value contract, in PostgreSQL ----------
+
+   `identity_proposal_conflict` mirrored the JavaScript rule but not the
+   JavaScript VALUE contract. `gbp_place_id: 'x'` — which `isAcceptableValue`
+   has always refused — was compared, counted as agreement on both sides, and
+   neutralised a real name-and-email contradiction. JavaScript now throws;
+   without the same refusal here, PostgreSQL would still have linked, and the
+   two implementations would disagree about the same input.
+
+   Canonicality (normalizeEmail, normalizePhone, normalizeDomain,
+   normalizeName) is deliberately NOT reimplemented in SQL — a second
+   normalizer that drifts is worse than one. R5 proves instead that no
+   non-canonical value can reach the database through the endpoint, which is
+   the only writer of either side. */
+
+const acceptable = async (type, value) => {
+  const { rows } = await localEnv.pg.query(
+    'select public.identity_value_acceptable($1, $2) as ok', [type, value]);
+  return rows[0].ok;
+};
+
+utcIt('R1 — identity_value_acceptable mirrors isAcceptableValue, value for value', async () => {
+  const { createRequire } = await import('node:module');
+  const req = createRequire(import.meta.url);
+  const js = req('../../shared/business-record/resolve-identity.js');
+
+  /* One table, both implementations. A disagreement here is the defect. */
+  const cases = [
+    ['gbp_place_id', 'x'], ['gbp_place_id', 'ab'], ['gbp_place_id', 'abcdef'],
+    ['gbp_place_id', 'ChIJrTLr-GyuEmsRBfy61i59si0'], ['gbp_place_id', 'has spaces'],
+    ['gbp_place_id', 'a'.repeat(128)], ['gbp_place_id', 'a'.repeat(129)],
+    ['external_customer_id', 'ab'], ['external_customer_id', 'ab-c'],
+    ['external_customer_id', 'a b c'], ['external_customer_id', 'cus:1.2-3'],
+    ['payment_customer_id', 'abc'], ['payment_customer_id', 'cus_1234'],
+    ['payment_customer_id', 'has spaces'],
+    ['business_name', 'polished nail studio'], ['business_name', 'a'.repeat(256)],
+    ['business_name', 'a'.repeat(257)], ['business_name', ''],
+    ['email_exact', 'owner@polished.test'], ['email_domain', 'polished.test'],
+    ['website_domain', 'polished.test'], ['business_phone', '+18645550134'],
+    ['mobile_phone', '+18645550134'], ['vertical', 'nails'], ['locality', 'greenville sc']
+  ];
+
+  for (const [type, value] of cases) {
+    const sql = await acceptable(type, value);
+    assert.equal(sql, js.isAcceptableValue(type, value),
+      `${type} ${JSON.stringify(value.length > 40 ? `${value.slice(0, 12)}…(${value.length})` : value)}`);
+  }
+
+  /* Nulls refused on both sides. */
+  assert.equal(await acceptable(null, 'x'), false);
+  assert.equal(await acceptable('gbp_place_id', null), false);
+});
+
+utcIt('R2 — an impossible submitted value is refused, not compared', async () => {
+  const s = salonNames('r2');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+
+  const { data, error } = await rpc('identity_proposal_conflict', {
+    p_signals: [
+      signal('business_name', s.b), signal('email_exact', s.bEmail),
+      signal('gbp_place_id', 'x')
+    ],
+    p_business_id: salonA.businessId
+  });
+
+  assert.equal(data, null);
+  assert.ok(error, 'an impossible value must stop the comparison');
+  assert.match(error.message, /identity_value_unacceptable/);
+  assert.match(error.message, /submitted gbp_place_id/);
+  /* The value itself never appears in the message. */
+  assert.equal(/'x'/.test(error.message), false);
+});
+
+utcIt('R3 — matching impossible values on BOTH sides are refused, not agreement', async () => {
+  /* The audit's reproduction. Before the fix this returned material: false —
+     the junk agreed with itself and cancelled a real contradiction. */
+  const s = salonNames('r3');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+
+  /* Plant the same impossible value on the record. */
+  const { error: seedError } = await db.from('business_identifiers').insert({
+    business_id: salonA.businessId, identifier_type: 'gbp_place_id',
+    normalized_value: 'x', raw_value: 'x', source: 'seed',
+    confidence: 0.95, verified: false, verification_method: 'none'
+  });
+  assert.equal(seedError, null);
+
+  const { data, error } = await rpc('identity_proposal_conflict', {
+    p_signals: [
+      signal('business_name', s.b), signal('email_exact', s.bEmail),
+      signal('gbp_place_id', 'x')
+    ],
+    p_business_id: salonA.businessId
+  });
+
+  assert.equal(data, null);
+  assert.ok(error);
+  assert.match(error.message, /identity_value_unacceptable/);
+
+  /* And a HELD impossible value is refused even when the submission is clean. */
+  const clean = await rpc('identity_proposal_conflict', {
+    p_signals: [signal('business_name', s.a), signal('email_exact', s.aEmail)],
+    p_business_id: salonA.businessId
+  });
+  assert.equal(clean.data, null);
+  assert.match(clean.error.message, /held gbp_place_id/);
+});
+
+utcIt('R4 — the refusal reaches ingest_review, so nothing is stored on junk', async () => {
+  const s = salonNames('r4');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+
+  const submissionId = id();
+  const birId = id();
+  const base = serviceMixPayload({ submissionId, sessionId: id() });
+  created.submissionIds.push(submissionId);
+  created.idempotencyKeys.push(submissionId);
+
+  const { data, error } = await rpc('ingest_review', {
+    p_idempotency_key: submissionId,
+    p_request_hash: createHash('sha256').update(submissionId).digest('hex'),
+    p_payload: { ...base, contact: { ...base.contact, salonName: s.b, email: s.bEmail } },
+    p_signals: [
+      signal('business_name', s.b), signal('email_exact', s.bEmail),
+      signal('gbp_place_id', 'x')
+    ],
+    p_bir: serviceMixBir(), p_bir_id: birId, p_retention_days: 30,
+    p_meta: { correlationId: `r4-${RUN}` },
+    p_review_type: 'service_mix',
+    p_continuation_business_id: salonA.businessId
+  });
+
+  assert.equal(data, null);
+  assert.ok(error, 'ingestion fails closed rather than linking on junk');
+  assert.match(error.message, /identity_value_unacceptable/);
+
+  /* Nothing was written: one atomic function, one transaction. */
+  assert.deepEqual(await rows('assessment_submissions', 'submission_id', submissionId), []);
+  assert.deepEqual(await rows('business_intelligence_reports', 'bir_id', birId), []);
+  const held = (await rows('business_identifiers', 'business_id', salonA.businessId))
+    .map(i => i.normalized_value);
+  assert.equal(held.includes(s.b), false, 'and Salon A gained nothing');
+});
+
+utcIt('R5 — every signal the endpoint sends is acceptable AND canonical', async () => {
+  /* Canonicality is not reimplemented in SQL, so this is the property that
+     keeps a non-canonical value out of the database: the endpoint is the only
+     writer of either side, and what it sends is canonical by construction.
+     business_identifiers rows are written from these same signals. */
+  const { createRequire } = await import('node:module');
+  const req = createRequire(import.meta.url);
+  const js = req('../../shared/business-record/resolve-identity.js');
+
+  const payloads = [
+    payload({ submissionId: id(), sessionId: id(), name: 'Polished Nail Studio, LLC',
+              contactEmail: 'Owner+Tag@Polished.TEST',
+              extraContact: { mobile: '(864) 555-0134', website: 'https://www.polished.test/x',
+                              businessPhone: '864-555-0135',
+                              googlePlaceId: 'ChIJrTLr-GyuEmsRBfy61i59si0' } }),
+    payload({ submissionId: id(), sessionId: id() }),
+    serviceMixPayload({ submissionId: id(), sessionId: id() })
+  ];
+
+  for (const p of payloads) {
+    const signals = js.persistableSignals(js.extractIdentitySignals(p));
+    assert.ok(signals.length, 'a payload with contact details produces signals');
+
+    for (const s of signals) {
+      assert.equal(js.isAcceptableValue(s.type, s.normalizedValue), true,
+        `${s.type} not acceptable in JavaScript`);
+      assert.equal(await acceptable(s.type, s.normalizedValue), true,
+        `${s.type} not acceptable in PostgreSQL`);
+    }
+
+    /* And the comparison accepts them, in both implementations. */
+    assert.doesNotThrow(() => js.proposalConflict({
+      signals,
+      heldIdentifiers: signals.map(s => ({ type: s.type, normalizedValue: s.normalizedValue }))
+    }));
+  }
+});
+
+utcIt('R6 — the dense case table is unchanged by the value contract', async () => {
+  /* P1-P18 already cover it end to end; this re-runs the comparison
+     primitive directly on the same shapes, to show the hardening changed
+     nothing about valid evidence. */
+  const s = salonNames('r6');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+
+  const same = await rpc('identity_proposal_conflict', {
+    p_signals: [signal('business_name', s.a), signal('email_exact', s.aEmail)],
+    p_business_id: salonA.businessId
+  });
+  assert.equal(same.error, null);
+  assert.equal(same.data[0].material, false, 'same business');
+
+  const different = await rpc('identity_proposal_conflict', {
+    p_signals: [signal('business_name', s.b), signal('email_exact', s.bEmail)],
+    p_business_id: salonA.businessId
+  });
+  assert.equal(different.error, null);
+  assert.equal(different.data[0].material, true, 'different business');
+
+  const rebrand = await rpc('identity_proposal_conflict', {
+    p_signals: [signal('business_name', `${s.a} and spa`), signal('email_exact', s.aEmail)],
+    p_business_id: salonA.businessId
+  });
+  assert.equal(rebrand.error, null);
+  assert.equal(rebrand.data[0].material, false, 'rebrand');
+
+  /* A REAL shared strong identifier is still continuity — the contract
+     refuses impossible values, not valid ones. */
+  const place = 'ChIJrTLr-GyuEmsRBfy61i59si0';
+  await db.from('business_identifiers').insert({
+    business_id: salonA.businessId, identifier_type: 'gbp_place_id',
+    normalized_value: place, raw_value: place, source: 'seed',
+    confidence: 0.95, verified: false, verification_method: 'none'
+  });
+  const shared = await rpc('identity_proposal_conflict', {
+    p_signals: [signal('business_name', s.b), signal('email_exact', s.bEmail),
+                signal('gbp_place_id', place)],
+    p_business_id: salonA.businessId
+  });
+  assert.equal(shared.error, null);
+  assert.equal(shared.data[0].material, false,
+    'a real shared place id outranks a name and email change');
+  assert.ok(shared.data[0].agreed_types.includes('gbp_place_id'));
+});
+
+
+/* ---------- S. case-preserving strong identifiers, and the SQL boundary ----------
+
+   `identity_proposal_conflict` applied `lower()` to both sides. For the three
+   opaque strong identifiers that is a collision, not a normalization:
+   `gbp_place_id` `Abcdef` and `abcdef` are two different places, and
+   business_identifiers_strong_unique — a plain btree index — already stores
+   them as two rows. Folded together they were reported as AGREEMENT, which
+   outranks every contradiction, and a submission carrying a contradictory
+   business name AND a contradictory email linked to the wrong record.
+
+   Section S also closes the two remaining JavaScript/PostgreSQL disagreements:
+   the length definition above U+FFFF, and malformed evidence, which this
+   function used to filter while the JavaScript threw. */
+
+const CASE_DISTINCT = [
+  ['gbp_place_id',         'Abcdef',    'abcdef'],
+  ['external_customer_id', 'Cust:Abcd', 'cust:abcd'],
+  ['payment_customer_id',  'Cus_Abcd',  'cus_abcd']
+];
+
+const holdIdentifier = async (businessId, type, value) => {
+  const { error } = await db.from('business_identifiers').insert({
+    business_id: businessId, identifier_type: type,
+    normalized_value: value, raw_value: value, source: 'seed',
+    confidence: 0.95, verified: false, verification_method: 'none'
+  });
+  assert.equal(error, null, `seeding ${type}`);
+};
+
+utcIt('S1 — case-distinct strong values are a contradiction, not agreement', async () => {
+  for (const [type, heldValue, submittedValue] of CASE_DISTINCT) {
+    const s = salonNames(`s1-${type}`);
+    const salonA = await establishBusiness(s.a, s.aEmail);
+    await holdIdentifier(salonA.businessId, type, heldValue);
+
+    /* Both spellings are acceptable values on both sides of the wire. */
+    const { rows: ok } = await localEnv.pg.query(
+      'select public.identity_value_acceptable($1,$2) as held, ' +
+      '       public.identity_value_acceptable($1,$3) as submitted',
+      [type, heldValue, submittedValue]);
+    assert.equal(ok[0].held, true);
+    assert.equal(ok[0].submitted, true);
+
+    const { data, error } = await rpc('identity_proposal_conflict', {
+      p_signals: [signal('business_name', s.b), signal('email_exact', s.bEmail),
+                  signal(type, submittedValue)],
+      p_business_id: salonA.businessId
+    });
+
+    assert.equal(error, null);
+    assert.equal(data[0].agreed_types.includes(type), false,
+      `${type}: case-distinct values reported as agreement`);
+    assert.ok(data[0].contradicted_types.includes(type), `${type}: contradicted`);
+    assert.equal(data[0].material, true,
+      `${type}: the real name and email contradiction must survive`);
+  }
+});
+
+utcIt('S2 — an exact strong value is still continuity, all three types', async () => {
+  /* The approved rule is unchanged. Only case folding was removed. */
+  for (const [type, heldValue] of CASE_DISTINCT) {
+    const s = salonNames(`s2-${type}`);
+    const salonA = await establishBusiness(s.a, s.aEmail);
+    await holdIdentifier(salonA.businessId, type, heldValue);
+
+    const { data, error } = await rpc('identity_proposal_conflict', {
+      p_signals: [signal('business_name', s.b), signal('email_exact', s.bEmail),
+                  signal(type, heldValue)],
+      p_business_id: salonA.businessId
+    });
+
+    assert.equal(error, null);
+    assert.ok(data[0].agreed_types.includes(type), `${type}: exact match is agreement`);
+    assert.equal(data[0].material, false,
+      `${type}: an exact shared strong identifier outranks a name and email change`);
+  }
+});
+
+utcIt('S3 — end to end: a case-distinct place id does not link, and contaminates nothing', async () => {
+  /* The reported reproduction. Before this change Salon B was filed under
+     Salon A, and Salon A ended up holding both names, both emails and both
+     spellings of the place id. */
+  const s = salonNames('s3');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  await holdIdentifier(salonA.businessId, 'gbp_place_id', 'Abcdef');
+
+  const submissionId = id();
+  const birId = id();
+  const base = serviceMixPayload({ submissionId, sessionId: id() });
+  created.submissionIds.push(submissionId);
+  created.idempotencyKeys.push(submissionId);
+
+  const { data, error } = await rpc('ingest_review', {
+    p_idempotency_key: submissionId,
+    p_request_hash: createHash('sha256').update(submissionId).digest('hex'),
+    p_payload: { ...base, contact: { ...base.contact, salonName: s.b, email: s.bEmail } },
+    p_signals: [signal('business_name', s.b), signal('email_exact', s.bEmail),
+                signal('gbp_place_id', 'abcdef')],
+    p_bir: serviceMixBir(), p_bir_id: birId, p_retention_days: 30,
+    p_meta: { correlationId: `s3-${RUN}` },
+    p_review_type: 'service_mix',
+    p_continuation_business_id: salonA.businessId
+  });
+
+  assert.equal(error, null, 'the visitor still gets a result');
+  assert.equal(data.continuationContradicted, true);
+  assert.equal(data.businessId, null, 'not filed under Salon A');
+  assert.equal(data.identityStatus, 'resolution_pending');
+  assert.equal(data.linkMethod, null);
+
+  /* No contamination: Salon A gained nothing at all. */
+  const held = (await rows('business_identifiers', 'business_id', salonA.businessId))
+    .filter(i => i.valid_to === null);
+  const values = held.map(i => i.normalized_value);
+  assert.equal(values.includes(s.b), false, 'business name');
+  assert.equal(values.includes(s.bEmail), false, 'email');
+  assert.equal(values.includes('abcdef'), false, 'the lower-case place id');
+  assert.ok(values.includes(s.a) && values.includes(s.aEmail) && values.includes('Abcdef'),
+    'and Salon A still holds exactly what it held');
+
+  /* Nor did a record get created for Salon B off the back of a vetoed proposal. */
+  const { data: anywhere } = await db.from('business_identifiers')
+    .select('business_id').eq('normalized_value', s.bEmail);
+  assert.deepEqual(anywhere || [], []);
+
+  const [submission] = await rows('assessment_submissions', 'submission_id', submissionId);
+  assert.equal(submission.business_id, null);
+  assert.equal(submission.identity_status, 'resolution_pending');
+
+  /* And the same submission WOULD have linked with the exact value — so the
+     only thing standing between it and a link is the case. */
+  const exact = await rpc('identity_proposal_conflict', {
+    p_signals: [signal('business_name', s.b), signal('email_exact', s.bEmail),
+                signal('gbp_place_id', 'Abcdef')],
+    p_business_id: salonA.businessId
+  });
+  assert.equal(exact.data[0].material, false);
+});
+
+utcIt('S4 — JavaScript and PostgreSQL agree on length at ASCII, BMP and astral boundaries', async () => {
+  const { createRequire } = await import('node:module');
+  const req = createRequire(import.meta.url);
+  const js = req('../../shared/business-record/resolve-identity.js');
+
+  const chars = [
+    ['ascii', 'a'],
+    ['bmp-latin', 'é'],
+    ['bmp-cjk', '中'],
+    ['astral-emoji', '\u{1f600}'],
+    ['astral-plane2', '\u{2000b}']
+  ];
+
+  for (const [label, ch] of chars) {
+    for (const count of [1, 255, 256, 257]) {
+      const value = ch.repeat(count);
+      const { rows: r } = await localEnv.pg.query(
+        'select public.identity_value_acceptable($1,$2) as ok, length($2) as len',
+        ['locality', value]);
+      assert.equal(r[0].ok, js.isAcceptableValue('locality', value),
+        `${label} x${count}: JavaScript and PostgreSQL disagree`);
+      assert.equal(Number(r[0].len), count,
+        `${label} x${count}: PostgreSQL counts code points`);
+      assert.equal(r[0].ok, count <= 256, `${label} x${count}`);
+    }
+  }
+
+  /* The specific value from the audit: 129 emoji, 258 UTF-16 code units. */
+  const emoji129 = '\u{1f600}'.repeat(129);
+  assert.equal(emoji129.length, 258, 'still 258 code units in JavaScript');
+  const { rows: r } = await localEnv.pg.query(
+    'select public.identity_value_acceptable($1,$2) as ok', ['locality', emoji129]);
+  assert.equal(r[0].ok, true);
+  assert.equal(js.isAcceptableValue('locality', emoji129), true,
+    'JavaScript refused this before; both now count code points');
+
+  /* Straddling the boundary with mixed widths. */
+  for (const [value, expected] of [[`${'a'.repeat(255)}\u{1f600}`, true],
+                                   [`${'a'.repeat(256)}\u{1f600}`, false]]) {
+    const { rows: m } = await localEnv.pg.query(
+      'select public.identity_value_acceptable($1,$2) as ok', ['locality', value]);
+    assert.equal(m[0].ok, expected);
+    assert.equal(js.isAcceptableValue('locality', value), expected);
+  }
+});
+
+utcIt('S5 — malformed evidence fails the whole comparison, it is not filtered', async () => {
+  const s = salonNames('s5');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+
+  const valid = [signal('business_name', s.b), signal('email_exact', s.bEmail)];
+  const malformed = [
+    ['a null entry',        null,                                    'not an object'],
+    ['a string entry',      'business_name',                         'not an object'],
+    ['a number entry',      42,                                      'not an object'],
+    ['an array entry',      [],                                      'not an object'],
+    ['a missing type',      { normalizedValue: 'x' },                'type is missing'],
+    ['a null type',         { type: null, normalizedValue: 'x' },    'type is missing'],
+    ['a non-string type',   { type: 7, normalizedValue: 'x' },       'type is missing'],
+    ['an unknown type',     { type: 'not_a_type', normalizedValue: 'x' },
+                                                                     'not a recognized identifier type'],
+    ['a missing value',     { type: 'business_name' },               'normalizedValue is missing'],
+    ['a null value',        { type: 'business_name', normalizedValue: null },
+                                                                     'normalizedValue is missing'],
+    ['a numeric value',     { type: 'business_name', normalizedValue: 42 },
+                                                                     'normalizedValue is missing'],
+    ['a boolean value',     { type: 'business_name', normalizedValue: true },
+                                                                     'normalizedValue is missing'],
+    ['an object value',     { type: 'business_name', normalizedValue: { v: 'x' } },
+                                                                     'normalizedValue is missing']
+  ];
+
+  for (const [label, entry, fragment] of malformed) {
+    /* Alone, and mixed in among valid evidence — the whole comparison fails
+       either way, rather than the readable part being compared. */
+    for (const [where, signals] of [['alone', [entry]],
+                                    ['after valid evidence', valid.concat([entry])],
+                                    ['before valid evidence', [entry].concat(valid)]]) {
+      const { data, error } = await rpc('identity_proposal_conflict', {
+        p_signals: signals, p_business_id: salonA.businessId
+      });
+      assert.equal(data, null, `${label}, ${where}`);
+      assert.ok(error, `${label}, ${where}: must refuse`);
+      assert.match(error.message, /identity_evidence_invalid/, `${label}, ${where}`);
+      assert.match(error.message, new RegExp(fragment), `${label}, ${where}`);
+      /* Never the value. */
+      assert.equal(/riverside|salon-b/i.test(error.message), false,
+        `${label}, ${where}: a value reached the message`);
+    }
+  }
+
+  /* The audit's [null] reproduction specifically: it used to be ignored and
+     answer material: false. */
+  const nullEntry = await rpc('identity_proposal_conflict', {
+    p_signals: [null], p_business_id: salonA.businessId });
+  assert.equal(nullEntry.data, null);
+  assert.match(nullEntry.error.message, /position 0 is invalid/);
+
+  /* Position is reported, 0-based, matching the JavaScript message. */
+  const second = await rpc('identity_proposal_conflict', {
+    p_signals: valid.concat([null]), p_business_id: salonA.businessId });
+  assert.match(second.error.message, /position 2 is invalid/);
+
+  /* And a non-array operand is refused as such, not as a jsonb error.
+
+     `'"business_name"'` rather than `'business_name'`: the driver hands a
+     JavaScript string to a jsonb parameter verbatim, so the bare word is
+     rejected by the JSON parser before the function is entered. That is the
+     driver's boundary, not this function's, and the JSON-encoded form is what
+     actually reaches it as a jsonb string. */
+  for (const notAnArray of [{ type: 'business_name' }, '"business_name"', 42, true]) {
+    const { data, error } = await rpc('identity_proposal_conflict', {
+      p_signals: notAnArray, p_business_id: salonA.businessId });
+    assert.equal(data, null, JSON.stringify(notAnArray));
+    assert.match(error.message, /submitted evidence must be an array/);
+  }
+
+  /* An explicitly empty list is still valid and still means "nothing here". */
+  const empty = await rpc('identity_proposal_conflict', {
+    p_signals: [], p_business_id: salonA.businessId });
+  assert.equal(empty.error, null);
+  assert.equal(empty.data[0].material, false);
+});
+
+utcIt('S6 — malformed evidence reaching ingest_review stores nothing', async () => {
+  const s = salonNames('s6');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+
+  const submissionId = id();
+  const birId = id();
+  const base = serviceMixPayload({ submissionId, sessionId: id() });
+  created.submissionIds.push(submissionId);
+  created.idempotencyKeys.push(submissionId);
+
+  const { data, error } = await rpc('ingest_review', {
+    p_idempotency_key: submissionId,
+    p_request_hash: createHash('sha256').update(submissionId).digest('hex'),
+    p_payload: { ...base, contact: { ...base.contact, salonName: s.b, email: s.bEmail } },
+    p_signals: [signal('business_name', s.b), signal('email_exact', s.bEmail), null],
+    p_bir: serviceMixBir(), p_bir_id: birId, p_retention_days: 30,
+    p_meta: { correlationId: `s6-${RUN}` },
+    p_review_type: 'service_mix',
+    p_continuation_business_id: salonA.businessId
+  });
+
+  assert.equal(data, null);
+  assert.ok(error);
+  assert.match(error.message, /identity_evidence_invalid/);
+  assert.deepEqual(await rows('assessment_submissions', 'submission_id', submissionId), []);
+  assert.deepEqual(await rows('business_intelligence_reports', 'bir_id', birId), []);
+});
+
+utcIt('S7 — the evidence-shape predicate agrees with the JavaScript, entry for entry', async () => {
+  const { createRequire } = await import('node:module');
+  const req = createRequire(import.meta.url);
+  const js = req('../../shared/business-record/resolve-identity.js');
+
+  /* One table, both implementations: does this entry pass the shape contract?
+     PostgreSQL returns a reason or null; the JavaScript throws or does not. */
+  const entries = [
+    [null, false], ['business_name', false], [42, false], [[], false], [true, false],
+    [{}, false], [{ type: 'business_name' }, false],
+    [{ type: null, normalizedValue: 'polished nail studio' }, false],
+    [{ type: 'not_a_type', normalizedValue: 'x' }, false],
+    [{ type: 'business_name', normalizedValue: null }, false],
+    [{ type: 'business_name', normalizedValue: 42 }, false],
+    [{ type: 'business_name', normalizedValue: 'polished nail studio' }, true],
+    [{ type: 'gbp_place_id', normalizedValue: 'Abcdef' }, true],
+    [{ type: 'email_exact', normalizedValue: 'owner@polished.test' }, true],
+    [{ type: 'vertical', normalizedValue: 'nails' }, true]
+  ];
+
+  for (const [entry, wellFormed] of entries) {
+    const { rows: r } = await localEnv.pg.query(
+      'select public.identity_evidence_fault($1::jsonb) as fault',
+      [JSON.stringify(entry)]);
+    assert.equal(r[0].fault === null, wellFormed, `SQL: ${JSON.stringify(entry)}`);
+
+    /* The JavaScript reaches the same verdict through the surface production
+       uses. A well-formed entry may still be refused by the VALUE contract,
+       which SQL enforces separately — so only the shape is compared here. */
+    let threw = false;
+    try {
+      js.proposalConflict({ signals: [entry], heldIdentifiers: [] });
+    } catch { threw = true; }
+    assert.equal(threw, !wellFormed, `JavaScript: ${JSON.stringify(entry)}`);
+  }
+});
+
+utcIt('S8 — P1-P18 and R1-R6 shapes still behave, after the fold was removed', async () => {
+  /* A direct re-run of the comparison primitive on the dense shapes, to show
+     that removing lower() changed nothing about values that were never
+     case-distinct — every one of them is already lower case by construction. */
+  const s = salonNames('s8');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+
+  const same = await rpc('identity_proposal_conflict', {
+    p_signals: [signal('business_name', s.a), signal('email_exact', s.aEmail)],
+    p_business_id: salonA.businessId });
+  assert.equal(same.error, null);
+  assert.equal(same.data[0].material, false, 'same business');
+
+  const different = await rpc('identity_proposal_conflict', {
+    p_signals: [signal('business_name', s.b), signal('email_exact', s.bEmail)],
+    p_business_id: salonA.businessId });
+  assert.equal(different.data[0].material, true, 'different business');
+
+  const rebrand = await rpc('identity_proposal_conflict', {
+    p_signals: [signal('business_name', `${s.a} and spa`), signal('email_exact', s.aEmail)],
+    p_business_id: salonA.businessId });
+  assert.equal(rebrand.data[0].material, false, 'rebrand');
+
+  /* Context types are still excluded on both sides. */
+  const context = await rpc('identity_proposal_conflict', {
+    p_signals: [signal('business_name', s.a), signal('email_exact', s.aEmail),
+                signal('vertical', 'nails'), signal('locality', 'greenville sc')],
+    p_business_id: salonA.businessId });
+  assert.equal(context.data[0].agreed_types.includes('vertical'), false);
+  assert.equal(context.data[0].contradicted_types.includes('locality'), false);
+
+  /* And the v12 value contract is untouched. */
+  const junk = await rpc('identity_proposal_conflict', {
+    p_signals: [signal('business_name', s.b), signal('email_exact', s.bEmail),
+                signal('gbp_place_id', 'x')],
+    p_business_id: salonA.businessId });
+  assert.equal(junk.data, null);
+  assert.match(junk.error.message, /identity_value_unacceptable/);
+});
+
+
+/* ---------- T. null is not an empty list, in PostgreSQL ----------
+
+   `identity_proposal_conflict` rejected a non-array only when `p_signals is
+   not null`, and then wrote `coalesce(p_signals, '[]'::jsonb)` into every
+   scan. So a null operand became a comparison with nothing on one side, and a
+   comparison with nothing on one side always answers "no contradiction" —
+   the answer that links.
+
+   Salon A holds its name and email. A payload describing Salon B — different
+   name, different email — arrives with `p_signals = null`, and linked to
+   Salon A at confidence 1 through the session proposal and through the
+   continuation proposal alike. Neither was reported as contradicted, no
+   identity-resolution case was opened, and the submission and BIR were stored
+   under Salon A permanently.
+
+   The JavaScript has drawn the null/empty distinction since v11. This section
+   asks PostgreSQL the same four questions the fake database and the shared
+   rule are asked in tests/identity-proposals.test.mjs, and compares the
+   answers rather than only the successful paths. */
+
+const conflictWith = (signals, businessId) =>
+  rpc('identity_proposal_conflict', { p_signals: signals, p_business_id: businessId });
+
+utcIt('T1 — the primitive refuses null signals and keeps explicit empty legal', async () => {
+  const s = salonNames('t1');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+
+  /* Null: refused, with the 22023 invalid-input contract. */
+  const nulled = await conflictWith(null, salonA.businessId);
+  assert.equal(nulled.data, null, 'null must not be compared');
+  assert.ok(nulled.error);
+  assert.match(nulled.error.message, /identity_evidence_invalid/);
+  assert.match(nulled.error.message, /submitted evidence is required/);
+
+  /* A jsonb null scalar arrives by a different route and is refused too. */
+  const jsonNull = await localEnv.pg.query(
+    "select * from public.identity_proposal_conflict('null'::jsonb, $1)", [salonA.businessId])
+    .then(() => null, err => err);
+  assert.ok(jsonNull, 'a jsonb null scalar must be refused as well');
+  assert.match(jsonNull.message, /must be an array/);
+
+  /* Explicit empty: legal, and means what it says. */
+  const empty = await conflictWith([], salonA.businessId);
+  assert.equal(empty.error, null);
+  assert.deepEqual(empty.data[0].agreed_types, []);
+  assert.deepEqual(empty.data[0].contradicted_types, []);
+  assert.equal(empty.data[0].material, false);
+
+  /* Dense evidence for another business is still a material contradiction. */
+  const dense = await conflictWith(
+    [signal('business_name', s.b), signal('email_exact', s.bEmail)], salonA.businessId);
+  assert.equal(dense.error, null);
+  assert.equal(dense.data[0].material, true);
+
+  /* No identifier value reaches any message. */
+  [s.a, s.b, s.aEmail, s.bEmail].forEach(v =>
+    assert.equal(nulled.error.message.includes(v), false, `the message carried ${v}`));
+});
+
+/* One proposal at a time, so each kind is proven on its own. */
+const mixWithSignals = async ({ signals, sessionId, continuationBusinessId = null }) => {
+  const s = salonNames('t-b');
+  const submissionId = id();
+  const birId = id();
+  const base = serviceMixPayload({ submissionId, sessionId });
+  created.submissionIds.push(submissionId);
+  created.idempotencyKeys.push(submissionId);
+
+  const { data, error } = await rpc('ingest_review', {
+    p_idempotency_key: submissionId,
+    p_request_hash: createHash('sha256').update(submissionId).digest('hex'),
+    p_payload: { ...base, contact: { ...base.contact, salonName: s.b, email: s.bEmail } },
+    p_signals: signals,
+    p_bir: serviceMixBir(), p_bir_id: birId, p_retention_days: 30,
+    p_meta: { correlationId: `t-${RUN}` },
+    p_review_type: 'service_mix',
+    p_continuation_business_id: continuationBusinessId
+  });
+  return { data, error, submissionId, birId, names: s };
+};
+
+/* A session that already points at Salon A — the session proposal. The
+   seeding review must describe Salon A itself, or its own continuation
+   proposal is contradicted and no session link is established to test. */
+const sessionOn = async (businessId, s) => {
+  const sessionId = id();
+  const submissionId = id();
+  const birId = id();
+  created.submissionIds.push(submissionId);
+  created.idempotencyKeys.push(submissionId);
+  const base = serviceMixPayload({ submissionId, sessionId });
+  const { data, error } = await rpc('ingest_review', {
+    p_idempotency_key: submissionId,
+    p_request_hash: createHash('sha256').update(submissionId).digest('hex'),
+    p_payload: { ...base, contact: { ...base.contact, salonName: s.a, email: s.aEmail } },
+    p_signals: [signal('business_name', s.a), signal('email_exact', s.aEmail)],
+    p_bir: serviceMixBir(), p_bir_id: birId, p_retention_days: 30,
+    p_meta: { correlationId: `t-seed-${RUN}` },
+    p_review_type: 'service_mix',
+    p_continuation_business_id: businessId
+  });
+  assert.equal(error, null, 'the seeding review must link, or the rest proves nothing');
+  assert.equal(data.businessId, businessId);
+  return sessionId;
+};
+
+utcIt('T2 — null signals cannot link through a session proposal, and store nothing', async () => {
+  const s = salonNames('t2');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const sessionId = await sessionOn(salonA.businessId, s);
+
+  const before = {
+    submissions: (await rows('assessment_submissions', 'business_id', salonA.businessId)).length,
+    reports: (await rows('business_intelligence_reports', 'business_id', salonA.businessId)).length,
+    identifiers: (await rows('business_identifiers', 'business_id', salonA.businessId)).length,
+    timeline: (await rows('timeline_events', 'business_id', salonA.businessId)).length,
+    audit: (await rows('audit_events', 'business_id', salonA.businessId)).length,
+    states: await rows('business_review_states', 'business_id', salonA.businessId),
+    record: (await rows('business_records', 'business_id', salonA.businessId))[0],
+    session: (await rows('assessment_sessions', 'assessment_session_id', sessionId))[0]
+  };
+
+  const attempt = await mixWithSignals({ signals: null, sessionId });
+
+  assert.equal(attempt.data, null, 'null signals must not produce a decision');
+  assert.ok(attempt.error);
+  assert.match(attempt.error.message, /identity_evidence_invalid/);
+
+  /* THE WHOLE TRANSACTION IS GONE. One atomic function, one transaction. */
+  assert.deepEqual(await rows('assessment_submissions', 'submission_id', attempt.submissionId), []);
+  assert.deepEqual(await rows('business_intelligence_reports', 'bir_id', attempt.birId), []);
+  assert.deepEqual(await rows('idempotency_records', 'idempotency_key', attempt.submissionId), []);
+
+  const after = {
+    submissions: (await rows('assessment_submissions', 'business_id', salonA.businessId)).length,
+    reports: (await rows('business_intelligence_reports', 'business_id', salonA.businessId)).length,
+    identifiers: (await rows('business_identifiers', 'business_id', salonA.businessId)).length,
+    timeline: (await rows('timeline_events', 'business_id', salonA.businessId)).length,
+    audit: (await rows('audit_events', 'business_id', salonA.businessId)).length,
+    states: await rows('business_review_states', 'business_id', salonA.businessId),
+    record: (await rows('business_records', 'business_id', salonA.businessId))[0],
+    session: (await rows('assessment_sessions', 'assessment_session_id', sessionId))[0]
+  };
+
+  assert.equal(after.submissions, before.submissions, 'submission count under Salon A');
+  assert.equal(after.reports, before.reports, 'report count under Salon A');
+  assert.equal(after.identifiers, before.identifiers, 'identifier count under Salon A');
+  assert.equal(after.timeline, before.timeline, 'timeline events');
+  assert.equal(after.audit, before.audit, 'audit events');
+  assert.deepEqual(after.states, before.states, 'review-state pointers');
+  assert.equal(after.record.current_bir_id, before.record.current_bir_id, 'current BIR pointer');
+  assert.equal(after.session.business_id, before.session.business_id, 'session row');
+
+  /* And Salon B reached nothing, anywhere. */
+  const { data: anywhere } = await db.from('business_identifiers')
+    .select('business_id').eq('normalized_value', attempt.names.bEmail);
+  assert.deepEqual(anywhere || [], []);
+});
+
+utcIt('T3 — null signals cannot link through a continuation proposal either', async () => {
+  const s = salonNames('t3');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+
+  const attempt = await mixWithSignals({
+    signals: null, sessionId: id(), continuationBusinessId: salonA.businessId });
+
+  assert.equal(attempt.data, null);
+  assert.ok(attempt.error);
+  assert.match(attempt.error.message, /identity_evidence_invalid/);
+
+  assert.deepEqual(await rows('assessment_submissions', 'submission_id', attempt.submissionId), []);
+  assert.deepEqual(await rows('business_intelligence_reports', 'bir_id', attempt.birId), []);
+  assert.deepEqual(await rows('idempotency_records', 'idempotency_key', attempt.submissionId), []);
+
+  const held = (await rows('business_identifiers', 'business_id', salonA.businessId))
+    .filter(i => i.valid_to === null).map(i => i.normalized_value);
+  assert.equal(held.includes(attempt.names.b), false);
+  assert.equal(held.includes(attempt.names.bEmail), false);
+  assert.ok(held.includes(s.a) && held.includes(s.aEmail), 'Salon A is untouched');
+
+  /* No case was opened either — the submission never happened. */
+  const cases = await rows('identity_resolution_cases',
+    'assessment_submission_id', attempt.submissionId);
+  assert.deepEqual(cases, []);
+});
+
+utcIt('T4 — explicit empty signals stay legal for both proposal kinds', async () => {
+  /* "There is genuinely nothing to compare" is not a contradiction, and the
+     approved rule is that it links. Unchanged. */
+  const sa = salonNames('t4a');
+  const salonA = await establishBusiness(sa.a, sa.aEmail);
+  const sessionId = await sessionOn(salonA.businessId, sa);
+
+  const viaSession = await mixWithSignals({ signals: [], sessionId });
+  assert.equal(viaSession.error, null);
+  assert.equal(viaSession.data.businessId, salonA.businessId);
+  assert.equal(viaSession.data.linkMethod, 'session');
+
+  const sb = salonNames('t4b');
+  const salonB = await establishBusiness(sb.a, sb.aEmail);
+  const viaContinuation = await mixWithSignals({
+    signals: [], sessionId: id(), continuationBusinessId: salonB.businessId });
+  assert.equal(viaContinuation.error, null);
+  assert.equal(viaContinuation.data.businessId, salonB.businessId);
+  assert.equal(viaContinuation.data.linkMethod, 'continuation_context');
+});
+
+utcIt('T5 — dense contradicting signals still go to review, for both kinds', async () => {
+  const sa = salonNames('t5a');
+  const salonA = await establishBusiness(sa.a, sa.aEmail);
+  const sessionId = await sessionOn(salonA.businessId, sa);
+
+  const dense = names => [signal('business_name', names.b), signal('email_exact', names.bEmail)];
+
+  /* The session path. The names the payload carries are the ones the signals
+     describe, so the comparison is against a genuinely different business. */
+  const submissionId = id();
+  const birId = id();
+  const names = salonNames('t5-b');
+  created.submissionIds.push(submissionId);
+  created.idempotencyKeys.push(submissionId);
+  const base = serviceMixPayload({ submissionId, sessionId });
+  const viaSession = await rpc('ingest_review', {
+    p_idempotency_key: submissionId,
+    p_request_hash: createHash('sha256').update(submissionId).digest('hex'),
+    p_payload: { ...base, contact: { ...base.contact, salonName: names.b, email: names.bEmail } },
+    p_signals: dense(names),
+    p_bir: serviceMixBir(), p_bir_id: birId, p_retention_days: 30,
+    p_meta: { correlationId: `t5-${RUN}` },
+    p_review_type: 'service_mix', p_continuation_business_id: null
+  });
+  assert.equal(viaSession.error, null, 'the visitor still gets a result');
+  assert.equal(viaSession.data.sessionContradicted, true);
+  assert.equal(viaSession.data.businessId, null);
+  assert.equal(viaSession.data.identityStatus, 'resolution_pending');
+
+  /* The continuation path. */
+  const sb = salonNames('t5b');
+  const salonB = await establishBusiness(sb.a, sb.aEmail);
+  const submissionId2 = id();
+  const birId2 = id();
+  const names2 = salonNames('t5-c');
+  created.submissionIds.push(submissionId2);
+  created.idempotencyKeys.push(submissionId2);
+  const base2 = serviceMixPayload({ submissionId: submissionId2, sessionId: id() });
+  const viaContinuation = await rpc('ingest_review', {
+    p_idempotency_key: submissionId2,
+    p_request_hash: createHash('sha256').update(submissionId2).digest('hex'),
+    p_payload: { ...base2,
+      contact: { ...base2.contact, salonName: names2.b, email: names2.bEmail } },
+    p_signals: dense(names2),
+    p_bir: serviceMixBir(), p_bir_id: birId2, p_retention_days: 30,
+    p_meta: { correlationId: `t5c-${RUN}` },
+    p_review_type: 'service_mix', p_continuation_business_id: salonB.businessId
+  });
+  assert.equal(viaContinuation.error, null);
+  assert.equal(viaContinuation.data.continuationContradicted, true);
+  assert.equal(viaContinuation.data.businessId, null);
+});
+
+utcIt('T6 — candidate-only ingestion with no proposal is unchanged', async () => {
+  /* ingest_review calls the primitive only when a proposal exists, so this
+     path never reaches it. All three signal shapes behave identically, and
+     identically to before the repair. */
+  const outcomes = [];
+  for (const signals of [null, []]) {
+    const submissionId = id();
+    const birId = id();
+    const names = salonNames(`t6-${signals === null ? 'null' : 'empty'}`);
+    created.submissionIds.push(submissionId);
+    created.idempotencyKeys.push(submissionId);
+    const base = serviceMixPayload({ submissionId, sessionId: id() });
+
+    const { data, error } = await rpc('ingest_review', {
+      p_idempotency_key: submissionId,
+      p_request_hash: createHash('sha256').update(submissionId).digest('hex'),
+      p_payload: { ...base,
+        contact: { ...base.contact, salonName: names.b, email: names.bEmail } },
+      p_signals: signals,
+      p_bir: serviceMixBir(), p_bir_id: birId, p_retention_days: 30,
+      p_meta: { correlationId: `t6-${RUN}` },
+      p_review_type: 'service_mix', p_continuation_business_id: null
+    });
+
+    assert.equal(error, null, `signals=${signals === null ? 'null' : '[]'}`);
+    if (data.businessId) created.businessIds.push(data.businessId);
+    outcomes.push({ linked: data.businessId !== null, status: data.identityStatus,
+                    linkMethod: data.linkMethod });
+  }
+  assert.deepEqual(outcomes[1], outcomes[0],
+    'null and explicit empty must answer identically where no proposal exists');
+});
+
+utcIt('T7 — PostgreSQL answers the four signal shapes exactly as the shared rule does', async () => {
+  /* The property, asked of both implementations rather than only of their
+     successful paths. The JavaScript and fake-database halves are in
+     tests/identity-proposals.test.mjs; the expectations are the same table. */
+  const { createRequire } = await import('node:module');
+  const req = createRequire(import.meta.url);
+  const js = req('../../shared/business-record/resolve-identity.js');
+
+  /* Names built THROUGH the shared normalizers, so both sides are canonical.
+     `salonNames` produces "riverside barber co …", and normalizeName strips
+     "co" as a legal suffix — that would make the submitted value non-canonical
+     and the JavaScript would refuse it for a reason this test is not about.
+     The canonicality gap between the two implementations is a separate,
+     documented one that R5 covers. */
+  const aName = js.normalizeName(`polished nail studio t7 ${RUN}`);
+  const bName = js.normalizeName(`riverside barbershop t7 ${RUN}`);
+  const aEmail = js.normalizeEmail(email('t7-a'));
+  const bEmail = js.normalizeEmail(email('t7-b'));
+  assert.ok(aName && bName && aEmail && bEmail && aName !== bName);
+
+  const salonA = await establishBusiness(aName, aEmail);
+  const held = [{ type: 'business_name', normalizedValue: aName },
+                { type: 'email_exact', normalizedValue: aEmail }];
+
+  const shapes = [
+    ['omitted', undefined],
+    ['null', null],
+    ['explicitly empty', []],
+    ['dense', [signal('business_name', bName), signal('email_exact', bEmail)]]
+  ];
+
+  for (const [name, signals] of shapes) {
+    /* The shared rule. */
+    let ruleRefused = false;
+    let ruleMaterial = null;
+    try {
+      ruleMaterial = js.proposalConflict({
+        signals: signals === undefined ? undefined
+          : signals.map(x => ({ type: x.type, normalizedValue: x.normalizedValue })),
+        heldIdentifiers: held
+      }).material;
+    } catch { ruleRefused = true; }
+
+    /* PostgreSQL. An omitted jsonb argument arrives as null, which is the
+       point: the two are indistinguishable on the wire, so both are refused. */
+    const { data, error } = await rpc('identity_proposal_conflict', {
+      p_signals: signals === undefined ? null : signals,
+      p_business_id: salonA.businessId
+    });
+    const pgRefused = error !== null;
+
+    assert.equal(pgRefused, ruleRefused,
+      `${name}: PostgreSQL and the shared rule disagree about refusal`);
+    if (!ruleRefused) {
+      assert.equal(data[0].material, ruleMaterial,
+        `${name}: PostgreSQL and the shared rule disagree about the verdict`);
+    }
+  }
+});
+
+utcIt('T8 — P, R and S regressions are unaffected by the null refusal', async () => {
+  const s = salonNames('t8');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+
+  const same = await conflictWith(
+    [signal('business_name', s.a), signal('email_exact', s.aEmail)], salonA.businessId);
+  assert.equal(same.data[0].material, false, 'same business');
+
+  const rebrand = await conflictWith(
+    [signal('business_name', `${s.a} and spa`), signal('email_exact', s.aEmail)],
+    salonA.businessId);
+  assert.equal(rebrand.data[0].material, false, 'rebrand only');
+
+  const contactOnly = await conflictWith(
+    [signal('business_name', s.a), signal('email_exact', s.bEmail)], salonA.businessId);
+  assert.equal(contactOnly.data[0].material, false, 'contact change only');
+
+  const different = await conflictWith(
+    [signal('business_name', s.b), signal('email_exact', s.bEmail)], salonA.businessId);
+  assert.equal(different.data[0].material, true, 'different business');
+
+  /* An exact strong identifier is still continuity; a case-distinct one is
+     still a contradiction; junk is still refused by the value contract. */
+  const place = 'ChIJrTLr-GyuEmsRBfy61i59si0';
+  await db.from('business_identifiers').insert({
+    business_id: salonA.businessId, identifier_type: 'gbp_place_id',
+    normalized_value: place, raw_value: place, source: 'seed',
+    confidence: 0.95, verified: false, verification_method: 'none'
+  });
+  const exact = await conflictWith(
+    [signal('business_name', s.b), signal('email_exact', s.bEmail), signal('gbp_place_id', place)],
+    salonA.businessId);
+  assert.equal(exact.data[0].material, false, 'exact strong identifier is continuity');
+
+  const cased = await conflictWith(
+    [signal('business_name', s.b), signal('email_exact', s.bEmail),
+     signal('gbp_place_id', place.toLowerCase())],
+    salonA.businessId);
+  assert.equal(cased.data[0].material, true, 'case-distinct strong identifier is a contradiction');
+
+  const junk = await conflictWith(
+    [signal('business_name', s.b), signal('gbp_place_id', 'x')], salonA.businessId);
+  assert.equal(junk.data, null);
+  assert.match(junk.error.message, /identity_value_unacceptable/);
+
+  const malformed = await conflictWith([null], salonA.businessId);
+  assert.equal(malformed.data, null);
+  assert.match(malformed.error.message, /position 0 is invalid/);
 });
 
 /* ---------- L. cleanup ---------- */

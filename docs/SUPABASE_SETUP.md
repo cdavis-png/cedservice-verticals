@@ -77,9 +77,19 @@ PostgREST call will be ambiguous.
 
 ### Smoke test the function
 
-**The SQL has never been executed.** This is the largest single risk in the
-milestone. Do not stop at the happy path — the full sequence, including the
-constraint-violation cases the in-memory test double cannot prove, is in
+*Historical, superseded:* this section once read "the SQL has never been
+executed", which was true when it was written and is not now.
+
+**Current status.** Migrations 0001–0005 have been executed against Supabase
+PostgreSQL 17.6.1.155; migration 0006 has been executed against a disposable
+local PostgreSQL 18.3 through PGlite and **not** against PostgreSQL 17,
+hosted Supabase, or PostgREST. See
+[REAL_POSTGRES_VALIDATION.md](REAL_POSTGRES_VALIDATION.md), which is the one
+place this is stated.
+
+Executing the SQL is still not the same as smoke-testing this project. Do not
+stop at the happy path — the full sequence, including the constraint-violation
+cases the in-memory test double cannot prove, is in
 [PRODUCTION_HARDENING.md §11](PRODUCTION_HARDENING.md#real-postgres-test-plan).
 
 At minimum, before any traffic:

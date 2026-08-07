@@ -1,11 +1,74 @@
 # Integration tests — real Postgres
 
-These run against an **actual Supabase development database**, over the same
-PostgREST path the Vercel Function uses. The unit suite proves the contract;
-this proves the SQL.
+These run against real PostgreSQL. The unit suite proves the contract; this
+proves the SQL.
 
-They are **not** part of `npm test`. They require credentials, they write
-permanent rows, and there is no undo.
+There are **two modes**, and they are separate rather than one relaxed into
+the other:
+
+| | Local | Hosted |
+|---|---|---|
+| Where | A disposable PostgreSQL created inside the test process | An actual Supabase development project |
+| Transport | SQL, directly | PostgREST, the same path the Vercel Function uses |
+| Credentials | None. There is no host, no port and no socket. | Service-role key required |
+| Rows | Vanish when the process exits | **Permanent. There is no undo.** |
+| Command | `npm run test:integration:local` | `npm run test:integration` |
+
+A shell that sets both is **refused**: a run that could go either way is a run
+nobody can reason about afterwards.
+
+Neither mode is part of `npm test`.
+
+---
+
+## Local mode
+
+```bash
+npm install                              # @electric-sql/pglite is a devDependency
+
+export CED_ALLOW_INTEGRATION_TESTS=true
+export CED_LOCAL_PG=true
+# and SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY must NOT be set
+
+npm run test:integration:local
+```
+
+PowerShell: `$env:CED_LOCAL_PG = 'true'`.
+
+**What it is.** [PGlite](https://pglite.dev) is the PostgreSQL server source
+compiled to WebAssembly. The planner, plpgsql, the constraint machinery and the
+triggers are the real ones. `tests/helpers/local-pg.mjs` creates a cluster,
+creates the roles a Supabase project already has (`anon`, `authenticated`,
+`service_role` with `BYPASSRLS`), applies the migration chain in order, and
+presents the slice of the supabase-js surface this suite uses.
+
+**What it is not.**
+
+- **Not PostgREST.** It speaks SQL directly. Argument binding, function
+  overload resolution over HTTP, and JSON serialisation of a large payload are
+  the hosted path's job to prove.
+- **Not the same PostgreSQL version.** PGlite here is **18.3**; the hosted
+  development project is **17.6.1.155**. A behaviour that differs between the
+  two majors would not be caught.
+- **Not pgcrypto.** The extension is unavailable, and migration 0001's
+  `create extension` is tolerated. Nothing in the chain uses a function only
+  pgcrypto provides — `gen_random_uuid()` has been core since PostgreSQL 13
+  and `sha256()` since 11 — and `assertNoPgcryptoDependency()` checks that
+  rather than assuming it.
+
+**Memory.** A PGlite cluster costs roughly half a gigabyte resident, and it
+does not return that memory when the cluster is closed. On a machine with
+little headroom, V8 fails with `Fatal process out of memory: Zone` before the
+suite finishes. `tests/migration/run.mjs` is what makes it reliable: one
+process per test file, with `--max-old-space-size` passed through
+`NODE_OPTIONS` so it actually reaches the child. `npm run test:integration:local`
+uses it.
+
+---
+
+## Hosted mode
+
+Everything below concerns the hosted path.
 
 ---
 
@@ -95,6 +158,7 @@ npm run test:all                 # unit, then integration
 
 | Area | Tests |
 |---|---|
+| **Migration 0006 — review types and Service Mix (section O)** | **14** |
 | Schema, signature resolution, permissions | 2 |
 | First submission, replay, idempotency conflict | 3 |
 | Session linking and the BIR supersession chain | 1 |
@@ -117,8 +181,24 @@ prove the triggers fire and nothing about what they fire on.
 > **Section M has not yet run over PostgREST.** Its SQL was validated against
 > `ced-cip-dev` through the Supabase management API on 2026-08-05 — same
 > database, same functions, same triggers, same artifacts — because no
-> service-role key was available in that shell. See
+> service-role key was available in that shell. It **has** now run against
+> real PostgreSQL in local mode. See
 > [docs/REAL_POSTGRES_VALIDATION.md §0 and §7](../../docs/REAL_POSTGRES_VALIDATION.md).
+
+> **Sections M, N and O first executed on 2026-08-05, in local mode**, which
+> is also the first time this suite had ever been run end to end. That run
+> found three defects: one in migration 0006 (the analytics envelope version
+> constraint was never widened) and two in this suite (two tests sharing one
+> idempotency key, and one aggregate assertion counting the whole section
+> rather than its own group). All three are fixed.
+
+## The migration chain
+
+`npm run test:migration` is a separate suite covering migration 0006 as a
+migration rather than as a set of functions: a clean installation of the whole
+chain, and an upgrade applied on top of a **populated pre-0006 database** with
+representative Growth Review history. It always runs locally and never touches
+anything hosted.
 
 ---
 

@@ -21,6 +21,11 @@ mean all three and they carry very different obligations.
 | **Product** | First-party, pseudonymous observation of our own product, to find where people get stuck. Never shared, never sold, never joined to an advertising identifier. | **Yes — this is the whole milestone.** 18 of the 19 events. |
 | **Marketing** | Attributing a visitor to a campaign in order to *target* them, or sending anything to an advertising platform. | **No. Not built, and no third-party SDK is loaded anywhere.** |
 
+Every event carries a `reviewType` — `growth_review` or `service_mix` — so the
+two funnels are separable. The classification above applies identically to
+both: a second review type widened what is measured, and widened nothing about
+what may be carried.
+
 The campaign fields analytics carries (`utm_source` and friends) are **product**
 data here: they answer "does the QR card convert better than the one-pager?"
 for our own reporting. They are not passed to any ad platform, and there is no
@@ -61,6 +66,32 @@ They live in the Business Record under its consent and retention rules.
 Copying them into a funnel would create a second, weaker copy of the sales
 intelligence with a different lifetime and no owner. If a question needs those
 answers, it is a Business Record question, not an analytics one.
+
+### The Quick Service Mix Review's commercial figures
+
+Added with SM-1, and excluded for the same reason. What a business charges,
+how long it takes, how many it sells, and what that earns are the entire
+substance of the review:
+
+| Excluded | Why |
+|---|---|
+| Offering names | "Bridal party gel set" names what a salon does and, with a vertical and a locality, starts to name the salon. |
+| `offeringId`, `offeringSnapshotId`, `replacesOfferingId` | Opaque, but the offering id is **stable across submissions by design** — which makes it a join key between a funnel and a Business Record. The absence of any such key is what keeps the two apart. |
+| Selling price, direct cost | Commercially sensitive, and the basis of everything the review concludes. |
+| Monthly volume, appointment duration, capacity hours | The same fact in a different unit. |
+| Monthly revenue, revenue per hour, shares of either | Derived from all of the above, and no less sensitive for being derived. |
+
+What analytics **is** told about an offering, and all it is told:
+`offeringSource` (starter or custom) and `offeringCountBand` — a band, not a
+count, because two to five is a small range and an exact count plus a vertical
+plus a timestamp starts to identify a session.
+
+Enforcement is both tokenised and named outright. `offering` cannot be a
+prohibited **token**: `offeringCountBand` and `offeringSource` are exactly what
+analytics is permitted to know, and prohibiting the word would refuse them
+along with the identifiers. So the identifiers are named, and the commercial
+words — `price`, `cost`, `revenue`, `volume`, `duration`, `hours`, `minutes`,
+`margin`, `contribution`, `ticket`, `earnings` — are tokens.
 
 ---
 

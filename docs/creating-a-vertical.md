@@ -25,11 +25,14 @@ family is mostly copy work. A new *family* needs its own assessment design.
 > vertical supplies markup, copy, and an `assessment.config.js`; it writes no
 > assessment JavaScript of its own.
 >
-> Lead capture is built, shared, and hardened, but **not connected**: no
-> Supabase project exists, the migrations have never been executed, and no
-> challenge provider has been chosen. Over `file://` the endpoint resolves to
-> `null` and assessments are logged locally; over http(s) it posts to
-> `/api/assessments`.
+> Lead capture is built, shared, and hardened, but **not connected to
+> production**. Migrations 0001–0005 have been executed against a hosted
+> development PostgreSQL 17 project; migration 0006 has been executed only
+> against a disposable local PostgreSQL 18.3 through PGlite, and never against
+> PostgreSQL 17, hosted Supabase, or PostgREST. No production project is
+> configured and no challenge provider has been chosen. Over `file://` the
+> endpoint resolves to `null` and assessments are logged locally; over http(s)
+> it posts to `/api/assessments`.
 >
 > **No vertical can take public traffic yet.** See
 > [PRODUCTION_HARDENING.md §14](PRODUCTION_HARDENING.md#14-remaining-launch-blockers)
@@ -44,12 +47,25 @@ A vertical lives under `verticals/<family>/<industry>/`:
 ```
 verticals/<family>/<industry>/
 ├── README.md                    what this vertical is, status, live URL
-├── assessment.config.js         questions, weights, packages, copy
-└── site/
-    ├── index.html               landing page + assessment markup
-    ├── styles.css               vertical-specific styles only
-    └── README.md                local preview + launch notes
+├── assessment.config.js         Growth Review: questions, weights, packages, copy
+├── site/
+│   ├── index.html               landing page + assessment markup
+│   ├── styles.css               vertical-specific styles only
+│   └── README.md                local preview + launch notes
+└── service-mix/                 OPTIONAL — the Quick Service Mix Review
+    ├── README.md
+    ├── service-mix.config.js    starters, question wording, results copy
+    └── site/
+        ├── index.html
+        ├── page.js              DOM wiring only
+        └── styles.css
 ```
+
+A vertical may ship the Growth Review alone. `service-mix/` is a **second
+review type**, not a second page of the first one: it has its own config, its
+own storage key, its own analytics review type, and its own report. See
+[SERVICE_MIX_REVIEW.md](SERVICE_MIX_REVIEW.md) before adding one, and copy the
+nail-salon folder's *structure*, never its copy.
 
 The matching sales material lives in a parallel tree — the folder shape mirrors
 `verticals/` so the two stay findable together:

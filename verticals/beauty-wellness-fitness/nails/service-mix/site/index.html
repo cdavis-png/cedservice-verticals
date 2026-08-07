@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="A free Quick Service Mix Review for nail salons — see where your revenue and your hours actually go." />
+  <title>Quick Service Mix Review | CED Service</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="#top" aria-label="CED Service home">
+      <span class="brand-copy"><strong>CED</strong><span>SERVICE</span></span>
+    </a>
+  </header>
+
+  <main id="top" class="shell">
+
+    <!-- ============================================================
+         Intro
+         ============================================================ -->
+    <section class="intro" aria-labelledby="intro-heading">
+      <p class="eyebrow">FIND OUT WHERE THE HOURS GO</p>
+      <h1 id="intro-heading">See what each service actually earns you.</h1>
+      <p class="lead">
+        Enter two to five of the things you sell. We work out what each one brings in,
+        how much of your week it takes up, and what an hour of it earns compared with
+        the rest. It takes about eight minutes.
+      </p>
+      <p class="note">
+        This is a diagnostic tool, not a promise of results. It does not ask what your
+        products cost, so it cannot and does not tell you what anything is making you
+        in profit.
+      </p>
+      <button type="button" class="btn btn-primary" data-action="start"
+              data-analytics-event="service_mix.review_started">
+        Start the review
+      </button>
+      <p class="note" data-resume-note hidden>
+        You have a review saved on this device. Starting will pick up where you left off.
+      </p>
+    </section>
+
+    <!-- ============================================================
+         Step 1 — the offerings
+         ============================================================ -->
+    <section class="step" data-step="1" data-step-id="offerings" hidden
+             aria-labelledby="offerings-heading">
+      <p class="eyebrow">STEP 1 OF 3</p>
+      <h2 id="offerings-heading">What do you want to look at?</h2>
+      <p class="lead">
+        Pick from the list or add your own. Three is the sweet spot — enough to compare,
+        few enough to finish. You need at least two and can review up to five.
+      </p>
+
+      <fieldset class="starters">
+        <legend>Common nail-salon services</legend>
+        <p class="note">
+          Nothing here is assumed. Pick only what you actually offer.
+        </p>
+        <div class="starter-grid" data-starter-grid role="group"
+             aria-label="Starter offerings"></div>
+      </fieldset>
+
+      <div class="custom-add">
+        <label for="custom-offering-name">Something not on the list?</label>
+        <div class="custom-row">
+          <input type="text" id="custom-offering-name" name="customOfferingName"
+                 maxlength="80" autocomplete="off"
+                 placeholder="What do you call it?" />
+          <button type="button" class="btn btn-secondary" data-action="add-custom">
+            Add it
+          </button>
+        </div>
+      </div>
+
+      <div class="selected" role="region" aria-live="polite"
+           aria-label="Offerings you are reviewing">
+        <h3>Reviewing <span data-offering-count>0</span> of 5</h3>
+        <ul class="offering-list" data-offering-list></ul>
+        <p class="error" data-offering-error role="alert" hidden></p>
+      </div>
+
+      <div class="step-actions">
+        <button type="button" class="btn btn-primary" data-action="to-details">
+          Next
+        </button>
+      </div>
+    </section>
+
+    <!-- ============================================================
+         Step 2 — the figures
+         ============================================================ -->
+    <section class="step" data-step="2" data-step-id="figures" hidden
+             aria-labelledby="figures-heading">
+      <p class="eyebrow">STEP 2 OF 3</p>
+      <h2 id="figures-heading">Now the numbers.</h2>
+      <p class="lead">
+        For each one: what you charge, how long the appointment runs, and roughly how
+        many you do in a month.
+      </p>
+      <p class="note">
+        <strong>"I do not know" is a real answer.</strong> Say so and we will leave that
+        offering out of the part of the analysis it affects, rather than filling in a
+        number you did not give us.
+      </p>
+
+      <div data-figures-container></div>
+
+      <fieldset class="coverage">
+        <legend id="coverage-legend">Do these cover everything you offer?</legend>
+        <p class="note">
+          This decides whether the shares below describe your business or just the part
+          of it you entered.
+        </p>
+        <div class="radio-group" role="radiogroup" aria-labelledby="coverage-legend"
+             data-coverage-group></div>
+        <p class="error" data-coverage-error role="alert" hidden></p>
+      </fieldset>
+
+      <div class="step-actions">
+        <button type="button" class="btn btn-secondary" data-action="back-to-offerings">
+          Back
+        </button>
+        <button type="button" class="btn btn-primary" data-action="to-contact">
+          Next
+        </button>
+      </div>
+    </section>
+
+    <!-- ============================================================
+         Step 3 — where to send it
+         ============================================================ -->
+    <section class="step" data-step="3" data-step-id="contact" hidden
+             aria-labelledby="contact-heading">
+      <p class="eyebrow">STEP 3 OF 3</p>
+      <h2 id="contact-heading">Where should we send it?</h2>
+
+      <!-- Shown only when a connected review filled these in. -->
+      <p class="note" data-prefill-note hidden></p>
+
+      <!-- The visitor's own way of saying the review they are continuing from
+           belongs to somebody else: a friend borrowed the laptop, an owner is
+           reviewing a second location, a consultant is working through two
+           clients. Clearing here is what gets them a clean result instead of
+           a queued review; the server refuses a contradicted context either
+           way. Hidden unless something was actually prefilled. -->
+      <button type="button" class="link-button" data-action="not-my-business"
+              data-analytics-event="service_mix.continuation_rejected" hidden>
+        This is not my business — start fresh
+      </button>
+
+      <form class="contact-form" data-contact-form novalidate>
+        <div class="field">
+          <label for="salonName">Salon name</label>
+          <input type="text" id="salonName" name="salonName" maxlength="160"
+                 autocomplete="organization" required />
+        </div>
+        <div class="field">
+          <label for="ownerName">Your name</label>
+          <input type="text" id="ownerName" name="ownerName" maxlength="120"
+                 autocomplete="name" />
+        </div>
+        <div class="field">
+          <label for="email">Email</label>
+          <input type="email" id="email" name="email" maxlength="254"
+                 inputmode="email" autocomplete="email" required />
+        </div>
+
+        <!-- Not a real field. Named contactFax deliberately: `website` is
+             reserved for the identity roadmap. Only whether it was touched
+             ever travels, never its value. -->
+        <div class="trap" aria-hidden="true">
+          <label for="contactFax">Fax</label>
+          <input type="text" id="contactFax" name="contactFax" tabindex="-1"
+                 autocomplete="off" />
+        </div>
+
+        <!-- ========================================================
+             Consent — independent permissions, never bundled. Agreeing
+             to have the review worked out is not agreeing to marketing,
+             and declining marketing changes nothing about the results.
+
+             The required permission describes what ACTUALLY happens:
+             the review is sent to CED Solutions, the figures are worked
+             out, and the results appear on this page. It does not
+             promise an email, because no email is sent — this
+             repository has no tested delivery path and a permission
+             that describes a behaviour we do not have is not consent
+             to anything. When a delivery path exists and is tested,
+             the wording changes with it.
+
+             SM-1 offers two permissions rather than three: SMS is not
+             offered because no mobile number is collected here.
+             LEGAL REVIEW PENDING.
+             ======================================================== -->
+        <fieldset class="consents" data-legal-review="pending">
+          <legend>Permissions</legend>
+
+          <div class="consent-row">
+            <input type="checkbox" id="consentResults" name="consentResults" required />
+            <label for="consentResults" data-consent-statement>
+              Send my review to CED Solutions so my results can be worked out and
+              shown to me on this page.
+            </label>
+          </div>
+
+          <div class="consent-row">
+            <input type="checkbox" id="consentEmailMarketing" name="consentEmailMarketing" />
+            <label for="consentEmailMarketing" data-consent-statement>
+              You may also email me occasional tips and offers. This is optional.
+            </label>
+          </div>
+
+          <p class="note">
+            Your results appear on this page either way. Marketing permission is
+            never a condition of seeing them.
+          </p>
+        </fieldset>
+
+        <p class="error" data-contact-error role="alert" hidden></p>
+
+        <div class="step-actions">
+          <button type="button" class="btn btn-secondary" data-action="back-to-figures">
+            Back
+          </button>
+          <button type="submit" class="btn btn-primary" data-action="submit">
+            See my results
+          </button>
+        </div>
+      </form>
+    </section>
+
+    <!-- ============================================================
+         Results
+         ============================================================ -->
+    <section class="step results" data-step="4" data-step-id="results" hidden
+             aria-labelledby="results-heading" tabindex="-1">
+      <p class="eyebrow" data-health-eyebrow></p>
+      <h2 id="results-heading" data-health-heading></h2>
+      <p class="lead" data-health-body></p>
+
+      <div class="confidence" data-confidence></div>
+
+      <h3>Where the money comes from</h3>
+      <ul class="leaders" data-revenue-leaders></ul>
+      <!-- The scope of the ranking and of the total travel WITH them. A list
+           with no scope reads as a ranking of the whole business, which this
+           evidence rarely supports. -->
+      <p class="note" data-revenue-leaders-basis></p>
+      <p class="note" data-revenue-total-basis></p>
+
+      <h3>Where the hours go</h3>
+      <ul class="leaders" data-capacity-heavy></ul>
+      <p class="note" data-capacity-basis></p>
+      <p class="note" data-capacity-total-basis></p>
+
+      <div data-findings-section>
+        <h3>Worth looking at</h3>
+        <div data-findings></div>
+      </div>
+
+      <div data-gaps-section hidden>
+        <h3>What we could not work out</h3>
+        <ul data-gaps></ul>
+      </div>
+
+      <h3>What the Detailed Review would add</h3>
+      <ul data-detailed-adds></ul>
+
+      <!-- COMPLIANCE: the disclaimer sits with the figures, always. Never move
+           a number away from it. -->
+      <p class="disclaimer" data-disclaimer></p>
+
+      <div class="results-actions">
+        <a class="btn btn-secondary" href="../../site/index.html"
+           data-action="growth-review"
+           data-analytics-event="service_mix.growth_review_clicked">
+          Take the free Growth Review
+        </a>
+        <button type="button" class="btn btn-secondary" data-action="pricing-detail"
+                data-analytics-event="service_mix.pricing_detail_requested">
+          Show me the pricing detail
+        </button>
+        <!-- Deliberately not marked for tracking. This control explains that
+             the Quick Review says nothing about bundles;
+             service_mix.bundle_recommendation_viewed means a visitor SAW a
+             bundle recommendation, and firing it here would report
+             recommendations that were never made. -->
+        <button type="button" class="btn btn-secondary" data-action="bundle-detail">
+          What about bundles?
+        </button>
+        <button type="button" class="btn btn-secondary" data-action="ai-analysis"
+                data-analytics-event="service_mix.ai_analysis_clicked">
+          What is the AI Opportunity Analysis?
+        </button>
+      </div>
+
+      <p class="note" data-delivery-note></p>
+
+      <button type="button" class="btn btn-link" data-action="clear-data">
+        Delete what this review stored on my device
+      </button>
+    </section>
+
+  </main>
+
+  <footer class="site-footer shell">
+    <p>Real. Local. Reachable. Powered by CED Solutions, LLC.</p>
+  </footer>
+
+  <!-- Order matters: the value contract, then offerings, then everything that
+       reads them, then the controller. Classic scripts, no modules — the page
+       must still work opened straight from disk. -->
+  <script src="../service-mix.config.js"></script>
+  <!-- The shared continuation store, loaded before anything that reads it.
+       The browser side of this file only ever holds an opaque string; the
+       signing and verification halves run on the server and are unreachable
+       from here. -->
+  <script src="../../../../../shared/security/continuation.js"></script>
+  <script src="../../../../../shared/assessment-engine/submission.js"></script>
+  <script src="../../../../../shared/analytics/events.js"></script>
+  <script src="../../../../../shared/analytics/analytics-client.js"></script>
+  <script src="../../../../../shared/service-mix-engine/value.schema.js"></script>
+  <script src="../../../../../shared/service-mix-engine/offering.schema.js"></script>
+  <script src="../../../../../shared/service-mix-engine/calculate.js"></script>
+  <script src="../../../../../shared/service-mix-engine/classify.js"></script>
+  <script src="../../../../../shared/service-mix-engine/guidance.js"></script>
+  <script src="../../../../../shared/service-mix-engine/controller.js"></script>
+  <script src="page.js"></script>
+</body>
+</html>

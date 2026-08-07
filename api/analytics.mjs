@@ -53,7 +53,8 @@ import rateLimit from '../shared/security/rate-limit.js';
 const {
   ANALYTICS_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS, LIMITS,
   validateEvent, isProhibitedFieldName, scrubMetadata, sanitizeAttribution,
-  isUuid, isIso, EVENTS, DEVICE_CLASSES, bucketViewport
+  isUuid, isIso, EVENTS, DEVICE_CLASSES, bucketViewport, normalizeReviewType,
+  reviewTypeOfEvent, sanitizeServiceMixMetadata, ENDPOINT_DERIVED_METADATA_KEYS
 } = analyticsEvents;
 const { readBoundedBody, parseJsonSafely, OUTCOME: BODY } = bodyReader;
 const { buildRateLimitKeys } = rateLimit;
@@ -178,11 +179,36 @@ const validateEnvelope = body => {
   return { ok: true };
 };
 
+/* `clockSkewClamped` and `claimedOccurredAt` are the ENDPOINT's to write, and
+   never accepted from a request — on any event, for either review type.
+
+   A client that could assert "my timestamp was clamped" could annotate a row
+   with something that never happened, and could put an arbitrary string in
+   `claimedOccurredAt` under a key the allowlist otherwise permits. Neither is
+   a dramatic leak; both are a row saying something untrue about how it was
+   recorded, and a funnel nobody can trust is a funnel nobody should use.
+
+   Returns a copy. The batch is parsed JSON the caller may still be holding. */
+const stripEndpointDerivedMetadata = event => {
+  if (!event || typeof event !== 'object') return event;
+  const metadata = event.metadata;
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return event;
+  if (!ENDPOINT_DERIVED_METADATA_KEYS.some(key =>
+    Object.prototype.hasOwnProperty.call(metadata, key))) return event;
+
+  const kept = {};
+  Object.keys(metadata).forEach(key => {
+    if (ENDPOINT_DERIVED_METADATA_KEYS.includes(key)) return;
+    kept[key] = metadata[key];
+  });
+  return { ...event, metadata: kept };
+};
+
 /* Re-derives the stored row from the event, keeping ONLY the fields the
    schema defines. A client that invents an extra field does not get it
    stored; that is the difference between a schema and a suggestion. */
 const toRow = (event, now) => {
-  const { metadata } = scrubMetadata(event.metadata);
+  const scrubbed = scrubMetadata(event.metadata).metadata;
   const attribution = sanitizeAttribution(event.attribution);
   const device = event.device && typeof event.device === 'object' ? event.device : {};
   const deviceClass = DEVICE_CLASSES.includes(device.deviceClass) ? device.deviceClass : 'unknown';
@@ -195,6 +221,45 @@ const toRow = (event, now) => {
   const clamped = Math.min(claimed, now);
   const skewed = clamped !== claimed;
 
+  /* Resolved from the NAME first, so an event that mislabels itself is still
+     held to its own funnel's rules. */
+  const resolvedReviewType = reviewTypeOfEvent(event.eventName) ||
+    normalizeReviewType(event.reviewType);
+  const isServiceMix = resolvedReviewType === 'service_mix';
+
+  /* validateEvent has already refused a Service Mix event carrying anything
+     outside the allowlist, so nothing reaching here should need removing.
+     It is removed anyway. The endpoint's job is that no unapproved value can
+     be STORED, not that no unapproved value was sent — and the two are only
+     the same statement while every path into this function goes through that
+     validation. This one does today; the guarantee should not depend on it
+     still doing so tomorrow. */
+  const metadata = isServiceMix
+    ? sanitizeServiceMixMetadata(scrubbed, event.eventName).metadata
+    : scrubbed;
+
+  /* Held to the shape a Service Mix step id has, for the same reason: it is a
+     free string in the envelope rather than in metadata, which changes where
+     it sits and not what it can carry. Truncating it would be worse than
+     dropping it — a shortened identifier is a different identifier. */
+  const rawStepId = event.stepId
+    ? String(event.stepId).slice(0, LIMITS.maxStepIdLength) : null;
+  const stepId = isServiceMix
+    ? (sanitizeServiceMixMetadata({ stepId: rawStepId }).metadata.stepId ?? null)
+    : rawStepId;
+
+  /* Written here, and ONLY when a clamp actually happened. The claimed
+     timestamp is re-derived from the parsed value rather than copied from the
+     request, so not one client-supplied character survives into the row — the
+     annotation explains a clamp without becoming a way to smuggle a string
+     past the rule. The Growth path keeps its existing wording. */
+  const skewAnnotation = () => ({
+    clockSkewClamped: true,
+    claimedOccurredAt: isServiceMix
+      ? new Date(claimed).toISOString()
+      : event.occurredAt
+  });
+
   return {
     eventId: event.eventId,
     eventName: event.eventName,
@@ -206,8 +271,13 @@ const toRow = (event, now) => {
     verticalId: event.verticalId,
     assessmentVersion: event.assessmentVersion ?? null,
     questionSetVersion: event.questionSetVersion ?? null,
+    /* Normalised server-side, not merely trusted. An event with no declared
+       review type is a Growth Review event — a schema-1 page cached before
+       the Service Mix deploy has no field to send, and relabelling its rows
+       later is not something an append-only table can do. */
+    reviewType: normalizeReviewType(event.reviewType),
     assessmentStage: event.assessmentStage ?? null,
-    stepId: event.stepId ? String(event.stepId).slice(0, LIMITS.maxStepIdLength) : null,
+    stepId,
     questionId: event.questionId ? String(event.questionId).slice(0, LIMITS.maxQuestionIdLength) : null,
     occurredAt: new Date(clamped).toISOString(),
     activeElapsedMs: Math.round(Number(event.activeElapsedMs) || 0),
@@ -228,7 +298,7 @@ const toRow = (event, now) => {
       viewportWidth: bucketViewport(device.viewportWidth),
       viewportHeight: bucketViewport(device.viewportHeight)
     },
-    metadata: skewed ? { ...metadata, clockSkewClamped: true, claimedOccurredAt: event.occurredAt } : metadata,
+    metadata: skewed ? { ...metadata, ...skewAnnotation() } : metadata,
     consentStatus: typeof event.consentStatus === 'string' ? event.consentStatus.slice(0, 32) : null
   };
 };
@@ -378,7 +448,15 @@ export async function handleRequest(request, deps = {}) {
     const rejected = [];
     const seen = new Set();
 
-    batch.forEach(event => {
+    batch.forEach(raw => {
+      /* The clock-skew annotations are REMOVED from the request before
+         anything looks at it, rather than refused. They are this endpoint's
+         to write, and a client sending them is more likely a cached page
+         echoing a stored row back than an attack — refusing would cost a
+         legitimate measurement to punish a field we were going to overwrite
+         anyway. Everything downstream, validation included, sees an event
+         that never carried them. */
+      const event = stripEndpointDerivedMetadata(raw);
       const check = validateEvent(event);
       if (!check.valid) {
         rejected.push(reject(event && event.eventId, check.errors[0].code, check.errors[0].message));

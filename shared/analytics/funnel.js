@@ -135,7 +135,10 @@
      keep their counters and lose their rates, so a small segment is visible
      as small rather than absent. */
 
-  const SEGMENTS = ['source', 'deviceClass', 'assessmentVersion', 'questionSetVersion'];
+  /* reviewType is a segment like any other, which is the whole point: the
+     Growth funnel and the Service Mix funnel are one calculation cut two
+     ways, not two calculations that could drift apart. */
+  const SEGMENTS = ['source', 'deviceClass', 'assessmentVersion', 'questionSetVersion', 'reviewType'];
 
   const computeSegmented = (rows, segment, options = {}) => {
     if (!SEGMENTS.includes(segment)) {

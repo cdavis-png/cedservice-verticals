@@ -478,6 +478,14 @@
                href="mailto:cdavis@cedservice.com?subject=Personal Salon Growth Review"
                data-analytics-event="assessment.personal_review_clicked"
                data-analytics-label="stage1_results">Request a Personal Review</a>
+            <!-- A second, separate review. It attaches to the same Business
+                 Record through the server-issued continuation context the
+                 engine saved when this submission was accepted — the browser
+                 never holds a Business Record id. -->
+            <a class="btn btn-secondary btn-wide"
+               href="../service-mix/site/index.html"
+               data-analytics-event="assessment.report_requested"
+               data-analytics-label="stage1_service_mix">See Where Your Hours Go</a>
           </div>
         </div>
 
@@ -845,6 +853,10 @@
        figure on screen and the figure in the report would drift apart. The
        engine degrades to the point estimate if they are absent. -->
   <script src="../assessment.config.js"></script>
+  <!-- The shared continuation store. The Growth Review leaves a context here
+       when it completes; the Quick Service Mix Review picks it up. Either may
+       run first. -->
+  <script src="../../../../shared/security/continuation.js"></script>
   <script src="../../../../shared/assessment-engine/submission.js"></script>
   <script src="../../../../shared/assessment-engine/intelligence.js"></script>
   <script src="../../../../shared/business-intelligence/report.schema.js"></script>

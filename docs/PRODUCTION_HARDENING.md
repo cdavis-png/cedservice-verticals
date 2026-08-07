@@ -3,11 +3,23 @@
 What the Milestone 1 architecture review found, what was changed in response,
 and what is still outstanding.
 
-**Status: not deployed, not connected to a real Supabase project, no
-credentials created.** Everything below is verified by tests against an
-in-memory double. The PL/pgSQL has still never executed — see
-[Real-Postgres test plan](#real-postgres-test-plan), which is the largest
-remaining risk in the milestone.
+**Status: not deployed.** This document describes Milestone 1.1 **as it stood
+when it was written**, and the paragraph below is kept as a record of that
+moment rather than as a current statement.
+
+> *Historical, superseded:* "not connected to a real Supabase project, no
+> credentials created … the PL/pgSQL has still never executed."
+
+**Current execution status**, which is stated once in
+[REAL_POSTGRES_VALIDATION.md](REAL_POSTGRES_VALIDATION.md) and repeated
+nowhere else in a form that can drift:
+
+- Migrations 0001–0005 have been executed against **Supabase PostgreSQL
+  17.6.1.155**, in a development project.
+- Migration 0006 has been executed against a **disposable local PostgreSQL
+  18.3** through PGlite, clean-install and upgrade, and has **not** been
+  executed against PostgreSQL 17, hosted Supabase, or PostgREST.
+- Nothing has ever run through PostgREST.
 
 Nothing here changes pricing, scoring, the visible assessment design,
 deterministic BIR generation, append-only guarantees, idempotency semantics,
@@ -305,12 +317,19 @@ be verified without a trusted source and a named method.
 
 | Situation | Outcome | Business created? |
 |---|---|---|
-| Session already linked | link, `linkMethod: session` | no |
+| Session already linked, **and nothing in the submission contradicts that record** | link, `linkMethod: session` | no |
+| Session already linked, **materially contradicted** (rule B0) | `resolution_pending` + case | **no** |
 | One candidate with a **verified** strong identifier | link automatically | no |
 | No candidate | create | **yes** |
+| No candidate, but a saved proposal was vetoed | `resolution_pending` + case | **no** |
 | Weak-only match | `resolution_pending` + case | **no** |
 | **Claimed** (unverified) strong match | `resolution_pending` + case | **no** |
 | Two verified strong candidates | `resolution_pending` + case | **no** |
+
+A session id is a client-supplied journey identifier. It PROPOSES a Business
+Record; it does not decide one. See rule B0 in
+[SERVICE_MIX_REVIEW.md](SERVICE_MIX_REVIEW.md) §10a, and
+`shared/business-record/resolve-identity.js :: proposalConflict`.
 
 Consequences that are deliberate:
 
@@ -505,10 +524,20 @@ that superseded it.
 
 **Everything above is verified against an in-memory double.** It mirrors the
 SQL step for step and now enforces the CHECK constraints that ingestion can
-violate — which is what makes the timestamp tests meaningful — but it is not
-Postgres, and the PL/pgSQL has never run.
+violate, which is what makes the timestamp tests meaningful — but it is not
+Postgres.
 
-Run this against a scratch project before any pilot traffic.
+*Historical, superseded:* this section once continued "and the PL/pgSQL has
+never run". It has since run. Migrations 0001–0005 executed against a hosted
+development PostgreSQL 17 project, and the whole chain including 0006 executes
+against a disposable local PostgreSQL 18.3 through PGlite on every
+`npm run test:migration`. **0006 has not run against PostgreSQL 17, hosted
+Supabase, or PostgREST**, and nothing has ever run through PostgREST — both
+remain deployment blockers. See
+[REAL_POSTGRES_VALIDATION.md](REAL_POSTGRES_VALIDATION.md).
+
+The plan below is still the one to run against a scratch project before any
+pilot traffic; the local run does not replace it.
 
 **Setup.** Apply 0001, 0002, 0003 in order. Confirm 10 tables with RLS enabled
 and forced, 0 policies, and the five functions present.

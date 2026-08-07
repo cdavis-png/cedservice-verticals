@@ -265,7 +265,12 @@ export function loadEngine(dom, config, options = {}) {
     CEDSubmission: {
       submitAssessment: async payload => {
         submissions.push(JSON.parse(JSON.stringify(payload)));
-        return { status: options.deliveryStatus || 'sent' };
+        return {
+          status: options.deliveryStatus || 'sent',
+          /* Whatever the capture endpoint returned. Tests that care about the
+             connected-review handoff set this; everything else ignores it. */
+          ...(options.submissionResponse || {})
+        };
       },
       retryPendingSubmissions: async () => {},
       clearQueue: () => {}
@@ -304,6 +309,11 @@ export function loadEngine(dom, config, options = {}) {
     '../../shared/assessment-engine/engine.js'
   ].map(p => require.resolve(p));
   paths.forEach(p => { delete require.cache[p]; });
+
+  /* The shared continuation store. The nails page loads it before the
+     engine; the harness must too, or the Growth Review has nowhere to leave
+     a context for a connected review to find. */
+  win.CEDContinuation = require('../../shared/security/continuation.js');
 
   win.CEDIntelligence = require(paths[0]);
   /* The two report modules export to module.exports OR to window, not both,

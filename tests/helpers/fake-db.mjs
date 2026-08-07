@@ -13,6 +13,16 @@
    path is a double that hides constraint bugs. */
 
 import { randomUUID } from 'node:crypto';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+/* The same closed enum the endpoint and the migration filter against, so the
+   fake cannot accidentally accept a name real Postgres would drop. */
+const { PREFILLED_FIELD_NAMES } =
+  require('../../shared/service-mix-engine/offering.schema.js');
+/* The continuation conflict rule, CALLED rather than restated, so the fake
+   and the browser cannot reach different conclusions. */
+const resolveIdentity = require('../../shared/business-record/resolve-identity.js');
 
 const STRONG_TYPES = ['gbp_place_id', 'external_customer_id', 'payment_customer_id'];
 const CONTEXT_TYPES = ['vertical', 'locality'];
@@ -34,6 +44,7 @@ export function createFakeDb(options = {}) {
     assessment_sessions: [],
     assessment_submissions: [],
     business_intelligence_reports: [],
+    business_review_states: [],
     timeline_events: [],
     identity_resolution_cases: [],
     idempotency_records: [],
@@ -52,8 +63,13 @@ export function createFakeDb(options = {}) {
     if (CONTEXT_TYPES.includes(row.identifier_type)) {
       throw new ConstraintViolation('business_identifiers_no_context_types');
     }
-    if (typeof row.normalized_value !== 'string' ||
-        row.normalized_value.length < 1 || row.normalized_value.length > 256) {
+    /* business_identifiers_value_length is `length(normalized_value) between 1
+       and 256`, and PostgreSQL `length()` counts CODE POINTS. `.length` counts
+       UTF-16 code units, so an emoji counted twice here and once there — the
+       same disagreement the identity predicates had above U+FFFF. */
+    const valueLength = typeof row.normalized_value === 'string'
+      ? [...row.normalized_value].length : -1;
+    if (valueLength < 1 || valueLength > 256) {
       throw new ConstraintViolation('business_identifiers_value_length');
     }
     if (row.verified === true &&
@@ -67,9 +83,10 @@ export function createFakeDb(options = {}) {
     if (linked !== (row.business_id !== null && row.business_id !== undefined)) {
       throw new ConstraintViolation('assessment_submissions_identity_consistency');
     }
-    /* Mirrors migration 0004: payload versions 2-5 are accepted. */
+    /* Mirrors 0004 as widened by 0006: payload versions 2-6 are accepted.
+       6 is the Quick Service Mix Review's shape, not a newer Growth one. */
     if (row.payload_schema_version !== null && row.payload_schema_version !== undefined &&
-        (row.payload_schema_version < 2 || row.payload_schema_version > 5)) {
+        (row.payload_schema_version < 2 || row.payload_schema_version > 6)) {
       throw new ConstraintViolation('assessment_submissions_payload_version_check');
     }
   };
@@ -121,10 +138,15 @@ export function createFakeDb(options = {}) {
     return businessId;
   };
 
-  const seedSession = (sessionId, businessId) => {
+  const seedSession = (sessionId, businessId, reviewType = 'growth_review') => {
     state.assessment_sessions.push({
       assessment_session_id: sessionId, business_id: businessId,
-      first_touch: {}, created_at: now().toISOString(), last_seen_at: now().toISOString()
+      first_touch: {},
+      /* A session that predates review types is a Growth session — the same
+         value migration 0006 backfills, and the column is NOT NULL, so there
+         is no such thing as a session without one. */
+      review_type: reviewType,
+      created_at: now().toISOString(), last_seen_at: now().toISOString()
     });
   };
 
@@ -286,14 +308,23 @@ export function createFakeDb(options = {}) {
     };
   };
 
-  /* ---------- ingest_assessment ---------- */
+  /* ---------- ingest_review / ingest_assessment ----------
+     Mirrors migration 0006, in which ingest_review is the body and
+     ingest_assessment is a thin wrapper calling it with 'growth_review'. */
 
   const ingest = args => {
     const {
       p_idempotency_key: key, p_request_hash: requestHash, p_payload: payload,
       p_signals: signals, p_bir: bir, p_bir_id: birId, p_retention_days: retentionDays,
-      p_meta: meta = {}
+      p_meta: meta = {},
+      p_review_type: reviewTypeArg = 'growth_review',
+      p_continuation_business_id: continuationBusinessId = null
     } = args;
+
+    const reviewType = reviewTypeArg || 'growth_review';
+    if (!['growth_review', 'service_mix'].includes(reviewType)) {
+      throw new Error(`unsupported_review_type: ${reviewType}`);
+    }
 
     const at = now();
     const nowIso = at.toISOString();
@@ -327,6 +358,9 @@ export function createFakeDb(options = {}) {
       session = {
         assessment_session_id: sessionId, business_id: null,
         first_touch: payload.attribution?.firstTouch ?? {},
+        /* Set on insert and never changed on conflict: a session belongs to
+           one review, and relabelling it would move counts already made. */
+        review_type: reviewType,
         created_at: nowIso, last_seen_at: nowIso
       };
       state.assessment_sessions.push(session);
@@ -334,15 +368,90 @@ export function createFakeDb(options = {}) {
       session.last_seen_at = nowIso;
     }
 
+    /* A session presented under a different review type is refused rather
+       than relabelled or silently accepted — mirrors migration 0006. */
+    if (session.review_type !== reviewType) {
+      throw new Error(
+        `session_review_type_conflict: session ${sessionId} belongs to ` +
+        `${session.review_type} and cannot be reused for ${reviewType}`);
+    }
+
     /* 3. Identity resolution — verified strong identifiers only. */
     let businessId = null, identityStatus, resolutionStatus, recommendedAction, linkMethod = null;
     let confidence = 0, createdBusiness = false, candidates = [], contributing = [], conflicting = [];
 
-    if (session.business_id) {
-      businessId = session.business_id;
+    /* Rule B0: a PROPOSAL is not a decision.
+
+       Two things can name a Business Record before any identifier is looked
+       at — a server-signed continuation context and a client-supplied
+       session id — and NEITHER is evidence about the business. Both are
+       statements about a browser. Each is compared with what the record it
+       names actually holds, and a materially contradicted proposal is set
+       aside.
+
+       Mirrors migration 0006 rule B0. The shared rule is CALLED rather than
+       restated, so the fake and the browser cannot reach different
+       conclusions; only the SQL is a genuine second implementation, and
+       tests/identity-proposals.test.mjs runs one case table through all
+       three. */
+    const liveRecord = id => (id
+      ? state.business_records.find(b => b.business_id === id && !b.merged_into_business_id)
+      : null) || null;
+
+    const heldBy = businessIdOf => state.business_identifiers
+      .filter(bi => bi.business_id === businessIdOf && bi.valid_to === null)
+      .map(bi => ({ type: bi.identifier_type, normalizedValue: bi.normalized_value }));
+
+    /* Evidence-bearing proposals. A record that no longer exists is not a
+       proposal at all, so it is absent rather than present-and-empty — the
+       two are different statements and only one of them may link. */
+    const proposalFor = (kind, id) => {
+      const record = liveRecord(id);
+      if (!record) return null;
+      return {
+        kind,
+        businessId: record.business_id,
+        heldIdentifiers: heldBy(record.business_id)
+      };
+    };
+
+    const proposals = [
+      proposalFor('continuation_context', continuationBusinessId),
+      proposalFor('session', session.business_id)
+    ].filter(Boolean);
+
+    /* ONE call: validate, compare, resolve. The fake used to do the
+       comparison itself and hand verdicts to a separate resolver, which is
+       exactly the seam an evidence-free link could be composed through.
+
+       `signals` is passed THROUGH, not defaulted. `signals || []` here turned
+       "no evidence was supplied" into "there is genuinely nothing to compare"
+       before the hardened resolver ever saw it — the same default the resolver
+       spent three revisions removing, reintroduced one call further out. The
+       resolver refuses null when a proposal exists, and this is where that
+       refusal has to be able to fire. The `|| []` further down, on the
+       candidate-only path, is a different question and is left alone: that
+       path never compares signals against a PROPOSED record. */
+    const verdict = resolveIdentity.resolveIdentityProposals({ signals, proposals });
+    const contradictedProposals = verdict.judged.filter(p => p.conflict.material);
+    const continuationContradicted =
+      verdict.vetoedKinds.includes('continuation_context');
+    const sessionContradicted = verdict.vetoedKinds.includes('session');
+
+    if (verdict.outcome === 'link') {
+      businessId = verdict.businessId;
       identityStatus = 'linked'; resolutionStatus = 'unique_match';
-      recommendedAction = 'link_to_existing'; linkMethod = 'session'; confidence = 1;
-      contributing = ['assessment_session_link'];
+      recommendedAction = 'link_to_existing'; linkMethod = verdict.linkMethod; confidence = 1;
+      contributing = verdict.linkMethod === 'continuation_context'
+        ? ['server_issued_continuation_context']
+        : ['assessment_session_link'];
+    } else if (verdict.outcome === 'review') {
+      /* A contradicted proposal, or two surviving proposals naming different
+         records. Neither is resolved here and neither record is touched. */
+      businessId = null;
+      identityStatus = 'resolution_pending';
+      resolutionStatus = 'manual_review_required';
+      recommendedAction = 'queue_for_review'; confidence = 0;
     } else {
       const matchable = (signals || []).filter(s => !CONTEXT_TYPES.includes(s.type));
       const byBusiness = new Map();
@@ -373,11 +482,20 @@ export function createFakeDb(options = {}) {
       const verifiedStrong = candidates.filter(c => c.verifiedStrongTypes.length > 0);
       const anyClaimed = candidates.some(c => c.claimedStrongTypes.length > 0);
 
-      if (candidates.length === 0) {
+      if (candidates.length === 0 && verdict.mayCreate) {
         businessId = randomUUID();
         identityStatus = 'linked'; resolutionStatus = 'no_match';
         recommendedAction = 'create_new_record'; linkMethod = 'auto'; confidence = 0;
         createdBusiness = true;
+      } else if (candidates.length === 0 && !verdict.mayCreate) {
+        /* Rule B4v: B4 would create, and a vetoed proposal may not create.
+           The only evidence that this is a new business is the same evidence
+           that just contradicted a saved proposal, and these tables refuse
+           DELETE — a wrongly created record is permanent. */
+        businessId = null;
+        identityStatus = 'resolution_pending';
+        resolutionStatus = 'manual_review_required';
+        recommendedAction = 'queue_for_review'; confidence = 0;
       } else if (verifiedStrong.length === 1) {
         businessId = verifiedStrong[0].businessId;
         identityStatus = 'linked'; resolutionStatus = 'unique_match';
@@ -395,6 +513,33 @@ export function createFakeDb(options = {}) {
       }
     }
 
+    /* Every vetoed proposal is recorded wherever resolution landed, without
+       the identifier values — those belong in the Business Record under its
+       own retention rules, not in a review queue. */
+    contradictedProposals.forEach(p => {
+      conflicting = conflicting.concat([{
+        kind: p.kind === 'session'
+          ? 'session_contradicted' : 'continuation_context_contradicted',
+        proposedBusinessId: p.businessId,
+        agreedTypes: p.conflict.agreedTypes,
+        contradictedTypes: p.conflict.contradictedTypes,
+        reason: p.conflict.reason
+      }]);
+    });
+
+    /* Two surviving proposals naming different records. Neither contradicts
+       the payload, so neither can be dismissed — and choosing one would
+       leave the other pointing somewhere else forever. */
+    if (verdict.disagreed && !contradictedProposals.length) {
+      conflicting = conflicting.concat([{
+        kind: 'proposals_disagree',
+        proposedBusinessIds: proposals.map(p => p.businessId),
+        reason: 'The session and the continuation context name different records.'
+      }]);
+    }
+
+    const proposalReviewRequired = verdict.outcome === 'review';
+
     /* 4. Create the record when required. */
     if (createdBusiness) {
       state.business_records.push({
@@ -403,7 +548,8 @@ export function createFakeDb(options = {}) {
         legal_name: null,
         vertical_id: verticalId, lifecycle_state: 'lead_assessed',
         merged_into_business_id: null, current_bir_id: null,
-        metadata: { createdFrom: 'assessment', createdBySubmission: submissionId }
+        metadata: { createdFrom: 'assessment', createdBySubmission: submissionId,
+                    createdByReviewType: reviewType }
       });
     }
     trip('business');
@@ -420,7 +566,12 @@ export function createFakeDb(options = {}) {
       payload_hash: requestHash, consent_snapshot: payload.consent ?? {},
       attribution_snapshot: payload.attribution ?? {},
       payload_schema_version: schemaVersion,
-      ingest_meta: { ...meta, timelineOccurredAt: timelineAt }
+      /* continuationApplied is decided HERE, overwriting the caller's claim:
+         the endpoint knows only that it offered a context. Mirrors 0006. */
+      ingest_meta: { ...meta, timelineOccurredAt: timelineAt,
+                     continuationApplied: linkMethod === 'continuation_context',
+                     continuationContradicted, sessionContradicted },
+      review_type: reviewType
     };
     checkSubmissionRow(submissionRow);
     state.assessment_submissions.push(submissionRow);
@@ -431,7 +582,9 @@ export function createFakeDb(options = {}) {
       if (!session.business_id) session.business_id = businessId;
       (signals || []).forEach(s => {
         if (CONTEXT_TYPES.includes(s.type)) return;
-        if (typeof s.normalizedValue !== 'string' || s.normalizedValue.length > 256) return;
+        /* Code points, matching business_identifiers_value_length above. */
+        if (typeof s.normalizedValue !== 'string' ||
+            [...s.normalizedValue].length > 256) return;
 
         if (STRONG_TYPES.includes(s.type)) {
           const holder = state.business_identifiers.find(bi =>
@@ -469,37 +622,136 @@ export function createFakeDb(options = {}) {
       });
     }
 
-    /* 7. BIR, chained to the business's previous current BIR. */
+    /* 7. BIR, chained to THIS REVIEW TYPE's previous current report.
+       Read from business_review_states, not from business_records —
+       reading the legacy Growth pointer here is exactly the defect
+       migration 0006 exists to prevent. */
     let previousBirId = null;
+    let reviewState = null;
     if (businessId) {
-      const record = state.business_records.find(b => b.business_id === businessId);
-      previousBirId = record?.current_bir_id ?? null;
+      reviewState = state.business_review_states.find(
+        r => r.business_id === businessId && r.review_type === reviewType);
+      previousBirId = reviewState?.current_bir_id ?? null;
     }
     const report = clone(bir);
     report.identity.businessId = businessId;
     report.identity.identityStatus = identityStatus;
     if (report.provenance) report.provenance.supersedes = previousBirId;
 
+    /* The related Growth Review reference, written HERE because only the
+       database knows which business this is. A reference and nothing more:
+       no Growth score, no finding, no opportunity figure, and
+       usedInCalculations is false because nothing from the Growth Review
+       enters a Service Mix calculation. Mirrors migration 0006 section 7a. */
+    if (reviewType === 'service_mix' && businessId) {
+      const growthState = state.business_review_states.find(
+        r => r.business_id === businessId && r.review_type === 'growth_review');
+      const growthBir = growthState && state.business_intelligence_reports
+        .find(r => r.bir_id === growthState.current_bir_id);
+      if (growthBir) {
+        const ageDays = (at.getTime() - Date.parse(growthBir.generated_at)) / 86400000;
+        report.relatedGrowthReview = {
+          birId: growthBir.bir_id,
+          generatedAt: growthBir.generated_at,
+          freshness: ageDays <= 90 ? 'fresh' : ageDays <= 180 ? 'aging'
+            : ageDays <= 365 ? 'stale' : 'expired',
+          /* Revalidated, not carried verbatim — mirrors 0006 section 7a. */
+          prefilledFields: PREFILLED_FIELD_NAMES.filter(
+            name => (payload.serviceMix?.prefilledFields ?? []).includes(name)),
+          usedInCalculations: false
+        };
+      }
+    }
+
     if (state.business_intelligence_reports.some(r => r.assessment_submission_id === submissionId)) {
       throw new ConstraintViolation('bir_one_per_submission');
     }
-    /* Mirrors 0001 as widened by 0004: BIR schema versions 2-4. */
-    if (report.schemaVersion < 2 || report.schemaVersion > 4) {
+    /* Mirrors 0001 as widened by 0004 and then 0006: versions 2-5. */
+    if (report.schemaVersion < 2 || report.schemaVersion > 5) {
       throw new ConstraintViolation('bir_schema_version_check');
     }
-    if (!['low', 'medium', 'high'].includes(report.estimateConfidence?.band ?? 'low')) {
+    /* 0006: a v5 report is a Service Mix report and nothing else, and a
+       Service Mix report is never any other version. */
+    const versionMatchesReview = reviewType === 'service_mix'
+      ? report.schemaVersion === 5
+      : report.schemaVersion >= 2 && report.schemaVersion <= 4;
+    if (!versionMatchesReview) {
+      throw new ConstraintViolation('bir_service_mix_version_check');
+    }
+
+    /* Service Mix carries a 0..1 confidence rather than a band, so the column
+       keeps one meaning across review types instead of silently defaulting. */
+    const confidenceBand = reviewType === 'service_mix'
+      ? (() => {
+          const c = Number(report.dataConfidence?.confidence ?? 0);
+          return c >= 0.80 ? 'high' : c >= 0.50 ? 'medium' : 'low';
+        })()
+      : report.estimateConfidence?.band ?? 'low';
+
+    if (!['low', 'medium', 'high'].includes(confidenceBand)) {
       throw new ConstraintViolation('bir_confidence_band_check');
     }
+
+    /* 0006 supersession guard: closed within one business AND one review
+       type. Enforced here as well as in the engine, because a constraint in
+       one layer is a convention and in two it is a rule. */
+    if (previousBirId) {
+      const previous = state.business_intelligence_reports.find(r => r.bir_id === previousBirId);
+      if (!previous) throw new ConstraintViolation('supersedes_unknown_bir');
+      if (previous.review_type !== reviewType) {
+        throw new ConstraintViolation('supersedes_review_type_mismatch');
+      }
+      if (!businessId || previous.business_id !== businessId) {
+        throw new ConstraintViolation('supersedes_business_mismatch');
+      }
+    }
+
     state.business_intelligence_reports.push({
       bir_id: birId, business_id: businessId, assessment_submission_id: submissionId,
       schema_version: report.schemaVersion, generated_at: nowIso, report,
-      confidence_band: report.estimateConfidence?.band ?? 'low',
-      missing_critical_fields: report.qualificationProfile?.missingCriticalFields ?? [],
-      supersedes_bir_id: previousBirId
+      confidence_band: confidenceBand,
+      missing_critical_fields: reviewType === 'service_mix'
+        ? (report.measurementGaps ?? []).map(g => ({ offeringId: g.offeringId, measure: g.measure }))
+        : report.qualificationProfile?.missingCriticalFields ?? [],
+      supersedes_bir_id: previousBirId,
+      review_type: reviewType
     });
+
     if (businessId) {
+      /* Per review type — the surface that makes Growth and Service Mix
+         independently current. */
+      if (!reviewState) {
+        reviewState = {
+          business_id: businessId, review_type: reviewType,
+          current_bir_id: null,
+          /* Written once, on the first submission of this review type, and
+             never moved: it is the root of the supersession chain. */
+          original_submission_id: null, latest_submission_id: null,
+          last_completed_at: null,
+          next_reassessment_due_at: null, next_reassessment_kind: null,
+          completed_count: 0,
+          created_at: nowIso, updated_at: nowIso,
+          state: { verticalId, lastLinkMethod: linkMethod }
+        };
+        state.business_review_states.push(reviewState);
+      }
+      const firstOfType = reviewState.original_submission_id === null;
+      reviewState.current_bir_id = birId;
+      if (firstOfType) reviewState.original_submission_id = submissionId;
+      reviewState.latest_submission_id = submissionId;
+      reviewState.last_completed_at = timelineAt;
+      /* LIFECYCLE_POLICY: 90 days either way; the kind says which rule. */
+      reviewState.next_reassessment_due_at =
+        new Date(Date.parse(timelineAt) + 90 * 86400000).toISOString();
+      reviewState.next_reassessment_kind = firstOfType ? 'quick_recheck' : 'quarterly_review';
+      reviewState.completed_count += 1;
+      reviewState.updated_at = nowIso;
+      reviewState.state = { ...reviewState.state, verticalId, lastLinkMethod: linkMethod };
+
+      /* The legacy pointer stays a GROWTH pointer. 0006 refuses anything else
+         at the database; this mirrors that refusal. */
       const record = state.business_records.find(b => b.business_id === businessId);
-      if (record) record.current_bir_id = birId;
+      if (record && reviewType === 'growth_review') record.current_bir_id = birId;
     }
     trip('bir');
 
@@ -594,8 +846,11 @@ export function createFakeDb(options = {}) {
     }
     trip('timeline');
 
-    /* 9. Ambiguity or claim conflict -> a case. */
-    if (identityStatus === 'resolution_pending' || claimConflicts.length) {
+    /* 9. Ambiguity or claim conflict -> a case. A vetoed PROPOSAL always makes
+       one too, even when resolution succeeded by other means: "a saved
+       proposal was set aside" is a fact somebody needs to find. */
+    if (identityStatus === 'resolution_pending' || claimConflicts.length ||
+        contradictedProposals.length || verdict.disagreed) {
       const caseId = randomUUID();
       state.identity_resolution_cases.push({
         identity_resolution_id: caseId, assessment_submission_id: submissionId,
@@ -607,13 +862,25 @@ export function createFakeDb(options = {}) {
         resolved_at: null, resolved_by: null
       });
       appendEvent('identity.review_required', 1, timelineAt, 'business-record-engine', caseId,
-        claimConflicts.length
-          ? 'A claimed identifier is already held, verified, by another business.'
-          : 'Identity could not be resolved automatically; queued for review.',
+        contradictedProposals.length
+          ? 'A saved identity proposal was set aside: the submitted identity contradicts the record it named.'
+          : verdict.disagreed
+            ? 'The session and the continuation context name different records.'
+            : claimConflicts.length
+              ? 'A claimed identifier is already held, verified, by another business.'
+              : 'Identity could not be resolved automatically; queued for review.',
         { identityResolutionId: caseId, resolutionStatus,
-          reason: claimConflicts.length
-            ? 'Cross-business claim on a verified identifier.'
-            : 'No unique verified strong identifier among candidates.',
+          reason: contradictedProposals.length
+            ? 'A saved identity proposal was contradicted by submitted identity evidence.'
+            : verdict.disagreed
+              ? 'Two saved proposals name different Business Records.'
+              : claimConflicts.length
+                ? 'Cross-business claim on a verified identifier.'
+                : 'No unique verified strong identifier among candidates.',
+          continuationContradicted,
+          sessionContradicted,
+          proposalsDisagreed: verdict.disagreed,
+          vetoedProposalKinds: verdict.vetoedKinds,
           candidateBusinessIds: candidates, claimConflicts });
     }
 
@@ -625,7 +892,9 @@ export function createFakeDb(options = {}) {
       previous_value: null,
       new_value: {
         submissionId, birId, supersedesBirId: previousBirId, identityStatus, resolutionStatus,
-        payloadSchemaVersion: schemaVersion, ingestMeta: meta, claimConflicts
+        payloadSchemaVersion: schemaVersion, ingestMeta: meta,
+        continuationContradicted, sessionContradicted,
+        proposalsDisagreed: verdict.disagreed, claimConflicts
       },
       correlation_id: meta.correlationId || submissionId, created_at: nowIso
     });
@@ -634,7 +903,13 @@ export function createFakeDb(options = {}) {
     const response = {
       ok: true, replayed: false, submissionId, assessmentSessionId: sessionId,
       businessId, assessmentId: submissionId, birId, supersedesBirId: previousBirId,
-      identityStatus, payloadSchemaVersion: schemaVersion,
+      identityStatus, reviewType, linkMethod, payloadSchemaVersion: schemaVersion,
+      /* Reported so the endpoint can log it. Carries no identifier value and
+         no business id: the caller learns that a proposal was not applied,
+         never whose record it named or what differed. */
+      continuationContradicted,
+      sessionContradicted,
+      proposalsDisagreed: verdict.disagreed,
       clockSkewDetected: meta.clockSkewDetected === true,
       timelineEventIds: eventIds, receivedAt: nowIso,
       nextAction: identityStatus === 'resolution_pending' ? 'identity_review_pending' : 'results_ready'
@@ -646,7 +921,12 @@ export function createFakeDb(options = {}) {
   };
 
   const HANDLERS = {
-    ingest_assessment: ingest,
+    /* 0006: one body, two names. ingest_assessment is the compatibility
+       wrapper and always means growth_review. */
+    ingest_review: ingest,
+    ingest_assessment: args => ingest({
+      ...args, p_review_type: 'growth_review', p_continuation_business_id: null
+    }),
     check_rate_limit: checkRateLimit,
     purge_expired_idempotency_records: purgeIdempotency,
     redact_business_pii: redact

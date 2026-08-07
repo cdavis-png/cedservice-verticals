@@ -53,8 +53,11 @@
   /* Structural version of the event envelope. Bump when a field is added or
      its meaning changes; the endpoint accepts a range so a page cached before
      a deploy is not punished for it. */
-  const ANALYTICS_SCHEMA_VERSION = 1;
-  const SUPPORTED_SCHEMA_VERSIONS = [1];
+  /* 2 adds `reviewType` to the envelope. 1 stays accepted: a page cached
+     before the Service Mix deploy still emits valid events, and an event with
+     no declared review type is a Growth Review event, which is what it is. */
+  const ANALYTICS_SCHEMA_VERSION = 2;
+  const SUPPORTED_SCHEMA_VERSIONS = [1, 2];
 
   /* ---------- consent categories ----------
 
@@ -131,10 +134,56 @@
 
     /* The visitor erasing what we stored on their device. Recorded because a
        deletion nobody can see is a deletion nobody can audit. */
-    'assessment.clear_saved_data':          { category: CATEGORY.functional, version: 1 }
+    'assessment.clear_saved_data':          { category: CATEGORY.functional, version: 1 },
+
+    /* ---------- Quick Service Mix Review (SM-1) ----------
+
+       New names, never repurposed ones. The raw event table is append-only,
+       so renaming an existing event orphans its history rather than
+       migrating it — a second review type therefore gets its own names.
+
+       Movement through the questions is NOT duplicated here:
+       assessment.step_viewed and friends carry `reviewType` and are the
+       shared mechanism. Separating the funnels is a GROUP BY, not a second
+       set of names to keep in step. */
+    'service_mix.review_viewed':            { category: CATEGORY.product, version: 1, once: 'session' },
+    'service_mix.review_started':           { category: CATEGORY.product, version: 1, once: 'session' },
+    'service_mix.offering_added':           { category: CATEGORY.product, version: 1 },
+    /* Removed BEFORE submission. An offering added and deleted in one sitting
+       never happened, and this is the only trace it leaves anywhere. */
+    'service_mix.offering_removed':         { category: CATEGORY.product, version: 1 },
+    'service_mix.stage1_completed':         { category: CATEGORY.product, version: 1, once: 'session' },
+    'service_mix.results_viewed':           { category: CATEGORY.product, version: 1 },
+    'service_mix.pricing_detail_requested': { category: CATEGORY.product, version: 1 },
+    'service_mix.bundle_recommendation_viewed': { category: CATEGORY.product, version: 1 },
+    'service_mix.growth_review_clicked':    { category: CATEGORY.product, version: 1 },
+    'service_mix.ai_analysis_clicked':      { category: CATEGORY.product, version: 1 },
+    /* The visitor said the review they are continuing from is not theirs, or
+       typed over an identity-bearing prefilled field, and the borrowed
+       context was dropped. Worth counting: how often one device carries two
+       businesses is the whole reason rule B0 exists. */
+    'service_mix.continuation_rejected':    { category: CATEGORY.product, version: 1 }
   };
 
   const EVENT_NAMES = Object.keys(EVENTS);
+
+  /* ---------- review types ----------
+
+     Mirrors shared/business-intelligence/review-registry.js :: REVIEW_TYPES.
+     Restated rather than imported because this file must keep working on a
+     page that loads analytics and nothing else; a test asserts the two lists
+     stay identical.
+
+     An event with no declared review type is a Growth Review event. Any other
+     default would retroactively relabel every row already written. */
+  const REVIEW_TYPES = ['growth_review', 'service_mix'];
+  const DEFAULT_REVIEW_TYPE = 'growth_review';
+
+  /* Which review type an event name belongs to, when the name settles it.
+     Everything else takes the review type from the emitting page. */
+  const reviewTypeOfEvent = eventName =>
+    (typeof eventName === 'string' && eventName.startsWith('service_mix.'))
+      ? 'service_mix' : null;
 
   /* Events that must never be emitted twice for the same session, whatever the
      client does. Enforced client-side by suppression and server-side by the
@@ -170,7 +219,16 @@
     /* regulated categories */
     'ssn', 'dob', 'birth', 'nin', 'passport',
     'payment', 'card', 'cardholder', 'iban', 'routing', 'account', 'cvv', 'cvc',
-    'diagnosis', 'medication', 'prescription', 'patient', 'health', 'symptom'
+    'diagnosis', 'medication', 'prescription', 'patient', 'health', 'symptom',
+    /* Commercial figures from the Quick Service Mix Review. What a business
+       charges, how long it takes, how many it sells, and what that earns are
+       the substance of the review — they belong in the Business Record under
+       its consent and retention rules, and nowhere near a funnel.
+
+       `hours` and `minutes` are here because capacityHours and
+       durationMinutes are the same fact wearing a unit. */
+    'price', 'pricing', 'cost', 'revenue', 'volume', 'duration',
+    'margin', 'contribution', 'ticket', 'hours', 'minutes', 'earnings'
   ]);
 
   /* Splits an identifier into lowercase words. Handles camelCase, snake_case,
@@ -276,7 +334,26 @@
        Business Record under its consent and retention rules and never in a
        funnel; before this fix nothing enforced it. Derived from the shared
        intelligence contract below so the two cannot drift. */
-    ...closeRelatedFieldNames()
+    ...closeRelatedFieldNames(),
+
+    /* ---- Quick Service Mix Review ----
+
+       Offering identity is named outright because no token rule can catch it
+       without breaking the metadata that IS allowed. `offering` cannot be a
+       prohibited token: offeringCountBand and offeringSource are exactly what
+       analytics is permitted to know about an offering, and prohibiting the
+       word would refuse them along with the identifiers.
+
+       A stable offeringId is excluded even though it is opaque. It is stable
+       across submissions by design, which makes it a join key between a
+       funnel and a Business Record — and the absence of any such key is what
+       keeps the two apart. */
+    'offeringId', 'offeringSnapshotId', 'replacesOfferingId',
+    'offeringName', 'offeringLabel', 'offerings',
+    /* Named as well as tokenised, so they survive an edit to the token set. */
+    'sellingPrice', 'directCost', 'monthlyVolume', 'durationMinutes',
+    'monthlyRevenue', 'capacityHours', 'revenuePerCapacityHour',
+    'shareOfEnteredRevenue', 'shareOfEnteredCapacity'
   ]);
 
   const isProhibitedFieldName = key => {
@@ -298,6 +375,205 @@
      never override the prohibition. */
   const mayRecordValue = questionId =>
     SAFE_VALUE_ALLOWLIST.has(questionId) && !isProhibitedFieldName(questionId);
+
+  const normalizeReviewType = value =>
+    REVIEW_TYPES.includes(value) ? value : DEFAULT_REVIEW_TYPE;
+
+  /* Bands, not counts. Two to five is a small range and an exact count plus a
+     vertical plus a timestamp starts to identify a session; a band answers
+     "do people who enter more offerings finish more often?" just as well. */
+  const OFFERING_COUNT_BANDS = ['none', 'one', 'two_to_three', 'four_to_five', 'over_five'];
+
+  const offeringCountBand = count => {
+    const n = Number(count);
+    if (!Number.isFinite(n) || n <= 0) return 'none';
+    if (n === 1) return 'one';
+    if (n <= 3) return 'two_to_three';
+    if (n <= 5) return 'four_to_five';
+    return 'over_five';
+  };
+
+  /* ---------- Service Mix metadata ----------
+
+     A CLOSED ALLOWLIST, enforced, and the reason it is closed rather than a
+     prohibition list is worth stating.
+
+     The prohibited-name rule asks "does this key look like personal data?".
+     That works when the leak is honest — someone adds `ownerEmail` and it is
+     refused. It does nothing about the dishonest case, because the key names
+     itself: `stepId: "owner@example.com"` passes every name-based check ever
+     written, and so does `trigger: "She said she will buy in September"`.
+     Guessing at the CONTENT is no better: a content pattern that catches an
+     email address does not catch an offering name, and one that catches
+     "Gel manicure" catches half the legitimate vocabulary of the product.
+
+     So a Service Mix event may carry these keys and no others, and each value
+     must be one of a small number of things it is allowed to be. A key that
+     is not here is removed; a value that does not match is removed. Nothing
+     is truncated into a shorter version of itself, and nothing is guessed at.
+
+     Applied in the browser client before an event is queued, and AGAIN in
+     api/analytics.mjs, which additionally refuses the event outright. Twice
+     on purpose: the browser copy can be tampered with. */
+
+  const oneOf = values => {
+    const set = new Set(values);
+    return value => set.has(value);
+  };
+
+  /* A step id is authored, short, and slug-shaped. The UUID exclusion is
+     deliberate and is not redundant with the slug rule: a UUID is made
+     entirely of hex and hyphens, so it satisfies any reasonable slug pattern
+     — and a UUID is exactly the shape an offering identifier has. A step
+     called by a UUID does not exist; a UUID arriving in stepId is an
+     identifier wearing a neutral key. */
+  const STEP_ID_RE = /^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$/i;
+  const isStepId = value =>
+    typeof value === 'string' &&
+    value.length > 0 && value.length <= 64 &&
+    STEP_ID_RE.test(value) &&
+    !UUID_RE.test(value);
+
+  /* How a review was ENTERED, which is what a Service Mix page reports, and
+     what suggested one was abandoned, which only the client's own inference
+     reports. Two closed vocabularies under one key, kept apart because they
+     belong to different events — see the note on ABANDONMENT_METADATA. */
+  const ENTRY_TRIGGERS = ['standalone', 'after_growth_review', 'resumed'];
+  const ABANDON_TRIGGERS = ['idle', 'page_hidden', 'page_exit'];
+
+  /* ---------- what a PAGE may say ----------
+
+     The seven approved keys. This is the public surface: anything reaching
+     `track()` from ordinary page instrumentation is held to exactly this, on
+     every Service Mix event without exception.
+
+     `reviewType` is pinned to 'service_mix' rather than "either review type".
+     On an event already resolved as Service Mix, a metadata field claiming
+     `growth_review` is either a bug or an attempt to file the row in the
+     other funnel; both are worth refusing, and neither is worth storing. */
+  const SERVICE_MIX_METADATA = {
+    /* the review this event belongs to — and it is THIS one */
+    reviewType:        value => value === 'service_mix',
+    /* always 1 in SM-1; the field is shared vocabulary with the Growth review */
+    stage:             value => value === 1 || value === 2,
+    /* which step, for drop-off */
+    stepId:            value => isStepId(value),
+    /* how the review was entered */
+    trigger:           oneOf(ENTRY_TRIGGERS),
+    /* starter or custom — never WHICH starter */
+    offeringSource:    oneOf(['starter', 'custom']),
+    /* how many offerings, as a band */
+    offeringCountBand: oneOf(OFFERING_COUNT_BANDS),
+    /* which kind of result was shown */
+    resultKind:        oneOf(['preliminary', 'detailed'])
+  };
+
+  const SERVICE_MIX_METADATA_KEYS = Object.keys(SERVICE_MIX_METADATA);
+
+  /* ---------- what the PLATFORM may say, and on which event ----------
+
+     A different thing from the seven, and — this is the correction the v3
+     audit demanded — attached to ONE event rather than available on all of
+     them.
+
+     The v3 implementation kept a `PLATFORM_METADATA` object and claimed a
+     page could not reach it. That claim was false: the same public `track()`
+     path fed the same sanitizer, so any page could attach `provisional: true`
+     to any Service Mix event and have it stored. A funnel row saying
+     "provisional" on a results view is not a privacy leak, but it is a lie
+     about how the number was obtained, and the honesty rules in CLAUDE.md
+     section 11 are the reason the field exists at all.
+
+     So the annotations are keyed by EVENT NAME. `assessment.abandoned` is the
+     only event that carries them, because it is the only event nobody
+     observed — the client infers it from silence, and every one of these
+     fields exists to say how weak that inference is.
+
+     `clockSkewClamped` and `claimedOccurredAt` are NOT here. They are written
+     by api/analytics.mjs when it actually clamps a timestamp, and a request
+     may never supply them: a client that could assert "my clock was clamped"
+     could annotate a row with something that never happened. The endpoint
+     strips them from the request and derives them itself. */
+  const isBool = value => value === true || value === false;
+  const isCount = value =>
+    Number.isInteger(value) && value >= 0 && value <= 30 * 24 * 60 * 60 * 1000;
+
+  const ABANDONMENT_METADATA = {
+    /* Exactly true. An abandonment event is ALWAYS a guess; `provisional:
+       false` would be a claim this platform is not in a position to make. */
+    provisional:   value => value === true,
+    /* What suggested it — its own vocabulary, not the entry one. */
+    trigger:       oneOf(ABANDON_TRIGGERS),
+    quietForMs:    isCount,   /* how long the visitor had been quiet */
+    resumedCount:  isCount,   /* how many times the review was resumed */
+    reachedStage1: isBool,
+    reachedStage2: isBool
+  };
+
+  /* Written by the endpoint, never accepted from a request. Listed so a
+     stored row can be checked against a complete set of permitted keys. */
+  const ENDPOINT_DERIVED_METADATA = {
+    clockSkewClamped:  isBool,
+    claimedOccurredAt: value => typeof value === 'string' && ISO_RE.test(value)
+  };
+
+  const ENDPOINT_DERIVED_METADATA_KEYS = Object.keys(ENDPOINT_DERIVED_METADATA);
+
+  /* Which platform annotations an event may carry. One entry, deliberately:
+     a second would need the same argument made again. */
+  const PLATFORM_METADATA_BY_EVENT = {
+    'assessment.abandoned': ABANDONMENT_METADATA
+  };
+
+  const PLATFORM_METADATA_KEYS = [
+    ...new Set(Object.values(PLATFORM_METADATA_BY_EVENT).flatMap(Object.keys))
+  ];
+
+  /* Keeps the approved keys whose values are approved, and reports everything
+     else it removed. Never edits a value into an acceptable one: a shortened
+     or coerced value is a different value, and a different value is a wrong
+     measurement rather than a safe one.
+
+     `eventName` decides which platform annotations apply. Omitting it means
+     "no event in particular", and no annotation is permitted — the safe
+     default, because the caller that forgot to say which event this is, is
+     exactly the caller that should not be attaching internal fields. */
+  const sanitizeServiceMixMetadata = (metadata, eventName) => {
+    const source = metadata && typeof metadata === 'object' && !Array.isArray(metadata)
+      ? metadata : {};
+    const platform = PLATFORM_METADATA_BY_EVENT[eventName] || null;
+    const out = {};
+    const droppedFields = [];
+    Object.keys(source).forEach(key => {
+      /* The event's own platform annotations win where the names collide:
+         `trigger` means something different on an abandonment than on a page
+         view, and each has its own closed vocabulary. */
+      const accepts =
+        (platform && Object.prototype.hasOwnProperty.call(platform, key))
+          ? platform[key]
+          : (Object.prototype.hasOwnProperty.call(SERVICE_MIX_METADATA, key)
+              ? SERVICE_MIX_METADATA[key] : null);
+      const value = source[key];
+      if (!accepts) { droppedFields.push(key); return; }
+      /* An absent optional value is absent, not a violation. */
+      if (value === null || value === undefined) return;
+      if (!accepts(value)) { droppedFields.push(key); return; }
+      out[key] = value;
+    });
+    return { metadata: out, droppedFields };
+  };
+
+  /* The same rule as a list, for the endpoint, which refuses rather than
+     removes so a broken client is visible instead of silently thinned.
+
+     Endpoint-derived keys are reported as violations wherever they arrive,
+     including on the abandonment event: they are the endpoint's to write, and
+     a request carrying one is asserting something about the endpoint's own
+     clock. */
+  const serviceMixMetadataViolations = (metadata, eventName) => {
+    const dropped = sanitizeServiceMixMetadata(metadata, eventName).droppedFields;
+    return [...new Set(dropped)];
+  };
 
   /* ---------- device class ----------
      Derived from viewport and input capability. The user agent string is NOT
@@ -480,6 +756,55 @@
       fail('unsupported_schema', `Unsupported analytics schemaVersion: ${event.schemaVersion}`);
     }
 
+    /* Review type. Absent is legal and means growth_review — a schema-1 page
+       cached before the Service Mix deploy has no field to send. A PRESENT
+       value must be one we recognise, and it must agree with the event name
+       when the name settles it: a `service_mix.*` event claiming to be a
+       Growth Review would split one funnel across two review types. */
+    if (event.reviewType !== null && event.reviewType !== undefined) {
+      if (!REVIEW_TYPES.includes(event.reviewType)) {
+        fail('invalid_review_type', `Unknown reviewType: ${String(event.reviewType).slice(0, 32)}`);
+      } else {
+        const implied = reviewTypeOfEvent(event.eventName);
+        if (implied && implied !== event.reviewType) {
+          fail('review_type_mismatch',
+            `${event.eventName} is a ${implied} event and cannot carry reviewType ${event.reviewType}.`);
+        }
+      }
+    }
+
+    /* A Service Mix event may NEVER carry a Business Record identifier.
+       Growth may: its page is given one by the capture endpoint, and a funnel
+       row joined to a record is an approved part of that contract. The Service
+       Mix page is never given one — the endpoint returns an opaque
+       continuation context instead — so a businessId appearing on one of its
+       events means something upstream leaked an identifier, and the event is
+       refused rather than stored. Checked on the RESOLVED review type, so an
+       event that merely forgot to declare one is still caught by its name. */
+    const resolvedReviewType = reviewTypeOfEvent(event.eventName) ||
+      normalizeReviewType(event.reviewType);
+    if (resolvedReviewType === 'service_mix' &&
+        event.businessId !== null && event.businessId !== undefined) {
+      fail('business_id_in_service_mix',
+        'A Service Mix analytics event may not carry a Business Record identifier.');
+    }
+
+    /* And its metadata is a closed allowlist, by key AND by value. Refused
+       rather than thinned, so a client sending something unapproved finds
+       out; the endpoint removes it as well, so a refusal that is somehow
+       bypassed still stores nothing. The offending VALUE is never echoed —
+       an error message is a place it would then appear. */
+    if (resolvedReviewType === 'service_mix') {
+      const unapproved = serviceMixMetadataViolations(event.metadata, event.eventName);
+      if (unapproved.length) {
+        fail('unapproved_service_mix_metadata',
+          'A Service Mix analytics event may only carry ' +
+          `${SERVICE_MIX_METADATA_KEYS.join(', ')}, each with an approved value, ` +
+          'plus the platform annotations belonging to that particular event. ' +
+          `Refused: ${unapproved.slice(0, 8).join(', ')}.`);
+      }
+    }
+
     (definition ? definition.requires || [] : []).forEach(field => {
       if (event[field] === null || event[field] === undefined || event[field] === '') {
         fail('missing_required_field', `${event.eventName} requires ${field}.`);
@@ -521,6 +846,23 @@
     EVENTS,
     EVENT_NAMES,
     ONCE_PER_SESSION,
+    REVIEW_TYPES,
+    DEFAULT_REVIEW_TYPE,
+    reviewTypeOfEvent,
+    normalizeReviewType,
+    SERVICE_MIX_METADATA,
+    SERVICE_MIX_METADATA_KEYS,
+    ABANDONMENT_METADATA,
+    PLATFORM_METADATA_BY_EVENT,
+    PLATFORM_METADATA_KEYS,
+    ENDPOINT_DERIVED_METADATA,
+    ENDPOINT_DERIVED_METADATA_KEYS,
+    ENTRY_TRIGGERS,
+    ABANDON_TRIGGERS,
+    sanitizeServiceMixMetadata,
+    serviceMixMetadataViolations,
+    OFFERING_COUNT_BANDS,
+    offeringCountBand,
     PROHIBITED_FIELD_PATTERN,
     PROHIBITED_TOKENS,
     PROHIBITED_FIELD_NAMES,

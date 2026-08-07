@@ -55,6 +55,9 @@
   const DEFAULTS = {
     endpoint: null,              /* null → development console mode */
     verticalId: null,
+    /* Which review this page is measuring. Every event carries it so the two
+       funnels are separable by a GROUP BY rather than by two event catalogs. */
+    reviewType: 'growth_review',
     /* Batching. Small enough that a lost batch loses little, large enough
        that a 15-step assessment is not 60 requests. */
     batchSize: 12,
@@ -266,7 +269,11 @@
 
   /* ---------- emitting ---------- */
 
-  const buildEvent = (eventName, fields) => {
+  /* `internal` is true only for events this file builds about the measurement
+     itself. It is a positional argument on a module-private function, and the
+     public `track()` never forwards it — that is what separates the public
+     tracking path from the internal one. See trackInternal. */
+  const buildEvent = (eventName, fields, internal = false) => {
     const definition = events.EVENTS[eventName];
     if (!definition) return null;
 
@@ -276,7 +283,39 @@
     const ctx = context();
     const t = timings();
     const attribution = events.sanitizeAttribution(ctx.attribution);
-    const { metadata } = events.scrubMetadata(fields.metadata);
+
+    /* Resolved once, before the envelope is built, because three things
+       depend on it: which funnel the event belongs to, whether it may carry a
+       Business Record identifier at all, and which metadata rule applies. */
+    const eventReviewType = events.reviewTypeOfEvent(eventName) ||
+      events.normalizeReviewType(fields.reviewType ?? ctx.reviewType ?? state.config.reviewType);
+
+    /* A Service Mix event's metadata is a closed allowlist, by key and by
+       value — see events.js. The name-based scrub still runs first, so both
+       rules apply rather than the narrower one replacing the broader.
+
+       Removed here rather than only refused at the endpoint: a measurement
+       lost is the correct price, and an event thinned in the browser never
+       becomes a request carrying something it should not.
+
+       PLATFORM ANNOTATIONS ARE EVENT-SPECIFIC, and an event that came in
+       through the public `track()` gets none of them. The sanitizer decides
+       that from the event NAME; a public call is additionally held to the
+       page rule by passing no name at all, so a page cannot reach an
+       annotation even by naming the event that owns it. An internal call
+       passes the name and gets the annotations that belong to it. */
+    const scrubbed = events.scrubMetadata(fields.metadata).metadata;
+    const metadata = eventReviewType === 'service_mix'
+      ? events.sanitizeServiceMixMetadata(scrubbed, internal ? eventName : null).metadata
+      : scrubbed;
+
+    /* The envelope's own stepId is the same risk under a different key: it is
+       a free string, and "offerings" and an email address are equally free.
+       Held to the same shape a Service Mix step id actually has. */
+    const rawStepId = fields.stepId ?? state.stepId ?? null;
+    const stepId = eventReviewType === 'service_mix'
+      ? (events.sanitizeServiceMixMetadata({ stepId: rawStepId }).metadata.stepId ?? null)
+      : rawStepId;
 
     return {
       eventId,
@@ -288,14 +327,25 @@
 
       assessmentSessionId: state.sessionId,
       submissionId: fields.submissionId ?? state.submissionId ?? null,
-      businessId: fields.businessId ?? state.businessId ?? null,
+      /* Never for a Service Mix event. The endpoint does not give that page a
+         Business Record id, and a page that acquired one some other way must
+         not be able to put it on a funnel row. Enforced here as well as in
+         validateEvent so a leak is dropped rather than merely refused. */
+      businessId: eventReviewType === 'service_mix'
+        ? null
+        : (fields.businessId ?? state.businessId ?? null),
 
       verticalId: ctx.verticalId || state.config.verticalId || null,
       assessmentVersion: ctx.assessmentVersion || null,
       questionSetVersion: ctx.questionSetVersion || null,
 
+      /* The event name wins when it settles the matter, so a service_mix.*
+         event can never be filed under the wrong funnel by a misconfigured
+         page. Otherwise the page says which review it is. */
+      reviewType: eventReviewType,
+
       assessmentStage: fields.assessmentStage ?? state.stage ?? null,
-      stepId: fields.stepId ?? state.stepId ?? null,
+      stepId,
       questionId: fields.questionId ?? null,
 
       attribution,
@@ -333,7 +383,17 @@
     if (state.queue.length >= state.config.batchSize) void flush('batch_full');
   };
 
-  const track = (eventName, fields = {}) => {
+  /* ---------- two tracking paths, one queue ----------
+
+     `emit` is the shared body. `internal` is never derived from the caller's
+     arguments — it is a parameter only this file supplies — so there is no
+     value a page can pass to `track()` that turns a public call into an
+     internal one.
+
+     The v3 implementation had a single path and a comment asserting that
+     pages could not reach the platform annotations. The comment was wrong,
+     and a comment is not a boundary. This is. */
+  const emit = (eventName, fields, internal) => {
     if (!state || !state.installed) return;
     const definition = events.EVENTS[eventName];
     if (!definition) {
@@ -351,7 +411,7 @@
       state.emittedOnce.add(eventName);
     }
 
-    const event = buildEvent(eventName, fields);
+    const event = buildEvent(eventName, fields, internal);
     if (!event) return;
 
     const check = events.validateEvent(event);
@@ -367,6 +427,15 @@
 
     enqueue(event);
   };
+
+  /* The PUBLIC path. Everything a page calls arrives here, and it can never
+     attach a platform annotation, whatever event it names. */
+  const track = (eventName, fields = {}) => emit(eventName, fields, false);
+
+  /* The INTERNAL path. Used only by this file, for events it builds about the
+     measurement itself rather than about anything the visitor did. Not
+     exported on the public API. */
+  const trackInternal = (eventName, fields = {}) => emit(eventName, fields, true);
 
   /* ---------- transport ---------- */
 
@@ -515,12 +584,20 @@
     if (state.lastAbandonState === key) return;
     state.lastAbandonState = key;
 
-    track('assessment.abandoned', {
+    /* The INTERNAL builder. Nobody observed this event — the client inferred
+       it from silence — and every field below exists to say how weak that
+       inference is. `provisional: true` is what stops an abandonment count
+       being read as a total.
+
+       Rounded to integers here rather than validated loosely there: a
+       fractional millisecond is not a measurement anyone will ever use, and
+       the annotation rule takes integers only. */
+    trackInternal('assessment.abandoned', {
       metadata: {
         trigger,
         provisional: true,
-        quietForMs: Math.round(quietForMs || 0),
-        resumedCount: state.resumedCount,
+        quietForMs: Math.max(0, Math.round(quietForMs || 0)),
+        resumedCount: Math.max(0, Math.round(state.resumedCount || 0)),
         reachedStage1: state.emittedOnce.has('assessment.stage1_completed'),
         reachedStage2: state.emittedOnce.has('assessment.stage2_started')
       }

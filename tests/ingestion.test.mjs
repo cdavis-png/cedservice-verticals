@@ -95,7 +95,10 @@ test('a second submission in the same session links to the same business', async
   assert.equal(c.submissions, 2);
   assert.equal(c.birs, 2);
 
-  /* Session linkage is deterministic: no new business.created event. */
+  /* The session proposed the same record and nothing in this submission
+     contradicts it — same business, same contact — so it links and no second
+     business.created event is written. A session that is CONTRADICTED does
+     not link; see tests/identity-proposals.test.mjs, rule B0. */
   assert.equal(db.state.timeline_events.filter(e => e.event_name === 'business.created').length, 1);
   const linkEvent = db.state.timeline_events.find(
     e => e.event_name === 'identity.linked' && e.payload.linkedArtifactId === second.submissionId);

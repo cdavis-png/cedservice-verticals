@@ -69,7 +69,7 @@ payload, not the report, not the price. Every engine call goes through a
 wrapper that swallows failures, and there is no foreign key from an analytics
 table to the Business Record. A vertical marks a control with
 `data-analytics-event`; it does not add event names, and it does not widen the
-privacy rules. See section 10.
+privacy rules. See section 11.
 
 **Direction of dependency is one-way.** A vertical imports from `shared/` and
 `design-system/`. Shared code must never import from, reference, or special-case
@@ -140,9 +140,15 @@ has a rule that must not be quietly relaxed:
 See [docs/PRODUCTION_HARDENING.md](docs/PRODUCTION_HARDENING.md) and
 [docs/IMPLEMENTATION_MILESTONE_1.md](docs/IMPLEMENTATION_MILESTONE_1.md).
 
-**Known outstanding gaps:** no production database is connected; migrations
-0001–0004 are validated against a development Postgres, but section M of the
-integration suite has not yet run over PostgREST; no challenge provider has
+**Known outstanding gaps:** no production database is connected; migration
+0006 has been validated against a disposable local PostgreSQL 18.3 — the whole
+chain, a clean install and an upgrade over populated pre-0006 data, with the
+full integration suite including sections O, P and Q passing — but has **never
+been applied to a hosted database and has never run against PostgreSQL 17**,
+which is what the hosted development project runs; nothing has ever run over
+PostgREST; migrations 0001–0005 are validated against that hosted development
+Postgres, but section M of the integration suite has not run over PostgREST
+either; the application is not deployed for public traffic; no challenge provider has
 been chosen; there is no surface for working the identity-resolution queue, so
 ambiguous submissions are stored safely but cannot yet be resolved by anyone —
 a queue the intelligence expansion sends *more* work to, since multi-location
@@ -469,7 +475,66 @@ the planned medical/dental family, where the temptation is highest.
 
 ---
 
-## 10. Analytics
+## 10. Review types
+
+"Assessment" used to mean one thing. It now means two, and the difference is
+a first-class dimension called `review_type`.
+
+| | `growth_review` | `service_mix` |
+| --- | --- | --- |
+| What it asks | The operational picture, in two stages | Two to five offerings, in one |
+| What it produces | BIR **v4** | BIR **v5**, `reportType: "service_mix"` |
+| Payload schema | 2–5 | 6 |
+| Engine | `shared/business-intelligence/` | `shared/service-mix-engine/` |
+
+`shared/business-intelligence/review-registry.js` is the routing table: which
+engine generates, which validator checks, which BIR version each produces.
+Nothing else should branch on a review type by hand.
+
+**Growth reports stay at v4 and stay immutable.** `BIR_SCHEMA_VERSION` in
+`report.schema.js` is the *Growth* generator's version and was deliberately
+not bumped for SM-1. A consumer branches on `reportType`, never on
+`schemaVersion` alone.
+
+**Every existing row is `growth_review`**, by column default and by backfill.
+Any other default would retroactively relabel history.
+
+**Supersession is closed within one business AND one review type.** A Service
+Mix report may *reference* the applicable Growth BIR through
+`relatedGrowthReview`; it may never supersede one, and the database refuses
+the attempt as well as the engine. `business_records.current_bir_id` keeps
+meaning "the current Growth report" — it predates review types and is not
+repurposed. `business_review_states`, keyed `(business_id, review_type)`, is
+the forward-looking surface and is what makes the two independently current.
+
+**A second review attaches by a server-issued continuation context, never by
+a client-supplied Business Record id.** The endpoint signs an opaque,
+expiring token with `CED_CONTINUATION_SECRET`, the browser echoes it back
+untouched, and `shared/security/continuation.js` verifies it before anything
+links. The token is stripped from the payload before hashing or storage, like
+the challenge token and for the same reason, and any `businessId` a client
+puts in the payload is deleted rather than ignored. Every failure mode falls
+through to ordinary identity resolution: a visitor whose token aged out still
+gets their results.
+
+**SM-1 never claims profit.** It collects no direct costs, so contribution,
+underpricing, add-on and bundle analyses are present in the report and marked
+`requires_detailed_review`. The validator refuses a report that marks any of
+them available without cost evidence. The approved phrase is *estimated
+contribution*, never *profit leader* — `classify.js :: CONTRIBUTION_LANGUAGE`
+is the authority and the templates read from it.
+
+**A finding is raised only when its interval clears the threshold**, never its
+midpoint. A threshold the interval straddles is not cleared, however
+favourable the middle looks. This is what stops the review manufacturing
+conclusions to fill a report.
+
+Full detail: [docs/SERVICE_MIX_REVIEW.md](docs/SERVICE_MIX_REVIEW.md) and
+[docs/SERVICE_MIX_BIR.md](docs/SERVICE_MIX_BIR.md).
+
+---
+
+## 11. Analytics
 
 First-party, pseudonymous, and strictly observational. Full detail in
 [docs/ASSESSMENT_ANALYTICS.md](docs/ASSESSMENT_ANALYTICS.md),
@@ -527,7 +592,14 @@ step and **makes no recommendation**.
 
 ### Known outstanding gaps
 
-Migration 0005 has never been executed. The analytics consent policy is
-**pending professional review** and no compliance claim is made anywhere. There
-is no signed session token, so the endpoint's only real defences are the origin
-allowlist and rate limiting. Abandonment counts are a floor, not a total.
+Migration 0005 **has** been executed against the hosted development
+PostgreSQL 17 project; migration 0006 has been executed only against a
+disposable local PostgreSQL 18.3 through PGlite, and has never run against
+PostgreSQL 17, hosted Supabase, or PostgREST. Nothing has ever run through
+PostgREST at all. The single record of what has and has not executed is
+[docs/REAL_POSTGRES_VALIDATION.md](docs/REAL_POSTGRES_VALIDATION.md).
+
+The analytics consent policy is **pending professional review** and no
+compliance claim is made anywhere. There is no signed session token, so the
+endpoint's only real defences are the origin allowlist and rate limiting.
+Abandonment counts are a floor, not a total.
