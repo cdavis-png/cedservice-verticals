@@ -1,7 +1,13 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "node tools/build-static.mjs",
+  "outputDirectory": "dist",
   "functions": {
     "api/assessments.mjs": {
+      "maxDuration": 15,
+      "memory": 512
+    },
+    "api/staff/identity-resolution/[...path].mjs": {
       "maxDuration": 15,
       "memory": 512
     }
@@ -15,11 +21,17 @@
         { "key": "X-Content-Type-Options", "value": "nosniff" },
         { "key": "Referrer-Policy", "value": "no-referrer" }
       ]
+    },
+    {
+      "source": "/staff/(.*)",
+      "headers": [
+        { "key": "X-Frame-Options", "value": "DENY" },
+        { "key": "Content-Security-Policy", "value": "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'" },
+        { "key": "Cache-Control", "value": "no-store" },
+        { "key": "Referrer-Policy", "value": "no-referrer" },
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "X-Robots-Tag", "value": "noindex, nofollow, noarchive" }
+      ]
     }
-  ],
-  "comments": {
-    "maxDuration": "The function budget must sit between the database timeout (CED_DB_TIMEOUT_MS, 6s) and the browser timeout (assessment.config.js submission.timeoutMs, 20s). Raising CED_DB_TIMEOUT_MS above this value would let the platform kill the request before the endpoint can answer.",
-    "regions": "Pin the function to the same region as the Supabase project. A function and a database on different continents add 100-300ms to every query INSIDE the ingestion transaction. iad1 is a placeholder: change it to match the region chosen in docs/SUPABASE_SETUP.md.",
-    "scope": "This file configures the deployment. Nothing here deploys anything, and no project is connected yet."
-  }
+  ]
 }

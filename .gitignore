@@ -82,6 +82,7 @@ report.*.json
 
 # ---------- Build & deployment artifacts ----------
 dist/
+dist.tmp-*/
 build/
 out/
 .next/

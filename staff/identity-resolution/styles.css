@@ -1,0 +1,190 @@
+/* ============================================================
+   Staff console — identity resolution
+   ------------------------------------------------------------
+   Mobile-first, min-width breakpoints. Deliberately plain: this
+   is a working surface for a person deciding something
+   consequential, not a marketing page.
+
+   ITS OWN TOKEN LAYER, DECLARED HERE, AND WHY.
+
+   design-system/standards/tokens.css is the marketing palette:
+   --bg #060916, --panel, --text #f7f9ff, --blue, --cyan,
+   --purple, --radius 24px. It is a dark, high-contrast brand
+   surface, and it is the right vocabulary for a landing page.
+
+   This is not a landing page. It is a light, quiet, dense
+   administrative screen that has to stay legible for an hour at
+   a time, and every one of the marketing tokens would be wrong
+   for it. So it declares its own, namespaced `--staff-*` layer
+   rather than pretending to consume the shared one.
+
+   This file previously named nine tokens — --color-surface,
+   --color-ink and the rest — that exist in NO stylesheet in this
+   repository. Every var() fell through to its literal fallback
+   and the shared import contributed nothing, while the header
+   claimed otherwise. A stated dependency that does not exist is
+   worse than an honest local layer, which is what this is.
+
+   CLAUDE.md section 2 keeps SHARED tokens in exactly one file.
+   These are not shared tokens: nothing outside this directory
+   may read them, and no vertical may.
+   ============================================================ */
+
+:root {
+  --staff-surface:    #f7f7f8;
+  --staff-panel:      #ffffff;
+  --staff-ink:        #1b1b1f;
+  --staff-ink-muted:  #5b5b66;
+  --staff-line:       #e2e2e8;
+  --staff-focus:      #2f6fed;
+  --staff-warning:    #b26a00;
+  --staff-danger:     #a4172c;
+  --staff-success:    #14683f;
+  --staff-radius:     8px;
+  --staff-radius-lg:  12px;
+  --staff-font: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--staff-surface);
+  color: var(--staff-ink);
+  font-family: var(--staff-font);
+  line-height: 1.5;
+}
+
+.shell, .panel, .bar { width: min(1180px, calc(100% - 40px)); margin-inline: auto; }
+
+.skip-link {
+  position: absolute; left: -9999px; top: 0;
+  background: var(--staff-ink); color: #fff;
+  padding: 12px 16px; z-index: 10;
+}
+.skip-link:focus { left: 8px; top: 8px; }
+
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px; overflow: hidden;
+  clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap;
+}
+
+.bar { padding: 24px 0 8px; }
+.eyebrow {
+  margin: 0; font-size: 0.75rem; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--staff-ink-muted);
+}
+h1 { margin: 4px 0 0; font-size: clamp(1.4rem, 4vw, 1.9rem); font-weight: 650; }
+h2 { font-size: 1.15rem; margin-top: 0; }
+h3 { font-size: 1rem; margin-bottom: 4px; }
+
+.bar__who { font-size: 0.85rem; color: var(--staff-ink-muted); }
+.bar__who span { font-family: ui-monospace, "SFMono-Regular", monospace; }
+
+.panel {
+  background: #fff;
+  border: 1px solid var(--staff-line);
+  border-radius: var(--staff-radius-lg);
+  padding: 20px;
+  margin-block: 16px;
+}
+
+main:focus { outline: none; }
+
+.muted { color: var(--staff-ink-muted); font-size: 0.9rem; }
+.hint  { color: var(--staff-ink-muted); font-size: 0.8rem; margin: 4px 0 0; }
+.empty { color: var(--staff-ink-muted); padding: 24px 0; }
+
+.field { margin-block: 14px; }
+.field label { display: block; font-weight: 600; margin-bottom: 4px; }
+.field--check { display: flex; gap: 10px; align-items: flex-start; }
+.field--check label { font-weight: 400; }
+
+input[type="text"], input[type="email"], input[type="password"], select, textarea {
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 12px;
+  border: 1px solid var(--staff-line);
+  border-radius: var(--staff-radius);
+  font: inherit;
+  background: #fff;
+}
+textarea { min-height: 88px; resize: vertical; }
+input[type="checkbox"], input[type="radio"] { width: 22px; height: 22px; margin: 2px 0 0; }
+
+:focus-visible {
+  outline: 3px solid var(--staff-focus);
+  outline-offset: 2px;
+}
+
+.btn {
+  min-height: 44px; min-width: 44px;
+  padding: 10px 18px;
+  border-radius: var(--staff-radius);
+  border: 1px solid var(--staff-line);
+  background: #fff;
+  font: inherit; font-weight: 600;
+  cursor: pointer;
+}
+.btn--primary { background: var(--staff-ink); color: #fff; border-color: transparent; }
+.btn--quiet { background: transparent; }
+.btn[disabled] { opacity: 0.5; cursor: not-allowed; }
+
+/* The queue reads as a table because it is one. On a phone it scrolls
+   inside its own container rather than pushing the page sideways. */
+.queue { width: 100%; border-collapse: collapse; display: block; overflow-x: auto; }
+.queue th, .queue td {
+  text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--staff-line);
+  font-size: 0.9rem; vertical-align: top;
+}
+.queue th { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.05em; }
+
+.pager { display: flex; gap: 12px; align-items: center; margin-top: 14px; }
+
+.facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 0 0 16px; }
+.facts dt { font-weight: 600; color: var(--staff-ink-muted); }
+.facts dd { margin: 0; }
+
+.evidence { padding-left: 20px; }
+.evidence li { margin-bottom: 4px; font-size: 0.9rem; }
+
+.candidate { display: flex; gap: 10px; align-items: flex-start; padding: 10px 0; }
+.candidate label { font-weight: 400; }
+
+fieldset { border: 1px solid var(--staff-line); border-radius: var(--staff-radius); padding: 12px 16px; }
+legend { font-weight: 600; padding-inline: 6px; }
+
+/* Status colours never carry meaning alone — every one of these has words
+   in it, which is the rule for the assessment status words too. */
+.warn {
+  border-left: 4px solid var(--staff-warning);
+  background: #fff8ec; padding: 12px 14px; border-radius: var(--staff-radius);
+  margin-block: 12px;
+}
+.override {
+  border: 1px solid var(--staff-warning);
+  background: #fff8ec;
+  border-radius: var(--staff-radius);
+  padding: 14px 16px;
+  margin-block: 16px;
+}
+.error { color: var(--staff-danger); font-weight: 600; }
+.ok    { color: var(--staff-success); font-weight: 600; }
+
+@media (min-width: 720px) {
+  .bar { display: grid; grid-template-columns: 1fr auto; align-items: end; }
+  .bar__who { grid-column: 2; margin: 0; }
+  .panel { padding: 28px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}
+
+@media (prefers-color-scheme: dark) {
+  body { background: #14141a; color: #ececf1; }
+  .panel { background: #1c1c24; border-color: #2e2e3a; }
+  input, select, textarea, .btn { background: #14141a; color: #ececf1; border-color: #3a3a48; }
+  .btn--primary { background: #ececf1; color: #14141a; }
+  .warn, .override { background: #2a2214; }
+}

@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow, noarchive">
+  <title>Identity resolution — CED Service staff</title>
+  <!-- This page is NOT a public vertical. It is exempt from the file://
+       requirement in CLAUDE.md §1 because a secure authentication callback
+       and privileged data cannot be handled from a local file, and it says
+       so here so the exemption is never mistaken for an oversight. It is
+       served over HTTPS, behind Supabase Auth with a second factor. -->
+  <!-- The marketing token file is deliberately NOT imported. It is a dark
+       brand palette for landing pages; this is a light administrative screen
+       and consumes none of it. styles.css declares its own namespaced
+       --staff-* layer instead, and says why. -->
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to the queue</a>
+
+  <header class="bar">
+    <p class="eyebrow">CED SERVICE — STAFF</p>
+    <h1>Identity resolution</h1>
+    <p class="bar__who" id="who" hidden>
+      Signed in as <span id="who-id"></span>
+      <button type="button" id="sign-out" class="btn btn--quiet">Sign out</button>
+    </p>
+  </header>
+
+  <main id="main" tabindex="-1">
+
+    <!-- Sign-in. Invite-only: there is no registration control anywhere on
+         this page, deliberately. -->
+    <section id="signin" class="panel" aria-labelledby="signin-h">
+      <h2 id="signin-h">Sign in</h2>
+      <p class="muted">Staff accounts are provisioned by an owner. There is no
+        self-registration, and a second factor is required.</p>
+      <form id="signin-form" novalidate>
+        <div class="field">
+          <label for="email">Work email</label>
+          <input id="email" name="email" type="email" inputmode="email"
+                 autocomplete="username" required>
+        </div>
+        <div class="field">
+          <label for="password">Password</label>
+          <input id="password" name="password" type="password"
+                 autocomplete="current-password" required>
+        </div>
+        <div class="field" id="totp-field" hidden>
+          <label for="totp">Authentication code</label>
+          <input id="totp" name="totp" type="text" inputmode="numeric"
+                 autocomplete="one-time-code" pattern="[0-9]*" maxlength="6">
+          <p class="hint">Six digits from your authenticator app.</p>
+        </div>
+        <button type="submit" class="btn btn--primary" id="signin-submit">Sign in</button>
+      </form>
+      <p class="error" id="signin-error" role="alert" aria-live="assertive" hidden></p>
+      <!-- Shown when the account has no verified authenticator app. It is a
+           provisioning problem, not a sign-in problem, so it is stated
+           separately and points at the person who can fix it. There is no
+           enrollment control here, deliberately. -->
+      <p class="warn" id="signin-enrollment" role="status" hidden></p>
+    </section>
+
+    <!-- Queue -->
+    <section id="queue" class="panel" aria-labelledby="queue-h" hidden>
+      <h2 id="queue-h">Open cases</h2>
+      <p class="muted" id="queue-summary" aria-live="polite"></p>
+
+      <p class="empty" id="queue-empty" hidden>
+        No open cases. Nothing is waiting on a person.
+      </p>
+
+      <table class="queue" id="queue-table" hidden>
+        <caption class="visually-hidden">
+          Open identity-resolution cases, oldest first.
+        </caption>
+        <thead>
+          <tr>
+            <th scope="col">Submitted as</th>
+            <th scope="col">Age</th>
+            <th scope="col">Review</th>
+            <th scope="col">Why it stopped</th>
+            <th scope="col">Evidence</th>
+            <th scope="col">Candidates</th>
+            <th scope="col"><span class="visually-hidden">Open case</span></th>
+          </tr>
+        </thead>
+        <tbody id="queue-body"></tbody>
+      </table>
+
+      <nav class="pager" aria-label="Queue pages" id="pager" hidden>
+        <button type="button" class="btn btn--quiet" id="prev">Previous</button>
+        <span id="page-label" aria-live="polite"></span>
+        <button type="button" class="btn btn--quiet" id="next">Next</button>
+      </nav>
+    </section>
+
+    <!-- Case detail -->
+    <section id="detail" class="panel" aria-labelledby="detail-h" hidden>
+      <button type="button" class="btn btn--quiet" id="back">Back to the queue</button>
+      <h2 id="detail-h">Case</h2>
+
+      <div class="warn" id="detail-warn" role="status" hidden></div>
+
+      <h3>What was submitted</h3>
+      <dl class="facts" id="submitted-facts"></dl>
+
+      <h3>Why automatic resolution stopped</h3>
+      <p id="stop-reason"></p>
+      <ul class="evidence" id="conflict-list"></ul>
+
+      <h3>Candidate records</h3>
+      <p class="muted" id="no-candidates" hidden></p>
+      <form id="resolve-form" novalidate>
+        <fieldset id="candidates-set">
+          <legend>Choose the record this review belongs to</legend>
+          <div id="candidates"></div>
+        </fieldset>
+
+        <div class="field" id="note-field">
+          <label for="note">Resolution note</label>
+          <textarea id="note" name="note" rows="3" required minlength="8"
+                    aria-describedby="note-hint"></textarea>
+          <p class="hint" id="note-hint">
+            Say what you checked. Do not paste passwords, card details or
+            anything you would not want kept.
+          </p>
+        </div>
+
+        <!-- Only shown when the chosen record contradicts the submission.
+             Either because the case evidence says so, or because the server
+             checked the record as it stands now and refused without one. -->
+        <div class="override" id="override" hidden>
+          <h3 id="override-h">This record contradicts the submission</h3>
+          <p class="warn" id="override-required" role="status" hidden>
+            The server checked this record as it stands now and refused the
+            link without a documented override. Nothing has been changed.
+          </p>
+          <p>The business name and contact evidence do not match this record.
+            Linking anyway overrides an automatic protection, and that is
+            recorded against your account.</p>
+          <div class="field">
+            <label for="override-reason">Why is this link correct?</label>
+            <select id="override-reason" name="overrideReason">
+              <option value="">Choose a reason</option>
+              <option value="verified_same_business">Verified the same business</option>
+              <option value="business_rebrand">Business rebrand</option>
+              <option value="contact_information_changed">Contact information changed</option>
+              <option value="source_information_incorrect">Source information was incorrect</option>
+              <option value="other_verified_evidence">Other verified evidence</option>
+            </select>
+          </div>
+          <div class="field field--check">
+            <input type="checkbox" id="override-confirm" name="overrideConfirm">
+            <label for="override-confirm">
+              I have verified this is the same business and I am overriding the
+              automatic identity protection.
+            </label>
+          </div>
+        </div>
+
+        <button type="submit" class="btn btn--primary" id="resolve">Link this review</button>
+        <p class="error" id="detail-error" role="alert" aria-live="assertive" hidden></p>
+        <p class="ok" id="detail-ok" role="status" aria-live="polite" hidden></p>
+      </form>
+    </section>
+  </main>
+
+  <!-- The production authentication adapter, first. It sets
+       window.CED_STAFF_AUTH, which page.js uses for every token it needs.
+       Both are deferred, so they execute in document order. -->
+  <script src="auth.js" defer></script>
+  <script src="page.js" defer></script>
+</body>
+</html>

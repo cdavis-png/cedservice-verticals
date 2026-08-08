@@ -171,7 +171,9 @@ test('clean installation of the whole chain', async t => {
       const tables = (await CLEAN.pg.query(
         `select tablename from pg_tables where schemaname = 'public' order by 1`)).rows.map(r => r.tablename);
       assert.ok(tables.includes('business_review_states'));
-      assert.equal(tables.length, 14);
+      assert.ok(tables.includes('staff_operators') && tables.includes('identity_resolution_requests'),
+        '0007 adds the staff operator record and the resolution idempotency ledger');
+      assert.equal(tables.length, 16);
 
       const functions = (await CLEAN.pg.query(
         `select proname from pg_proc p join pg_namespace n on n.oid = p.pronamespace
@@ -185,7 +187,8 @@ test('clean installation of the whole chain', async t => {
     await t.test('applying 0006 twice changes nothing the second time', async () => {
       const before = await snapshotSchema(CLEAN.pg);
       const again = await CLEAN.upgrade('0005');
-      assert.deepEqual(again.map(a => a.file), ['0006_service_mix_review.sql']);
+      assert.deepEqual(again.map(a => a.file),
+        ['0006_service_mix_review.sql', '0007_staff_identity_resolution.sql']);
 
       const after = await snapshotSchema(CLEAN.pg);
       assert.deepEqual(after, before, 'a rerun must be a no-op, not a second set of objects');
@@ -198,7 +201,7 @@ test('clean installation of the whole chain', async t => {
            from pg_class c join pg_namespace n on n.oid = c.relnamespace
           where n.nspname = 'public' and c.relkind = 'r' order by 1`)).rows;
 
-      assert.equal(rows.length, 14);
+      assert.equal(rows.length, 16);
       rows.forEach(r => {
         assert.equal(r.relrowsecurity, true, `${r.relname}: RLS must be enabled`);
         assert.equal(r.relforcerowsecurity, true, `${r.relname}: RLS must be FORCED`);

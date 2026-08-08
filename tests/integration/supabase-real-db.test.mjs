@@ -4234,6 +4234,1507 @@ utcIt('T8 — P, R and S regressions are unaffected by the null refusal', async 
   assert.match(malformed.error.message, /position 0 is invalid/);
 });
 
+
+/* ---------- U. staff identity resolution, in real PostgreSQL ----------
+
+   The route's own tests prove what it refuses before it reaches the
+   database. This section proves the half a fake cannot: `for update` on five
+   rows, a unique index deciding between two browser tabs, and a raise leaving
+   nothing behind.
+
+   Every case here is built directly rather than through ingestion, because
+   what is under test is the RESOLUTION, and the case-creation paths already
+   have P1-P18 to themselves. */
+
+const AAL2 = 'aal2';
+
+const makeOperator = async ({ role = 'identity_resolver', active = true } = {}) => {
+  const userId = id();
+  const { error } = await db.from('staff_operators').insert({
+    user_id: userId, role,
+    active, disabled_at: active ? null : new Date().toISOString()
+  });
+  assert.equal(error, null, 'operator seed');
+  return userId;
+};
+
+/* A queued submission, its report, and an open case naming one candidate. */
+const makeQueuedCase = async ({ candidates, reviewType = 'service_mix',
+                                submittedAt = null, names = null,
+                                conflictingSignals = [] } = {}) => {
+  const s = names || salonNames(`u-${id().slice(0, 6)}`);
+  const sessionId = id();
+  const submissionId = id();
+  const birId = id();
+  const caseId = id();
+  created.submissionIds.push(submissionId);
+
+  await db.from('assessment_sessions').insert({
+    assessment_session_id: sessionId, business_id: null, first_touch: {},
+    review_type: reviewType
+  });
+
+  const payloadDoc = reviewType === 'service_mix'
+    ? serviceMixPayload({ submissionId, sessionId })
+    : payload({ submissionId, sessionId });
+  const contactful = {
+    ...payloadDoc,
+    contact: { ...payloadDoc.contact, salonName: s.b, email: s.bEmail }
+  };
+  const when = submittedAt || new Date().toISOString();
+  const payloadHash = createHash('sha256').update(JSON.stringify(contactful)).digest('hex');
+
+  const { error: subError } = await db.from('assessment_submissions').insert({
+    submission_id: submissionId, assessment_session_id: sessionId, business_id: null,
+    assessment_version: '1.0.0', vertical_id: 'nails', raw_payload: contactful,
+    identity_status: 'resolution_pending', submitted_at: when, received_at: when,
+    payload_hash: payloadHash, review_type: reviewType
+  });
+  assert.equal(subError, null, 'submission seed');
+
+  const { error: birError } = await db.from('business_intelligence_reports').insert({
+    bir_id: birId, business_id: null, assessment_submission_id: submissionId,
+    schema_version: reviewType === 'service_mix' ? 5 : 4,
+    report: reviewType === 'service_mix' ? serviceMixBir() : bir(s.b),
+    confidence_band: 'medium', review_type: reviewType
+  });
+  assert.equal(birError, null, 'bir seed');
+
+  const { error: caseError } = await db.from('identity_resolution_cases').insert({
+    identity_resolution_id: caseId, assessment_submission_id: submissionId,
+    candidate_business_ids: (candidates || []).map(b => ({
+      businessId: b, matchedTypes: ['email_domain'],
+      verifiedStrongTypes: [], claimedStrongTypes: [] })),
+    contributing_signals: [], conflicting_signals: conflictingSignals,
+    confidence: 0.4, resolution_status: 'possible_duplicate',
+    recommended_action: 'queue_for_review'
+  });
+  assert.equal(caseError, null, 'case seed');
+
+  return { caseId, submissionId, birId, sessionId, payloadHash, names: s, submittedAt: when };
+};
+
+const signalsFor = names => [
+  { type: 'business_name', normalizedValue: names.b },
+  { type: 'email_exact', normalizedValue: names.bEmail }
+];
+
+const resolve = async ({ operator, caseId, target, requestId, hash, note, signals,
+                         payloadHash, aal = AAL2, override = false, reason = null }) =>
+  rpc('resolve_identity_case_link_existing', {
+    p_operator_user_id: operator, p_aal: aal, p_case_id: caseId,
+    p_target_business_id: target,
+    p_resolution_request_id: requestId || id(),
+    p_request_hash: hash || createHash('sha256').update(caseId + target).digest('hex'),
+    p_note: note || 'Confirmed by phone with the owner.',
+    p_signals: signals, p_payload_hash: payloadHash,
+    p_override_conflict: override, p_override_reason: reason
+  });
+
+utcIt('U1 — the operator guard refuses everything except an active, AAL2 operator', async () => {
+  const stranger = id();
+  const disabled = await makeOperator({ active: false });
+  const good = await makeOperator();
+
+  const notAnOperator = await rpc('staff_identity_queue',
+    { p_operator_user_id: stranger, p_aal: AAL2, p_limit: 10, p_offset: 0 });
+  assert.equal(notAnOperator.data, null);
+  assert.match(notAnOperator.error.message, /staff_not_an_operator/);
+
+  const revoked = await rpc('staff_identity_queue',
+    { p_operator_user_id: disabled, p_aal: AAL2, p_limit: 10, p_offset: 0 });
+  assert.equal(revoked.data, null);
+  assert.match(revoked.error.message, /staff_operator_disabled/);
+
+  for (const aal of [null, 'aal1', 'AAL2', '']) {
+    const weak = await rpc('staff_identity_queue',
+      { p_operator_user_id: good, p_aal: aal, p_limit: 10, p_offset: 0 });
+    assert.equal(weak.data, null, `aal=${aal}`);
+    assert.match(weak.error.message, /staff_aal2_required/, `aal=${aal}`);
+  }
+
+  const ok = await rpc('staff_identity_queue',
+    { p_operator_user_id: good, p_aal: AAL2, p_limit: 10, p_offset: 0 });
+  assert.equal(ok.error, null);
+  assert.ok(Array.isArray(ok.data));
+});
+
+utcIt('U2 — revocation blocks the very next call, with no token involved', async () => {
+  const operator = await makeOperator();
+  const before = await rpc('staff_identity_queue',
+    { p_operator_user_id: operator, p_aal: AAL2, p_limit: 5, p_offset: 0 });
+  assert.equal(before.error, null, 'authorized to begin with');
+
+  await db.from('staff_operators')
+    .update({ active: false, disabled_at: new Date().toISOString() })
+    .eq('user_id', operator);
+
+  const after = await rpc('staff_identity_queue',
+    { p_operator_user_id: operator, p_aal: AAL2, p_limit: 5, p_offset: 0 });
+  assert.equal(after.data, null);
+  assert.match(after.error.message, /staff_operator_disabled/,
+    'a live lookup, so nothing has to expire first');
+});
+
+utcIt('U3 — the queue lists open cases only, oldest first, with no values in it', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('u3');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const one = await makeQueuedCase({ candidates: [salonA.businessId] });
+  const two = await makeQueuedCase({ candidates: [salonA.businessId] });
+
+  const { data, error } = await rpc('staff_identity_queue',
+    { p_operator_user_id: operator, p_aal: AAL2, p_limit: 100, p_offset: 0 });
+  assert.equal(error, null);
+
+  const ids = data.map(r => r.identity_resolution_id);
+  assert.ok(ids.includes(one.caseId) && ids.includes(two.caseId));
+  assert.ok(ids.indexOf(one.caseId) < ids.indexOf(two.caseId), 'oldest first');
+  data.forEach(r => assert.ok(r.candidate_count >= 0));
+
+  /* No identifier value anywhere in the list — only the business LABEL the
+     visitor typed, which is what the operator has to read to decide. */
+  const text = JSON.stringify(data);
+  assert.equal(text.includes(s.aEmail), false, 'no candidate email');
+  assert.equal(text.includes(one.names.bEmail), false, 'no submitted email');
+
+  /* Resolving one removes it from the list. */
+  await resolve({ operator, caseId: one.caseId, target: salonA.businessId,
+    signals: signalsFor(one.names), payloadHash: one.payloadHash,
+    override: true, reason: 'verified_same_business',
+    note: 'Verified with the owner that this is the same salon under a new name.' });
+
+  const after = await rpc('staff_identity_queue',
+    { p_operator_user_id: operator, p_aal: AAL2, p_limit: 100, p_offset: 0 });
+  assert.equal(after.data.map(r => r.identity_resolution_id).includes(one.caseId), false);
+});
+
+utcIt('U4 — a target outside the candidate set is refused', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('u4');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const other = await establishBusiness(`${s.a} downtown`, email('u4-other'));
+  const c = await makeQueuedCase({ candidates: [salonA.businessId] });
+
+  const { data, error } = await resolve({ operator, caseId: c.caseId,
+    target: other.businessId, signals: signalsFor(c.names), payloadHash: c.payloadHash });
+
+  assert.equal(data, null);
+  assert.match(error.message, /target_not_a_candidate/);
+
+  const [submission] = await rows('assessment_submissions', 'submission_id', c.submissionId);
+  assert.equal(submission.business_id, null, 'and nothing was attached');
+});
+
+utcIt('U5 — a merged-away target is refused, never silently followed', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('u5');
+  const survivor = await establishBusiness(s.a, s.aEmail);
+  const mergedAway = await establishBusiness(`${s.a} old`, email('u5-old'));
+  await db.from('business_records')
+    .update({ merged_into_business_id: survivor.businessId })
+    .eq('business_id', mergedAway.businessId);
+
+  const c = await makeQueuedCase({ candidates: [mergedAway.businessId] });
+  const { data, error } = await resolve({ operator, caseId: c.caseId,
+    target: mergedAway.businessId, signals: signalsFor(c.names), payloadHash: c.payloadHash,
+    override: true, reason: 'verified_same_business',
+    note: 'Trying to resolve against a record that has since been merged away.' });
+
+  assert.equal(data, null);
+  assert.match(error.message, /target_merged_away/);
+
+  /* And it did NOT quietly resolve against the survivor instead. */
+  const survivorSubs = await rows('assessment_submissions', 'business_id', survivor.businessId);
+  assert.equal(survivorSubs.some(r => r.submission_id === c.submissionId), false);
+});
+
+utcIt('U6 — a material contradiction is refused without an override and accepted with one', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('u6');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const c = await makeQueuedCase({ candidates: [salonA.businessId] });
+
+  const refused = await resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+    signals: signalsFor(c.names), payloadHash: c.payloadHash });
+  assert.equal(refused.data, null);
+  assert.match(refused.error.message, /material_conflict/);
+
+  const noReason = await resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+    signals: signalsFor(c.names), payloadHash: c.payloadHash, override: true });
+  assert.equal(noReason.data, null);
+  assert.match(noReason.error.message, /override_reason_required/);
+
+  const thin = await resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+    signals: signalsFor(c.names), payloadHash: c.payloadHash,
+    override: true, reason: 'other_verified_evidence', note: 'Checked it.' });
+  assert.equal(thin.data, null);
+  assert.match(thin.error.message, /override_note_required/);
+
+  const done = await resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+    signals: signalsFor(c.names), payloadHash: c.payloadHash,
+    override: true, reason: 'business_rebrand',
+    note: 'Owner confirmed the rebrand and the new address by phone.' });
+  assert.equal(done.error, null);
+  assert.equal(done.data.ok, true);
+  assert.equal(done.data.conflictOverridden, true);
+  assert.equal(done.data.overrideReason, 'business_rebrand');
+
+  /* Nothing that was refused left a trace. */
+  const requests = await rows('identity_resolution_requests', 'identity_resolution_id', c.caseId);
+  assert.equal(requests.length, 1, 'one ledger row, from the attempt that succeeded');
+});
+
+utcIt('U7 — an override may not be claimed when there is nothing to override', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('u7');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const c = await makeQueuedCase({ candidates: [salonA.businessId] });
+
+  /* Signals that AGREE with the target: no contradiction to override. */
+  const agreeing = [{ type: 'business_name', normalizedValue: s.a },
+                    { type: 'email_exact', normalizedValue: s.aEmail }];
+  const { data, error } = await resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+    signals: agreeing, payloadHash: c.payloadHash,
+    override: true, reason: 'verified_same_business',
+    note: 'Marking an override that is not needed.' });
+
+  assert.equal(data, null);
+  assert.match(error.message, /override_not_applicable/);
+});
+
+utcIt('U8 — a clean link attaches submission and report and touches nothing else', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('u8');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const c = await makeQueuedCase({ candidates: [salonA.businessId] });
+
+  const identifiersBefore = (await rows('business_identifiers', 'business_id', salonA.businessId)).length;
+  const [sessionBefore] = await rows('assessment_sessions', 'assessment_session_id', c.sessionId);
+
+  const agreeing = [{ type: 'business_name', normalizedValue: s.a },
+                    { type: 'email_exact', normalizedValue: s.aEmail }];
+  const { data, error } = await resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+    signals: agreeing, payloadHash: c.payloadHash,
+    note: 'Same business; the visitor used a different address.' });
+
+  assert.equal(error, null);
+  assert.equal(data.ok, true);
+  assert.equal(data.businessId, salonA.businessId);
+  assert.equal(data.identityStatus, 'manually_verified');
+  assert.equal(data.conflictOverridden, false);
+
+  const [submission] = await rows('assessment_submissions', 'submission_id', c.submissionId);
+  assert.equal(submission.business_id, salonA.businessId);
+  assert.equal(submission.identity_status, 'manually_verified');
+  assert.ok(submission.raw_payload, 'the original payload is preserved');
+
+  const [report] = await rows('business_intelligence_reports', 'bir_id', c.birId);
+  assert.equal(report.business_id, salonA.businessId);
+  assert.equal(report.supersedes_bir_id, null, 'a late attachment joins no chain');
+
+  /* NO identifier promotion. A human decision about where a review belongs is
+     not a decision that every value in it is trustworthy identity evidence. */
+  const identifiersAfter = await rows('business_identifiers', 'business_id', salonA.businessId);
+  assert.equal(identifiersAfter.length, identifiersBefore, 'no identifier was written');
+  assert.equal(identifiersAfter.some(i => i.normalized_value === c.names.bEmail), false);
+
+  /* The session is not repointed. */
+  const [sessionAfter] = await rows('assessment_sessions', 'assessment_session_id', c.sessionId);
+  assert.equal(sessionAfter.business_id, sessionBefore.business_id);
+
+  const [closed] = await rows('identity_resolution_cases', 'identity_resolution_id', c.caseId);
+  assert.ok(closed.resolved_at);
+  assert.equal(closed.resolved_by, operator, 'the immutable operator UUID, not an email');
+  assert.equal(closed.recommended_action, 'queue_for_review', 'the engine advice is preserved');
+  assert.ok(closed.resolution_notes.length > 0);
+});
+
+utcIt('U9 — events and audit carry ids and type names, never values', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('u9');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const c = await makeQueuedCase({ candidates: [salonA.businessId] });
+  const requestId = id();
+
+  await resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+    requestId, signals: signalsFor(c.names), payloadHash: c.payloadHash,
+    override: true, reason: 'contact_information_changed',
+    note: 'New owner, same salon; confirmed the change of contact details.' });
+
+  const events = (await rows('timeline_events', 'business_id', salonA.businessId))
+    .filter(e => e.event_name === 'identity.review_resolved');
+  assert.equal(events.length, 1);
+  assert.equal(events[0].payload.conflictOverridden, true);
+  assert.equal(events[0].payload.overrideReason, 'contact_information_changed');
+  assert.equal(events[0].payload.operatorUserId, operator);
+
+  const audits = (await rows('audit_events', 'business_id', salonA.businessId))
+    .filter(a => a.action === 'identity_resolution.link_existing');
+  assert.equal(audits.length, 1);
+  assert.equal(audits[0].actor_type, 'human');
+  assert.equal(audits[0].actor_id, operator);
+  assert.equal(audits[0].new_value.identityStatus, 'manually_verified');
+
+  const text = JSON.stringify({ events, audits });
+  [s.aEmail, c.names.bEmail, s.a, c.names.b].forEach(v =>
+    assert.equal(text.includes(v), false, `an identifier value reached the trail: ${v}`));
+});
+
+utcIt('U10 — an older review is attached and counted but moves no pointer', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('u10');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+
+  /* Give the record a current Service Mix review. */
+  const recent = await makeQueuedCase({ candidates: [salonA.businessId] });
+  const agreeing = [{ type: 'business_name', normalizedValue: s.a },
+                    { type: 'email_exact', normalizedValue: s.aEmail }];
+  await resolve({ operator, caseId: recent.caseId, target: salonA.businessId,
+    signals: agreeing, payloadHash: recent.payloadHash, note: 'The newer review, resolved first.' });
+
+  const [stateAfterFirst] = (await rows('business_review_states', 'business_id', salonA.businessId))
+    .filter(r => r.review_type === 'service_mix');
+  assert.equal(stateAfterFirst.completed_count, 1);
+
+  /* Now an OLDER one. */
+  const older = await makeQueuedCase({
+    candidates: [salonA.businessId],
+    submittedAt: new Date(Date.parse(recent.submittedAt) - 86400000).toISOString() });
+  const second = await resolve({ operator, caseId: older.caseId, target: salonA.businessId,
+    signals: agreeing, payloadHash: older.payloadHash, note: 'An older review, resolved later.' });
+
+  assert.equal(second.error, null);
+  assert.equal(second.data.becameCurrent, false);
+
+  const [state] = (await rows('business_review_states', 'business_id', salonA.businessId))
+    .filter(r => r.review_type === 'service_mix');
+  assert.equal(state.completed_count, 2, 'counted exactly once each');
+  assert.equal(state.current_bir_id, recent.birId, 'the pointer did not move backwards');
+  assert.equal(state.latest_submission_id, recent.submissionId);
+
+  /* And the older report IS attached, just not current. */
+  const [olderReport] = await rows('business_intelligence_reports', 'bir_id', older.birId);
+  assert.equal(olderReport.business_id, salonA.businessId);
+});
+
+utcIt('U11 — a newer Growth review moves the Growth pointer; Service Mix never can', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('u11');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const agreeing = [{ type: 'business_name', normalizedValue: s.a },
+                    { type: 'email_exact', normalizedValue: s.aEmail }];
+
+  const [recordBefore] = await rows('business_records', 'business_id', salonA.businessId);
+
+  /* A Service Mix resolution must not touch business_records.current_bir_id,
+     which 0006 constrains to Growth reports. */
+  const mix = await makeQueuedCase({ candidates: [salonA.businessId], reviewType: 'service_mix' });
+  await resolve({ operator, caseId: mix.caseId, target: salonA.businessId,
+    signals: agreeing, payloadHash: mix.payloadHash, note: 'A Service Mix review, resolved.' });
+
+  const [afterMix] = await rows('business_records', 'business_id', salonA.businessId);
+  assert.equal(afterMix.current_bir_id, recordBefore.current_bir_id,
+    'the Growth-only pointer was not taken by a Service Mix report');
+
+  /* A newer GROWTH review may move it. */
+  const growth = await makeQueuedCase({
+    candidates: [salonA.businessId], reviewType: 'growth_review',
+    submittedAt: new Date(Date.now() + 60000).toISOString() });
+  const done = await resolve({ operator, caseId: growth.caseId, target: salonA.businessId,
+    signals: agreeing, payloadHash: growth.payloadHash, note: 'A newer Growth review, resolved.' });
+
+  assert.equal(done.error, null);
+  assert.equal(done.data.becameCurrent, true);
+  const [afterGrowth] = await rows('business_records', 'business_id', salonA.businessId);
+  assert.equal(afterGrowth.current_bir_id, growth.birId);
+});
+
+utcIt('U12 — the identical request replays; the same id with a new target is refused', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('u12');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const other = await establishBusiness(`${s.a} north`, email('u12-other'));
+  const c = await makeQueuedCase({ candidates: [salonA.businessId, other.businessId] });
+  const agreeing = [{ type: 'business_name', normalizedValue: s.a },
+                    { type: 'email_exact', normalizedValue: s.aEmail }];
+
+  const requestId = id();
+  const hash = createHash('sha256').update(`${c.caseId}|${salonA.businessId}`).digest('hex');
+
+  const first = await resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+    requestId, hash, signals: agreeing, payloadHash: c.payloadHash, note: 'The first attempt.' });
+  assert.equal(first.error, null);
+  assert.equal(first.data.replayed, false);
+
+  const again = await resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+    requestId, hash, signals: agreeing, payloadHash: c.payloadHash, note: 'The same attempt again.' });
+  assert.equal(again.error, null);
+  assert.equal(again.data.replayed, true, 'the stored outcome, not a second resolution');
+  assert.equal(again.data.businessId, salonA.businessId);
+
+  const changed = await resolve({ operator, caseId: c.caseId, target: other.businessId,
+    requestId, hash: createHash('sha256').update('different').digest('hex'),
+    signals: agreeing, payloadHash: c.payloadHash, note: 'The same id, a different record.' });
+  assert.equal(changed.data, null);
+  assert.match(changed.error.message, /resolution_request_conflict/);
+
+  /* One resolution, one ledger row, one submission attachment. */
+  assert.equal((await rows('identity_resolution_requests', 'identity_resolution_id', c.caseId)).length, 1);
+  const [submission] = await rows('assessment_submissions', 'submission_id', c.submissionId);
+  assert.equal(submission.business_id, salonA.businessId);
+});
+
+utcIt('U13 — an already-resolved case cannot be redirected to another record', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('u13');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const other = await establishBusiness(`${s.a} east`, email('u13-other'));
+  const c = await makeQueuedCase({ candidates: [salonA.businessId, other.businessId] });
+  const agreeing = [{ type: 'business_name', normalizedValue: s.a },
+                    { type: 'email_exact', normalizedValue: s.aEmail }];
+
+  await resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+    signals: agreeing, payloadHash: c.payloadHash, note: 'Resolved to the first record.' });
+
+  /* A different request id, a different target, the same case. */
+  const second = await resolve({ operator, caseId: c.caseId, target: other.businessId,
+    signals: agreeing, payloadHash: c.payloadHash, note: 'Trying to move it afterwards.' });
+  assert.equal(second.data, null);
+  assert.ok(/case_already_resolved|duplicate key/.test(second.error.message),
+    `unexpected: ${second.error.message}`);
+
+  const [submission] = await rows('assessment_submissions', 'submission_id', c.submissionId);
+  assert.equal(submission.business_id, salonA.businessId, 'still where it was put');
+});
+
+utcIt('U14 — evidence that does not belong to the submission is refused', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('u14');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const c = await makeQueuedCase({ candidates: [salonA.businessId] });
+
+  const { data, error } = await resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+    signals: [{ type: 'business_name', normalizedValue: s.a }],
+    payloadHash: 'not-the-hash-of-this-submission', note: 'Evidence from somewhere else.' });
+
+  assert.equal(data, null);
+  assert.match(error.message, /signals_payload_mismatch/);
+});
+
+utcIt('U15 — every refusal rolls the whole transaction back', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('u15');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+
+  const snapshot = async () => ({
+    submissions: (await rows('assessment_submissions', 'business_id', salonA.businessId)).length,
+    reports: (await rows('business_intelligence_reports', 'business_id', salonA.businessId)).length,
+    identifiers: (await rows('business_identifiers', 'business_id', salonA.businessId)).length,
+    timeline: (await rows('timeline_events', 'business_id', salonA.businessId)).length,
+    audit: (await rows('audit_events', 'business_id', salonA.businessId)).length,
+    states: (await rows('business_review_states', 'business_id', salonA.businessId)).length,
+    record: (await rows('business_records', 'business_id', salonA.businessId))[0].current_bir_id
+  });
+
+  const before = await snapshot();
+
+  /* One refusal from each stage of the function, in order. */
+  const c = await makeQueuedCase({ candidates: [salonA.businessId] });
+  const attempts = [
+    ['not an operator', { operator: id() }],
+    ['aal1', { aal: 'aal1' }],
+    ['note too short', { note: 'no' }],
+    ['target not a candidate', { target: id() }],
+    ['bad payload hash', { payloadHash: 'wrong' }],
+    ['material conflict, no override', {}]
+  ];
+
+  for (const [label, over] of attempts) {
+    const { data, error } = await resolve({
+      operator, caseId: c.caseId, target: salonA.businessId,
+      signals: signalsFor(c.names), payloadHash: c.payloadHash, ...over });
+    assert.equal(data, null, label);
+    assert.ok(error, label);
+
+    const after = await snapshot();
+    assert.deepEqual(after, before, `${label} left something behind`);
+
+    const [stillOpen] = await rows('identity_resolution_cases', 'identity_resolution_id', c.caseId);
+    assert.equal(stillOpen.resolved_at, null, `${label} closed the case`);
+    assert.deepEqual(
+      await rows('identity_resolution_requests', 'identity_resolution_id', c.caseId), [],
+      `${label} wrote a ledger row`);
+  }
+});
+
+utcIt('U16 — two competing resolutions cannot both succeed', async () => {
+  /* PGlite is single-connection, so this cannot be raced. What it CAN prove
+     is the mechanism that decides a race: irr_one_per_case is a unique index,
+     so the second writer is refused by the database rather than by whichever
+     browser happened to ask second. Recorded honestly as structural.
+     A hosted, multi-connection run is still owed. */
+  const operator = await makeOperator();
+  const s = salonNames('u16');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const other = await establishBusiness(`${s.a} west`, email('u16-other'));
+  const c = await makeQueuedCase({ candidates: [salonA.businessId, other.businessId] });
+  const agreeing = [{ type: 'business_name', normalizedValue: s.a },
+                    { type: 'email_exact', normalizedValue: s.aEmail }];
+
+  const first = await resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+    signals: agreeing, payloadHash: c.payloadHash, note: 'Tab one resolves.' });
+  assert.equal(first.error, null);
+
+  const second = await resolve({ operator, caseId: c.caseId, target: other.businessId,
+    signals: agreeing, payloadHash: c.payloadHash, note: 'Tab two, a moment later.' });
+  assert.equal(second.data, null);
+  assert.ok(second.error);
+
+  const { rows: idx } = await localEnv.pg.query(
+    "select indexdef from pg_indexes where indexname = 'irr_one_per_case'");
+  assert.match(idx[0].indexdef, /unique/i);
+  assert.match(idx[0].indexdef, /identity_resolution_id/);
+
+  assert.equal((await rows('identity_resolution_requests', 'identity_resolution_id', c.caseId)).length, 1);
+});
+
+utcIt('U17 — the case detail masks contact values and warns about merged candidates', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('u17');
+  const survivor = await establishBusiness(s.a, s.aEmail);
+  const gone = await establishBusiness(`${s.a} old site`, email('u17-old'));
+  await db.from('business_records')
+    .update({ merged_into_business_id: survivor.businessId })
+    .eq('business_id', gone.businessId);
+
+  const c = await makeQueuedCase({ candidates: [survivor.businessId, gone.businessId] });
+
+  const { data, error } = await rpc('staff_identity_case',
+    { p_operator_user_id: operator, p_aal: AAL2, p_case_id: c.caseId });
+  assert.equal(error, null);
+
+  assert.equal(data.caseId, c.caseId);
+  assert.equal(data.resolvable, true);
+  assert.equal(data.submitted.label, c.names.b, 'the business label is shown');
+  assert.notEqual(data.submitted.email, c.names.bEmail, 'the email is not');
+  assert.match(data.submitted.email, /^.\*\*\*@.\*\*\*\./, 'it is masked, in SQL');
+
+  const merged = data.candidates.find(x => x.businessId === gone.businessId);
+  assert.equal(merged.mergedAway, true, 'the operator is warned before choosing');
+  const kept = data.candidates.find(x => x.businessId === survivor.businessId);
+  assert.equal(kept.mergedAway, false);
+
+  /* An unresolvable case says so rather than offering a control that fails. */
+  const empty = await makeQueuedCase({ candidates: [] });
+  const { data: detail } = await rpc('staff_identity_case',
+    { p_operator_user_id: operator, p_aal: AAL2, p_case_id: empty.caseId });
+  assert.equal(detail.resolvable, false);
+  assert.match(detail.unsupportedReason, /names no Business Record at all/);
+});
+
+utcIt('U18 — anon and authenticated can reach none of it', async () => {
+  const objects = [
+    ['staff_operators', 'table'], ['identity_resolution_requests', 'table'],
+    ['staff_identity_queue(uuid,text,integer,integer)', 'function'],
+    ['staff_identity_case(uuid,text,uuid)', 'function'],
+    ['staff_operator_guard(uuid,text)', 'function'],
+    ['resolve_identity_case_link_existing(uuid,text,uuid,uuid,uuid,text,text,jsonb,text,boolean,text)', 'function']
+  ];
+
+  for (const [name, kind] of objects) {
+    for (const role of ['anon', 'authenticated', 'public']) {
+      const q = kind === 'table'
+        ? `select bool_or(has_table_privilege($1, 'public.${name}', p)) any_priv
+             from unnest(array['select','insert','update','delete']) p`
+        : `select has_function_privilege($1, 'public.${name}', 'EXECUTE') any_priv`;
+      const { rows: r } = await localEnv.pg.query(q, [role]);
+      assert.equal(r[0].any_priv, false, `${role} can reach ${name}`);
+    }
+    if (kind === 'function') {
+      const { rows: r } = await localEnv.pg.query(
+        `select has_function_privilege('service_role', 'public.${name}', 'EXECUTE') p`);
+      assert.equal(r[0].p, true, `service_role cannot execute ${name}`);
+    }
+  }
+
+  /* The internals hold NO grant, service_role included. Each is called only
+     from inside a SECURITY DEFINER function above, which runs it as the
+     owner. identity_case_eligible_targets is the one that matters: it answers
+     "which Business Records may this case attach to", and a direct grant
+     would let the server credential ask that with no operator guard in front
+     of it — the objection 0006 raises against granting
+     identity_proposal_conflict, which applies here word for word. */
+  const internals = [
+    'identity_case_eligible_targets(uuid)',
+    'mask_contact_value(text)',
+    'identity_resolution_replay(identity_resolution_requests, text, uuid)',
+    'reject_case_evidence_change()'
+  ];
+  for (const name of internals) {
+    for (const role of ['anon', 'authenticated', 'public', 'service_role']) {
+      const { rows: r } = await localEnv.pg.query(
+        `select has_function_privilege($1, 'public.${name}', 'EXECUTE') p`, [role]);
+      assert.equal(r[0].p, false, `${role} holds a grant on the internal helper ${name}`);
+    }
+  }
+
+  /* But they still WORK where they are actually called from, which is what
+     makes revoking them safe rather than merely tidy. */
+  const operator = await makeOperator();
+  const c = await makeQueuedCase({ candidates: [] });
+  const { error: stillWorks } = await rpc('staff_identity_case',
+    { p_operator_user_id: operator, p_aal: AAL2, p_case_id: c.caseId });
+  assert.equal(stillWorks, null,
+    'staff_identity_case calls both revoked helpers and is unaffected');
+
+  /* RLS is on and FORCED on both new tables, with no policy to soften it. */
+  const { rows: rls } = await localEnv.pg.query(
+    `select relname, relrowsecurity, relforcerowsecurity,
+            (select count(*) from pg_policy p where p.polrelid = c.oid) policies
+       from pg_class c join pg_namespace n on n.oid = c.relnamespace
+      where n.nspname = 'public'
+        and relname in ('staff_operators','identity_resolution_requests')`);
+  assert.equal(rls.length, 2);
+  rls.forEach(t => {
+    assert.equal(t.relrowsecurity, true, t.relname);
+    assert.equal(t.relforcerowsecurity, true, t.relname);
+    assert.equal(Number(t.policies), 0, t.relname);
+  });
+});
+
+
+/* ---------- V. proposed targets, and the durable operator reference ----------
+
+   A candidate-only eligible set made the two commonest escalations —
+   a contradicted proposal, and two proposals naming different records —
+   permanently unresolvable, because neither reaches the candidate lookup and
+   both leave `candidate_business_ids` empty. The record each of them named is
+   persisted in `conflicting_signals`, and section V is where that widening is
+   held to the same standard as everything else: derived in SQL, from this
+   case's own evidence, with malformed entries ignored and merged-away targets
+   still refused. */
+
+/* A case whose ONLY evidence is a vetoed proposal — no candidate at all,
+   which is exactly the shape ingest_review produces for a contradicted
+   session or continuation context. */
+const makeVetoedCase = ({ proposed, kind = 'session_contradicted' } = {}) =>
+  makeQueuedCase({ candidates: [], conflictingSignals: [{
+    kind,
+    proposedBusinessId: proposed,
+    agreedTypes: [],
+    contradictedTypes: ['business_name', 'email_exact'],
+    reason: 'The submitted business name and contact evidence match nothing this record holds.'
+  }] });
+
+const makeDisagreedCase = ({ first, second } = {}) =>
+  makeQueuedCase({ candidates: [], conflictingSignals: [{
+    kind: 'proposals_disagree',
+    proposedBusinessIds: [first, second],
+    reason: 'The session and the continuation context name different records.'
+  }] });
+
+const eligible = async caseId =>
+  (await localEnv.pg.query(
+    'select business_id, provenance from public.identity_case_eligible_targets($1) order by provenance, business_id',
+    [caseId])).rows;
+
+utcIt('V1 — a vetoed proposal makes its record eligible, with its provenance', async () => {
+  const s = salonNames('v1');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const c = await makeVetoedCase({ proposed: salonA.businessId });
+
+  /* The candidate array really is empty: this is the shape that used to be
+     permanently unresolvable. */
+  const [row] = await rows('identity_resolution_cases', 'identity_resolution_id', c.caseId);
+  assert.deepEqual(row.candidate_business_ids, []);
+
+  const targets = await eligible(c.caseId);
+  assert.equal(targets.length, 1);
+  assert.equal(targets[0].business_id, salonA.businessId);
+  assert.equal(targets[0].provenance, 'proposal_vetoed');
+});
+
+utcIt('V2 — a vetoed target still needs the documented override to be linked', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('v2');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const c = await makeVetoedCase({ proposed: salonA.businessId });
+
+  /* The submission describes a different business, which is why it was
+     vetoed in the first place — so the conflict rule still says material. */
+  const refused = await resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+    signals: signalsFor(c.names), payloadHash: c.payloadHash });
+  assert.equal(refused.data, null);
+  assert.match(refused.error.message, /material_conflict/,
+    'widening WHICH records are eligible did not widen what may be linked without an override');
+
+  const noReason = await resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+    signals: signalsFor(c.names), payloadHash: c.payloadHash, override: true });
+  assert.equal(noReason.data, null);
+  assert.match(noReason.error.message, /override_reason_required/);
+
+  const done = await resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+    signals: signalsFor(c.names), payloadHash: c.payloadHash,
+    override: true, reason: 'source_information_incorrect',
+    note: 'The visitor mistyped the salon name; confirmed by phone it is the same business.' });
+  assert.equal(done.error, null);
+  assert.equal(done.data.targetProvenance, 'proposal_vetoed');
+  assert.equal(done.data.conflictOverridden, true);
+});
+
+utcIt('V3 — both disagreeing proposals are eligible, and exactly one may be chosen', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('v3');
+  const one = await establishBusiness(s.a, s.aEmail);
+  const two = await establishBusiness(`${s.a} north`, email('v3-two'));
+  const c = await makeDisagreedCase({ first: one.businessId, second: two.businessId });
+
+  const targets = await eligible(c.caseId);
+  assert.equal(targets.length, 2);
+  assert.deepEqual([...new Set(targets.map(t => t.provenance))], ['proposals_disagreed']);
+  assert.deepEqual(targets.map(t => t.business_id).sort(),
+    [one.businessId, two.businessId].sort());
+
+  /* Choosing the second is as legitimate as choosing the first: neither
+     contradicts, which is why nobody could choose automatically. */
+  const agreeing = [{ type: 'business_name', normalizedValue: `${s.a} north` },
+                    { type: 'email_exact', normalizedValue: email('v3-two') }];
+  const done = await resolve({ operator, caseId: c.caseId, target: two.businessId,
+    signals: agreeing, payloadHash: c.payloadHash,
+    note: 'Confirmed this is the second location, not the first.' });
+  assert.equal(done.error, null);
+  assert.equal(done.data.businessId, two.businessId);
+  assert.equal(done.data.targetProvenance, 'proposals_disagreed');
+  assert.equal(done.data.conflictOverridden, false, 'no override needed when nothing contradicts');
+
+  /* And the case is now closed to the other one. */
+  const after = await resolve({ operator, caseId: c.caseId, target: one.businessId,
+    signals: agreeing, payloadHash: c.payloadHash, note: 'Trying the other record afterwards.' });
+  assert.equal(after.data, null);
+  assert.ok(after.error);
+});
+
+utcIt('V4 — a third record is refused however plausible it looks', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('v4');
+  const one = await establishBusiness(s.a, s.aEmail);
+  const two = await establishBusiness(`${s.a} south`, email('v4-two'));
+  const stranger = await establishBusiness(`${s.a} west`, email('v4-three'));
+  const c = await makeDisagreedCase({ first: one.businessId, second: two.businessId });
+
+  const agreeing = [{ type: 'business_name', normalizedValue: `${s.a} west` },
+                    { type: 'email_exact', normalizedValue: email('v4-three') }];
+  const { data, error } = await resolve({ operator, caseId: c.caseId,
+    target: stranger.businessId, signals: agreeing, payloadHash: c.payloadHash,
+    note: 'A record this case never named.' });
+
+  assert.equal(data, null);
+  assert.match(error.message, /target_not_a_candidate/);
+  assert.equal((await eligible(c.caseId)).some(t => t.business_id === stranger.businessId), false);
+});
+
+utcIt('V5 — malformed or unrecognized proposed-target data is ignored, not obeyed', async () => {
+  const s = salonNames('v5');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  /* Everything a corrupted or hand-edited evidence array could contain,
+     alongside one good entry. The good one must survive; none of the rest
+     may become a target, and none may abort the derivation. */
+  const c = await makeQueuedCase({ candidates: [], conflictingSignals: [
+      { kind: 'session_contradicted', proposedBusinessId: 'not-a-uuid' },
+      { kind: 'session_contradicted', proposedBusinessId: '' },
+      { kind: 'session_contradicted', proposedBusinessId: null },
+      { kind: 'session_contradicted', proposedBusinessId: 42 },
+      { kind: 'session_contradicted' },
+      { kind: 'some_other_kind', proposedBusinessId: id() },
+      { kind: 'proposals_disagree', proposedBusinessIds: ['nope', 7, null] },
+      { kind: 'proposals_disagree' },
+      'a bare string',
+      42,
+      null,
+      { kind: 'continuation_context_contradicted', proposedBusinessId: salonA.businessId }
+    ] });
+
+  const targets = await eligible(c.caseId);
+  assert.equal(targets.length, 1, 'exactly the one well-formed entry');
+  assert.equal(targets[0].business_id, salonA.businessId);
+  assert.equal(targets[0].provenance, 'proposal_vetoed');
+
+  /* An unrecognized `kind` is not a target even when its uuid is perfectly
+     well formed — the vocabulary is the gate, not the shape. */
+  const unknownKind = await makeQueuedCase({ candidates: [],
+    conflictingSignals: [{ kind: 'invented_kind', proposedBusinessId: salonA.businessId }] });
+  assert.deepEqual(await eligible(unknownKind.caseId), []);
+});
+
+utcIt('V6 — a merged-away or missing proposed target is still refused', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('v6');
+  const survivor = await establishBusiness(s.a, s.aEmail);
+  const gone = await establishBusiness(`${s.a} old`, email('v6-old'));
+  await db.from('business_records')
+    .update({ merged_into_business_id: survivor.businessId })
+    .eq('business_id', gone.businessId);
+
+  const c = await makeVetoedCase({ proposed: gone.businessId });
+
+  /* Eligible by evidence — and refused by state. The two are different facts
+     and the operator is told which one applies. */
+  assert.equal((await eligible(c.caseId)).length, 1);
+
+  const { data, error } = await resolve({ operator, caseId: c.caseId, target: gone.businessId,
+    signals: signalsFor(c.names), payloadHash: c.payloadHash,
+    override: true, reason: 'verified_same_business',
+    note: 'Attempting to resolve against a record that has since been merged away.' });
+  assert.equal(data, null);
+  assert.match(error.message, /target_merged_away/);
+
+  /* And it was not silently redirected to the survivor. */
+  const survivorSubs = await rows('assessment_submissions', 'business_id', survivor.businessId);
+  assert.equal(survivorSubs.some(r => r.submission_id === c.submissionId), false);
+});
+
+utcIt('V7 — a case naming nothing at all stays open and says so', async () => {
+  const operator = await makeOperator();
+  const c = await makeQueuedCase({ candidates: [] });
+
+  assert.deepEqual(await eligible(c.caseId), []);
+
+  const { data } = await rpc('staff_identity_case',
+    { p_operator_user_id: operator, p_aal: AAL2, p_case_id: c.caseId });
+  assert.equal(data.resolvable, false);
+  assert.deepEqual(data.candidates, []);
+  assert.match(data.unsupportedReason, /names no Business Record at all/);
+
+  const { data: queue } = await rpc('staff_identity_queue',
+    { p_operator_user_id: operator, p_aal: AAL2, p_limit: 100, p_offset: 0 });
+  const row = queue.find(r => r.identity_resolution_id === c.caseId);
+  assert.equal(row.resolvable, false);
+  assert.equal(Number(row.candidate_count), 0);
+});
+
+utcIt('V8 — the detail offers a vetoed target and labels why it is offered', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('v8');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const c = await makeVetoedCase({ proposed: salonA.businessId,
+    kind: 'continuation_context_contradicted' });
+
+  const { data, error } = await rpc('staff_identity_case',
+    { p_operator_user_id: operator, p_aal: AAL2, p_case_id: c.caseId });
+  assert.equal(error, null);
+  assert.equal(data.resolvable, true);
+  assert.equal(data.candidates.length, 1);
+  assert.equal(data.candidates[0].businessId, salonA.businessId);
+  assert.equal(data.candidates[0].provenance, 'proposal_vetoed');
+  assert.deepEqual(data.candidates[0].matchedTypes, [],
+    'a proposed target shares no identifier — that is why it was contradicted');
+
+  /* Still no identifier value in the detail. */
+  const text = JSON.stringify(data);
+  assert.equal(text.includes(s.aEmail), false);
+  assert.equal(text.includes(c.names.bEmail), false);
+});
+
+utcIt('V9 — provenance reaches the audit trail without any evidence value', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('v9');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const c = await makeVetoedCase({ proposed: salonA.businessId });
+
+  await resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+    signals: signalsFor(c.names), payloadHash: c.payloadHash,
+    override: true, reason: 'business_rebrand',
+    note: 'Owner confirmed the rebrand; the saved pointer was right after all.' });
+
+  const [audit] = (await rows('audit_events', 'business_id', salonA.businessId))
+    .filter(a => a.action === 'identity_resolution.link_existing');
+  assert.equal(audit.new_value.targetProvenance, 'proposal_vetoed');
+  assert.equal(audit.new_value.conflictOverridden, true);
+  assert.equal(audit.new_value.overrideReason, 'business_rebrand');
+
+  const [event] = (await rows('timeline_events', 'business_id', salonA.businessId))
+    .filter(e => e.event_name === 'identity.review_resolved');
+  assert.equal(event.payload.targetProvenance, 'proposal_vetoed');
+
+  const text = JSON.stringify({ audit, event });
+  [s.a, s.aEmail, c.names.b, c.names.bEmail].forEach(v =>
+    assert.equal(text.includes(v), false, `an identifier value reached the trail: ${v}`));
+
+  /* The three provenance values are the whole vocabulary. */
+  assert.ok(['candidate_set', 'proposal_vetoed', 'proposals_disagreed']
+    .includes(audit.new_value.targetProvenance));
+});
+
+utcIt('V10 — a candidate-set resolution is unchanged, and still labelled candidate_set', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('v10');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const c = await makeQueuedCase({ candidates: [salonA.businessId] });
+
+  const targets = await eligible(c.caseId);
+  assert.equal(targets.length, 1);
+  assert.equal(targets[0].provenance, 'candidate_set');
+
+  const agreeing = [{ type: 'business_name', normalizedValue: s.a },
+                    { type: 'email_exact', normalizedValue: s.aEmail }];
+  const { data, error } = await resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+    signals: agreeing, payloadHash: c.payloadHash, note: 'The ordinary candidate path.' });
+
+  assert.equal(error, null);
+  assert.equal(data.targetProvenance, 'candidate_set');
+  assert.equal(data.identityStatus, 'manually_verified');
+});
+
+/* ---------- the durable operator reference ---------- */
+
+utcIt('V11 — a resolution sets both operator columns, and they agree', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('v11');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const c = await makeQueuedCase({ candidates: [salonA.businessId] });
+  const agreeing = [{ type: 'business_name', normalizedValue: s.a },
+                    { type: 'email_exact', normalizedValue: s.aEmail }];
+
+  await resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+    signals: agreeing, payloadHash: c.payloadHash, note: 'Recording who did this.' });
+
+  const [row] = await rows('identity_resolution_cases', 'identity_resolution_id', c.caseId);
+  assert.equal(row.resolved_by_operator_id, operator, 'the real reference');
+  assert.equal(row.resolved_by, operator, 'and the legacy text column, identical');
+  assert.equal(row.resolved_by, row.resolved_by_operator_id);
+
+  const [audit] = (await rows('audit_events', 'business_id', salonA.businessId))
+    .filter(a => a.action === 'identity_resolution.link_existing');
+  assert.equal(audit.actor_id, operator, 'and the audit actor agrees with both');
+  assert.equal(audit.actor_type, 'human');
+});
+
+utcIt('V12 — the two operator columns cannot be written apart', async () => {
+  const operator = await makeOperator();
+  const other = await makeOperator();
+  const c = await makeQueuedCase({ candidates: [] });
+
+  const disagree = await localEnv.pg.query(
+    `update public.identity_resolution_cases
+        set resolved_at = now(), resolved_by = $1, resolved_by_operator_id = $2
+      where identity_resolution_id = $3`, [other, operator, c.caseId])
+    .then(() => null, err => err);
+
+  assert.ok(disagree, 'the constraint must refuse a disagreement');
+  assert.match(disagree.message, /irc_resolved_by_agreement/);
+});
+
+utcIt('V13 — an unknown operator cannot satisfy the reference', async () => {
+  const c = await makeQueuedCase({ candidates: [] });
+  const stranger = id();
+
+  const orphan = await localEnv.pg.query(
+    `update public.identity_resolution_cases
+        set resolved_at = now(), resolved_by = $1::text, resolved_by_operator_id = $1::uuid
+      where identity_resolution_id = $2`, [stranger, c.caseId])
+    .then(() => null, err => err);
+
+  assert.ok(orphan);
+  assert.match(orphan.message, /irc_resolved_by_operator_fk|foreign key/i);
+});
+
+utcIt('V14 — a referenced operator cannot be deleted, but may be disabled', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('v14');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const c = await makeQueuedCase({ candidates: [salonA.businessId] });
+  const agreeing = [{ type: 'business_name', normalizedValue: s.a },
+                    { type: 'email_exact', normalizedValue: s.aEmail }];
+
+  await resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+    signals: agreeing, payloadHash: c.payloadHash, note: 'A resolution to be protected.' });
+
+  const deletion = await localEnv.pg.query(
+    'delete from public.staff_operators where user_id = $1', [operator])
+    .then(() => null, err => err);
+  assert.ok(deletion, 'an operator in the audit trail may not be deleted');
+  assert.match(deletion.message, /irc_resolved_by_operator_fk|foreign key|violates/i);
+
+  /* Renumbering is refused too — ON UPDATE RESTRICT. */
+  const renumber = await localEnv.pg.query(
+    'update public.staff_operators set user_id = $1 where user_id = $2', [id(), operator])
+    .then(() => null, err => err);
+  assert.ok(renumber, 'nor renumbered out from under the record');
+
+  /* Disabling is how an operator leaves, and history survives it. */
+  const { error } = await db.from('staff_operators')
+    .update({ active: false, disabled_at: new Date().toISOString() })
+    .eq('user_id', operator);
+  assert.equal(error, null, 'deactivation must work');
+
+  const [row] = await rows('identity_resolution_cases', 'identity_resolution_id', c.caseId);
+  assert.equal(row.resolved_by_operator_id, operator, 'the history is preserved');
+
+  /* And that operator can do nothing further. */
+  const next = await makeQueuedCase({ candidates: [salonA.businessId] });
+  const after = await resolve({ operator, caseId: next.caseId, target: salonA.businessId,
+    signals: agreeing, payloadHash: next.payloadHash, note: 'A revoked operator trying again.' });
+  assert.equal(after.data, null);
+  assert.match(after.error.message, /staff_operator_disabled/);
+});
+
+utcIt('V15 — an EARLY refusal rolls back the operator reference with everything else', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('v15');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const c = await makeVetoedCase({ proposed: salonA.businessId });
+
+  /* Refused at the conflict check, which is step 7 — BEFORE the submission,
+     report and review-state writes at steps 8 to 10. So this proves that an
+     early refusal leaves nothing behind, and nothing more than that. The
+     harder case, a failure AFTER those writes, is V17. */
+  const { data, error } = await resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+    signals: signalsFor(c.names), payloadHash: c.payloadHash });
+  assert.equal(data, null);
+  assert.match(error.message, /material_conflict/);
+
+  const [row] = await rows('identity_resolution_cases', 'identity_resolution_id', c.caseId);
+  assert.equal(row.resolved_at, null);
+  assert.equal(row.resolved_by, null);
+  assert.equal(row.resolved_by_operator_id, null, 'the reference rolled back too');
+
+  const [submission] = await rows('assessment_submissions', 'submission_id', c.submissionId);
+  assert.equal(submission.business_id, null);
+  assert.equal(submission.identity_status, 'resolution_pending');
+  const [report] = await rows('business_intelligence_reports', 'bir_id', c.birId);
+  assert.equal(report.business_id, null);
+  assert.deepEqual(await rows('identity_resolution_requests', 'identity_resolution_id', c.caseId), []);
+});
+
+utcIt('V16 — case evidence is immutable once written', async () => {
+  const s = salonNames('v16');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const c = await makeQueuedCase({ candidates: [salonA.businessId] });
+
+  /* The eligible set is derived from these two columns, so a write to either
+     is a write to "what may this resolve against". Refused at the database. */
+  for (const [column, value] of [
+    ['candidate_business_ids', JSON.stringify([{ businessId: id() }])],
+    ['conflicting_signals', JSON.stringify([{ kind: 'session_contradicted', proposedBusinessId: id() }])],
+    ['recommended_action', 'link_to_existing'],
+    ['resolution_status', 'unique_match']
+  ]) {
+    const attempt = await localEnv.pg.query(
+      `update public.identity_resolution_cases set ${column} = $1
+        where identity_resolution_id = $2`, [value, c.caseId])
+      .then(() => null, err => err);
+    assert.ok(attempt, `${column} must be immutable`);
+    assert.match(attempt.message, /case_evidence_immutable/, column);
+  }
+
+  /* Resolving the case still works — only the evidence is frozen. */
+  const operator = await makeOperator();
+  const agreeing = [{ type: 'business_name', normalizedValue: s.a },
+                    { type: 'email_exact', normalizedValue: s.aEmail }];
+  const { error } = await resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+    signals: agreeing, payloadHash: c.payloadHash, note: 'Closing a case whose evidence is frozen.' });
+  assert.equal(error, null);
+});
+
+utcIt('V17 — a failure AFTER the writes rolls every one of them back', async () => {
+  /* THE TEST V15 WAS DESCRIBED AS AND WAS NOT.
+     V15 refuses at step 7, before anything is written, so it proves only that
+     a validation failure writes nothing — which is not in doubt. The claim
+     that matters is the other one: that a failure occurring once the
+     submission, the report, the review state, both pointers, the case
+     resolution and the events are ALL already written still leaves the
+     database exactly as it was.
+
+     The only production path that fails that late is the ledger insert at
+     step 14 losing a race on irr_one_per_case, and PGlite has one connection
+     so that race cannot be run. A trigger on the ledger table reproduces the
+     failure at precisely the same point, deterministically. It is installed
+     for this test and dropped in the same test, so nothing else can see it. */
+  const operator = await makeOperator();
+  const s = salonNames('v17');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const agreeing = [{ type: 'business_name', normalizedValue: s.a },
+                    { type: 'email_exact', normalizedValue: s.aEmail }];
+
+  /* Give the record a review state and a current pointer first, so the test
+     can prove the pointers do not MOVE rather than merely do not appear. */
+  const first = await makeQueuedCase({ candidates: [salonA.businessId], reviewType: 'growth_review' });
+  const seeded = await resolve({ operator, caseId: first.caseId, target: salonA.businessId,
+    signals: agreeing, payloadHash: first.payloadHash, note: 'Seeding a current pointer.' });
+  assert.equal(seeded.error, null);
+
+  const c = await makeQueuedCase({
+    candidates: [salonA.businessId], reviewType: 'growth_review',
+    submittedAt: new Date(Date.now() + 120000).toISOString() });
+
+  const snapshot = async () => ({
+    submission: (await rows('assessment_submissions', 'submission_id', c.submissionId))[0],
+    report: (await rows('business_intelligence_reports', 'bir_id', c.birId))[0],
+    case: (await rows('identity_resolution_cases', 'identity_resolution_id', c.caseId))[0],
+    states: await rows('business_review_states', 'business_id', salonA.businessId),
+    record: (await rows('business_records', 'business_id', salonA.businessId))[0],
+    timeline: (await rows('timeline_events', 'business_id', salonA.businessId)).length,
+    audit: (await rows('audit_events', 'business_id', salonA.businessId)).length,
+    ledger: await rows('identity_resolution_requests', 'identity_resolution_id', c.caseId),
+    identifiers: (await rows('business_identifiers', 'business_id', salonA.businessId)).length
+  });
+
+  const before = await snapshot();
+  /* Preconditions, so a vacuous pass is impossible: this resolution WOULD
+     move the pointer if it were allowed to commit. */
+  assert.ok(before.record.current_bir_id, 'the record already has a current Growth report');
+  assert.notEqual(before.record.current_bir_id, c.birId);
+  assert.equal(before.submission.business_id, null);
+  assert.deepEqual(before.ledger, []);
+
+  await localEnv.pg.exec(`
+    create or replace function pg_temp_v17_fail() returns trigger
+    language plpgsql as $fn$
+    begin
+      raise exception 'v17_injected_late_failure' using errcode = 'raise_exception';
+    end;
+    $fn$;
+    create trigger v17_late_failure
+      before insert on public.identity_resolution_requests
+      for each row execute function pg_temp_v17_fail();`);
+
+  let failed;
+  try {
+    failed = await resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+      signals: agreeing, payloadHash: c.payloadHash,
+      note: 'This one dies at the very last statement.' });
+  } finally {
+    await localEnv.pg.exec(`
+      drop trigger if exists v17_late_failure on public.identity_resolution_requests;
+      drop function if exists pg_temp_v17_fail();`);
+  }
+
+  assert.equal(failed.data, null);
+  assert.match(failed.error.message, /v17_injected_late_failure/,
+    'the injected failure is the one that fired, at step 14');
+
+  const after = await snapshot();
+
+  /* Every write the function had already made, undone. */
+  assert.equal(after.submission.business_id, null, 'the submission was not attached');
+  assert.equal(after.submission.identity_status, 'resolution_pending');
+  assert.equal(after.report.business_id, null, 'the report was not attached');
+  assert.equal(after.case.resolved_at, null, 'the case was not closed');
+  assert.equal(after.case.resolved_by, null);
+  assert.equal(after.case.resolved_by_operator_id, null, 'nor the operator reference written');
+  assert.deepEqual(after.ledger, [], 'and no ledger row survived');
+
+  /* The pointers did not move, and the counts did not creep. */
+  assert.equal(after.record.current_bir_id, before.record.current_bir_id,
+    'the Growth pointer stayed where it was');
+  assert.deepEqual(
+    after.states.map(r => [r.review_type, r.completed_count, r.current_bir_id,
+                           r.latest_submission_id, r.last_completed_at]).sort(),
+    before.states.map(r => [r.review_type, r.completed_count, r.current_bir_id,
+                            r.latest_submission_id, r.last_completed_at]).sort(),
+    'review state — count, pointer, latest submission and completion time — is unchanged');
+
+  /* Append-only history gained nothing. It cannot be cleaned up afterwards,
+     so a rollback that missed it would be permanent. */
+  assert.equal(after.timeline, before.timeline, 'no timeline event survived');
+  assert.equal(after.audit, before.audit, 'no audit event survived');
+  assert.equal(after.identifiers, before.identifiers, 'and still no identifier promotion');
+
+  /* And the case is genuinely still workable afterwards. */
+  const retry = await resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+    signals: agreeing, payloadHash: c.payloadHash, note: 'And now it succeeds normally.' });
+  assert.equal(retry.error, null);
+  assert.equal(retry.data.ok, true);
+});
+
+utcIt('V18 — a concurrent identical retry replays instead of colliding', async () => {
+  /* The ledger is read at step 1 and written at step 14. Two simultaneous
+     sends of ONE retry both find no ledger row at step 1; the loser then
+     waits on the case lock and arrives after the winner has committed.
+     Without the recheck it raised `case_already_resolved` — turning the
+     idempotent replay the contract promises into a conflict, purely because
+     the two overlapped.
+
+     PGlite cannot run them simultaneously. What it CAN run is the loser's
+     exact position: same request id, same inputs, arriving at a case that is
+     already resolved. That is the state the recheck exists for. */
+  const operator = await makeOperator();
+  const s = salonNames('v18');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const c = await makeQueuedCase({ candidates: [salonA.businessId] });
+  const agreeing = [{ type: 'business_name', normalizedValue: s.a },
+                    { type: 'email_exact', normalizedValue: s.aEmail }];
+
+  const requestId = id();
+  const hash = createHash('sha256').update(`${c.caseId}|${salonA.businessId}|${operator}`).digest('hex');
+  const send = () => resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+    requestId, hash, signals: agreeing, payloadHash: c.payloadHash, note: 'One retry, sent twice.' });
+
+  const first = await send();
+  assert.equal(first.error, null);
+  assert.equal(first.data.replayed, false);
+
+  const second = await send();
+  assert.equal(second.error, null, `the overlapping half must replay: ${second.error?.message}`);
+  assert.equal(second.data.replayed, true);
+  assert.equal(second.data.businessId, salonA.businessId);
+  assert.equal(second.data.caseId, first.data.caseId);
+
+  /* One resolution, whatever the caller did. */
+  assert.equal((await rows('identity_resolution_requests', 'identity_resolution_id', c.caseId)).length, 1);
+  const events = (await rows('timeline_events', 'business_id', salonA.businessId))
+    .filter(e => e.event_name === 'identity.review_resolved');
+  assert.equal(events.length, 1, 'and exactly one event, not one per send');
+});
+
+utcIt('V19 — a second operator cannot inherit another operator\'s replay', async () => {
+  const operator = await makeOperator();
+  const other = await makeOperator();
+  const s = salonNames('v19');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const c = await makeQueuedCase({ candidates: [salonA.businessId] });
+  const agreeing = [{ type: 'business_name', normalizedValue: s.a },
+                    { type: 'email_exact', normalizedValue: s.aEmail }];
+
+  const requestId = id();
+  const hash = createHash('sha256').update('identical-inputs').digest('hex');
+
+  const first = await resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+    requestId, hash, signals: agreeing, payloadHash: c.payloadHash, note: 'The first operator resolves.' });
+  assert.equal(first.error, null);
+
+  /* Same request id, same hash, DIFFERENT operator. The route folds the
+     operator into the hash so this shape should be unreachable through it;
+     the database refuses it independently, which is the point. */
+  const stolen = await resolve({ operator: other, caseId: c.caseId, target: salonA.businessId,
+    requestId, hash, signals: agreeing, payloadHash: c.payloadHash, note: 'A second operator, same id.' });
+
+  assert.equal(stolen.data, null);
+  assert.match(stolen.error.message, /resolution_request_conflict/,
+    'a resolution is attributed to a person; it is not inheritable');
+
+  /* And the attribution on record is still the first operator's. */
+  const [row] = await rows('identity_resolution_cases', 'identity_resolution_id', c.caseId);
+  assert.equal(row.resolved_by_operator_id, operator);
+  const [ledger] = await rows('identity_resolution_requests', 'identity_resolution_id', c.caseId);
+  assert.equal(ledger.operator_user_id, operator);
+});
+
+utcIt('V20 — a resolved case reports itself unresolvable rather than offering a dead control', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('v20');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const c = await makeQueuedCase({ candidates: [salonA.businessId] });
+  const agreeing = [{ type: 'business_name', normalizedValue: s.a },
+                    { type: 'email_exact', normalizedValue: s.aEmail }];
+
+  const open = await rpc('staff_identity_case',
+    { p_operator_user_id: operator, p_aal: AAL2, p_case_id: c.caseId });
+  assert.equal(open.data.resolvable, true, 'resolvable while it is open');
+  assert.equal(open.data.unsupportedReason, null);
+
+  await resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+    signals: agreeing, payloadHash: c.payloadHash, note: 'Closing this one.' });
+
+  const closed = await rpc('staff_identity_case',
+    { p_operator_user_id: operator, p_aal: AAL2, p_case_id: c.caseId });
+  assert.equal(closed.error, null, 'a resolved case can still be READ');
+  assert.equal(closed.data.resolvable, false,
+    'but it is not resolvable, whatever its evidence still names');
+  assert.match(closed.data.unsupportedReason, /already resolved/);
+  assert.ok(closed.data.resolvedAt, 'and it says when');
+  /* The evidence is still there; only the verdict changed. */
+  assert.equal(closed.data.candidates.length, 1);
+});
+
+/* ---------- W. provisioning the first operator ---------- */
+
+utcIt('W1 — the bootstrap creates exactly one owner and refuses to do it twice', async () => {
+  /* Runs against a database where earlier sections have already created
+     operators, so it exercises the "already done" path first — which is the
+     path that matters, because it is the one that stops a second person
+     making themselves an owner. */
+  const existing = (await localEnv.pg.query('select count(*)::int n from public.staff_operators')).rows[0].n;
+  assert.ok(existing > 0, 'precondition: operators exist by now');
+
+  const stranger = id();
+  const refused = await rpc('bootstrap_staff_owner', { p_user_id: stranger });
+  assert.equal(refused.data, null);
+  assert.match(refused.error.message, /staff_bootstrap_already_done/,
+    'a bootstrap is not a provisioning API');
+
+  assert.deepEqual(await rows('staff_operators', 'user_id', stranger), [],
+    'and nothing was written');
+
+  const nulled = await rpc('bootstrap_staff_owner', { p_user_id: null });
+  assert.equal(nulled.data, null);
+  assert.match(nulled.error.message, /staff_bootstrap_user_required/);
+});
+
+utcIt('W2 — on an empty table the bootstrap creates one owner, idempotently', async () => {
+  /* A separate, disposable cluster, because "the table is empty" is the
+     precondition and the shared one is not. Same migration chain. */
+  const { startLocalPg, disposableDataDir } = await import('../helpers/local-pg.mjs');
+  const env = await startLocalPg({ dataDir: disposableDataDir('bootstrap') });
+  try {
+    const q = async (sql, params = []) => (await env.pg.query(sql, params)).rows;
+    const owner = randomUUID();
+
+    assert.deepEqual(await q('select 1 from public.staff_operators'), [],
+      'precondition: no operator exists');
+
+    const [first] = await q('select public.bootstrap_staff_owner($1) as r', [owner]);
+    assert.equal(first.r.ok, true);
+    assert.equal(first.r.bootstrapped, true);
+    assert.equal(first.r.role, 'owner');
+
+    const [row] = await q('select * from public.staff_operators');
+    assert.equal(row.user_id, owner);
+    assert.equal(row.role, 'owner');
+    assert.equal(row.active, true);
+    assert.equal(row.created_by, null,
+      'the only row that legitimately has no creator, because there was nobody to be it');
+    assert.equal(row.disabled_at, null);
+
+    /* Idempotent for the IDENTICAL user: same answer, still one row. */
+    const [again] = await q('select public.bootstrap_staff_owner($1) as r', [owner]);
+    assert.equal(again.r.ok, true);
+    assert.equal(again.r.bootstrapped, false, 'it did not create a second one');
+    assert.equal((await q('select count(*)::int n from public.staff_operators'))[0].n, 1);
+
+    /* And refuses anybody else — the competing-bootstrap case. */
+    const competing = await env.pg.query(
+      'select public.bootstrap_staff_owner($1)', [randomUUID()]).then(() => null, e => e);
+    assert.ok(competing, 'a second, different bootstrap must be refused');
+    assert.match(competing.message, /staff_bootstrap_already_done/);
+    assert.equal((await q('select count(*)::int n from public.staff_operators'))[0].n, 1);
+
+    /* The bootstrapped owner can actually work the queue — the whole point. */
+    const [guard] = await q('select public.staff_operator_guard($1, $2) as role', [owner, 'aal2']);
+    assert.equal(guard.role, 'owner');
+
+    /* And the runbook's step 3 works: the owner creates the next operator,
+       with created_by recorded. */
+    const second = randomUUID();
+    await env.pg.query(
+      `insert into public.staff_operators (user_id, role, active, created_by)
+       values ($1, 'identity_resolver', true, $2)`, [second, owner]);
+    const [guard2] = await q('select public.staff_operator_guard($1, $2) as role', [second, 'aal2']);
+    assert.equal(guard2.role, 'identity_resolver');
+
+    /* A row that claims to have created itself is refused by the table. */
+    const selfMade = await env.pg.query(
+      `insert into public.staff_operators (user_id, role, active, created_by)
+       values ($1, 'owner', true, $1)`, [randomUUID()]).then(() => null, e => e);
+    assert.ok(selfMade);
+    assert.match(selfMade.message, /staff_operators_no_self_creation/);
+
+    /* Once a second operator exists, even the identical-user call is no
+       longer a bootstrap and must not answer as though it were. */
+    const stale = await env.pg.query(
+      'select public.bootstrap_staff_owner($1)', [owner]).then(() => null, e => e);
+    assert.ok(stale, 'this is no longer a bootstrap');
+    assert.match(stale.message, /staff_bootstrap_already_done/);
+  } finally {
+    await env.close();
+  }
+});
+
+utcIt('W3 — the bootstrap is reachable by the server role and by nobody else', async () => {
+  for (const role of ['anon', 'authenticated', 'public']) {
+    const { rows: r } = await localEnv.pg.query(
+      `select has_function_privilege($1, 'public.bootstrap_staff_owner(uuid)', 'EXECUTE') p`, [role]);
+    assert.equal(r[0].p, false, `${role} can call the bootstrap`);
+  }
+  const { rows: svc } = await localEnv.pg.query(
+    `select has_function_privilege('service_role', 'public.bootstrap_staff_owner(uuid)', 'EXECUTE') p`);
+  assert.equal(svc[0].p, true);
+});
+
+/* ---------- X. the resolution note ---------- */
+
+utcIt('X1 — redaction clears the resolution note it used to leave behind', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('x1');
+  const salonA = await establishBusiness(s.a, s.aEmail);
+  const c = await makeQueuedCase({ candidates: [salonA.businessId] });
+  const agreeing = [{ type: 'business_name', normalizedValue: s.a },
+                    { type: 'email_exact', normalizedValue: s.aEmail }];
+
+  const note = 'Spoke to the owner and confirmed this is the same salon.';
+  await resolve({ operator, caseId: c.caseId, target: salonA.businessId,
+    signals: agreeing, payloadHash: c.payloadHash, note });
+
+  const [before] = await rows('identity_resolution_cases', 'identity_resolution_id', c.caseId);
+  assert.equal(before.resolution_notes, note, 'stored as typed, until an erasure runs');
+
+  const { data, error } = await rpc('redact_business_pii', {
+    p_business_id: salonA.businessId,
+    p_reason: 'Erasure requested by the business owner.',
+    p_actor: 'integration-suite', p_actor_type: 'human'
+  });
+  assert.equal(error, null);
+  assert.equal(data.redacted.identityResolutionNotes, 1,
+    'the note is counted as redacted, declared rather than silent');
+
+  const [after] = await rows('identity_resolution_cases', 'identity_resolution_id', c.caseId);
+  assert.equal(after.resolution_notes, '[redacted]');
+  assert.equal(after.resolution_notes.includes('owner'), false);
+
+  /* The structural record survives. An erasure removes what a person wrote,
+     not the fact that a person decided. */
+  assert.ok(after.resolved_at, 'the case is still resolved');
+  assert.equal(after.resolved_by_operator_id, operator, 'and still attributable');
+  assert.deepEqual(after.candidate_business_ids, before.candidate_business_ids,
+    'and its evidence is untouched');
+
+  /* The audit event states what happened and carries no note text. */
+  const [audit] = (await rows('audit_events', 'business_id', salonA.businessId))
+    .filter(a => a.action === 'business.pii_redacted');
+  assert.equal(audit.new_value.resolutionNotesRedacted, 1);
+  assert.equal(JSON.stringify(audit).includes('Spoke to the owner'), false);
+});
+
+utcIt('X2 — redaction touches only the note, and only for the business being erased', async () => {
+  const operator = await makeOperator();
+  const s = salonNames('x2');
+  const target = await establishBusiness(s.a, s.aEmail);
+  const bystander = await establishBusiness(`${s.a} elsewhere`, email('x2-other'));
+
+  const mine = await makeQueuedCase({ candidates: [target.businessId] });
+  const theirs = await makeQueuedCase({ candidates: [bystander.businessId] });
+
+  await resolve({ operator, caseId: mine.caseId, target: target.businessId,
+    signals: [{ type: 'business_name', normalizedValue: s.a },
+              { type: 'email_exact', normalizedValue: s.aEmail }],
+    payloadHash: mine.payloadHash, note: 'The note that should be erased.' });
+  await resolve({ operator, caseId: theirs.caseId, target: bystander.businessId,
+    signals: [{ type: 'business_name', normalizedValue: `${s.a} elsewhere` },
+              { type: 'email_exact', normalizedValue: email('x2-other') }],
+    payloadHash: theirs.payloadHash, note: 'The note that must survive untouched.' });
+
+  await rpc('redact_business_pii', {
+    p_business_id: target.businessId,
+    p_reason: 'Erasure requested by the business owner.',
+    p_actor: 'integration-suite', p_actor_type: 'human'
+  });
+
+  const [erased] = await rows('identity_resolution_cases', 'identity_resolution_id', mine.caseId);
+  const [kept] = await rows('identity_resolution_cases', 'identity_resolution_id', theirs.caseId);
+  assert.equal(erased.resolution_notes, '[redacted]');
+  assert.equal(kept.resolution_notes, 'The note that must survive untouched.',
+    'another business\'s note is not collateral damage');
+
+  /* Re-running the erasure reports zero, not one: it is already gone. */
+  const { data: second } = await rpc('redact_business_pii', {
+    p_business_id: target.businessId,
+    p_reason: 'Erasure requested by the business owner, again.',
+    p_actor: 'integration-suite', p_actor_type: 'human'
+  });
+  assert.equal(second.redacted.identityResolutionNotes, 0);
+});
+
 /* ---------- L. cleanup ---------- */
 
 test('cleanup removes only what this run owns', { skip: BLOCKED ? 'guards not satisfied' : false },

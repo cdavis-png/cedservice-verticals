@@ -173,6 +173,280 @@ been applied to a hosted database, and the hosted run remains outstanding.**
 
 ---
 
+## Run 6 — migration 0007, staff identity resolution, against a disposable local PostgreSQL
+
+| | |
+|---|---|
+| Date | 2026-08-07 |
+| Target | Disposable PostgreSQL created inside the test process (PGlite) |
+| Version | **PostgreSQL 18.3** |
+| Transport | **SQL, directly. Not PostgREST.** |
+| Migrations | 0001 → 0002 → 0003 → 0004 → 0005 → 0006 → **0007**, applied as a chain |
+| Command | `CED_ALLOW_INTEGRATION_TESTS=true CED_LOCAL_PG=true npm run test:integration:local` |
+| Result | **integration suite passes with sections U, V, W and X added; migration-chain suite passes** |
+
+Sections added by 0007, named accurately:
+
+| Section | What it covers |
+|---|---|
+| **U** | The operator guard, the queue and case reads, the authoritative mutation, locking, idempotency, rollback, masking, and the `anon` / `authenticated` posture |
+| **V** | Proposal-vetoed and disagreeing targets, the durable operator reference, case-evidence immutability, the post-write rollback, the post-lock ledger recheck, operator-bound replay, and a resolved case reporting itself unresolvable |
+| **W** | `bootstrap_staff_owner` — empty-table only, idempotent for the identical sole operator, refusing every competing caller, and reachable by the server role alone |
+| **X** | `redact_business_pii` clearing the resolution note 0003 never knew about, and touching nothing else |
+
+### What run 6 did validate
+
+Executed, as real SQL, against a real PostgreSQL planner, constraint machinery
+and trigger machinery:
+
+- **The chain applies with 0007 in it**, on a clean database and as an upgrade
+  over populated pre-0006 data, and **re-applying it is a no-op** — the schema
+  snapshot before and after a rerun is byte-identical.
+- **Sixteen tables**, every one with RLS enabled AND forced and zero policies.
+- `staff_operator_guard` refusing every case except an active, AAL2,
+  provisioned operator — including an **absent** AAL claim, which is refused
+  rather than treated as satisfied.
+- **Revocation taking effect on the next call**, with no token involved.
+- The **eligible-target derivation** in SQL, including twelve malformed
+  evidence shapes of which exactly one well-formed entry survives.
+- The **authoritative mutation**: five rows locked, every one rechecked,
+  merged-away and non-canonical targets refused, the conflict rule re-run
+  against the current target, and the override vocabulary enforced.
+- **Rollback**, including a genuine **post-write** failure injected by a
+  test-local trigger on `identity_resolution_requests` — submission, report,
+  review state, both pointers, case resolution, the operator reference and
+  every event roll back together.
+- **Idempotency**, including the ledger recheck after the case lock and the
+  refusal of a second operator reusing another operator's request id.
+- **`bootstrap_staff_owner`** — empty-table-only, idempotent for the identical
+  sole operator, refusing every competing caller.
+- **Redaction of resolution notes** by the amended `redact_business_pii`.
+- **Grants as catalog facts**: `anon`, `authenticated` and `PUBLIC` hold
+  nothing on either new table or on any new function; internal helpers hold no
+  `service_role` grant either.
+
+### What run 6 did NOT validate
+
+Stated plainly, because every one of these is still owed:
+
+- **PostgreSQL 17.** This ran on **18.3**. The hosted development project runs
+  **17.6.1.155**. A behaviour that differs between the two majors would not be
+  caught here, and 0007 has never run on 17.
+- **Hosted Supabase.** 0007 has **never been applied to any hosted database**.
+- **PostgREST.** Local mode speaks SQL directly. The staff route calls five
+  functions over `db.rpc(...)` — `staff_operator_guard`,
+  `staff_identity_queue`, `staff_identity_case`,
+  `resolve_identity_case_link_existing`, `check_rate_limit` — and **none of
+  them has ever been resolved through PostgREST**. Nothing in this repository
+  ever has.
+- **The two direct table reads.** The route reads
+  `identity_resolution_cases` and `assessment_submissions` through PostgREST
+  with the elevated key. Local mode reaches them as the database owner
+  instead, so the `service_role` grants those reads depend on have not been
+  exercised as `service_role`.
+- **True multi-connection concurrency.** PGlite is a single connection, so no
+  two transactions can interleave. What is proven is the *mechanism* that
+  decides a race — `irr_one_per_case` is a unique index, the case row is taken
+  `for update`, and the ledger is rechecked after the lock is granted.
+  **The race itself has never been run.** Two simultaneous resolutions of one
+  case, and two simultaneous sends of one retry, both remain outstanding and
+  both need a server Postgres with two connections.
+- **`auth.users`.** Absent from PGlite, so the `staff_operators` foreign key
+  and `bootstrap_staff_owner`'s confirmed-email check are both **skipped**,
+  not passed. Neither has ever executed.
+- **Supabase Auth itself.** Everything the console does with it —
+  `signInWithPassword`, `mfa.listFactors`, `mfa.challengeAndVerify`,
+  `refreshSession`, `signOut`, and `getUser` on every subsequent request — is
+  covered against a **stubbed client** on the server side
+  (`tests/staff-auth-session.test.mjs`) and a **stubbed network** in the
+  browser (`tests/browser/staff-console-browser.test.mjs`). **No real access
+  token has ever been verified, no real TOTP factor has ever been enrolled or
+  challenged, and no real session has ever been refreshed or revoked.**
+
+  What the suite *does* now establish, and did not before: the production
+  factory is exercised as itself, so `persistSession: false`,
+  `autoRefreshToken: false` and `detectSessionInUrl: false` are read off a real
+  `@supabase/supabase-js` client, a fresh one per call, with no module-level
+  Auth state; the stub's method names are pinned against that real client's
+  surface, so a rename in a future Supabase version fails here rather than in
+  production; and the stub returns the shapes the installed version actually
+  returns — `challengeAndVerify` carries no `expires_at`, which is why the
+  route's `exp`-claim fallback is the covered path rather than a dead branch.
+  Method *names* and *response shapes* are therefore pinned to version
+  2.112.0. Their *semantics over the wire* are not, and cannot be without a
+  real project.
+- **The Vercel platform.** The route's deployment contract — filesystem
+  routing for `api/staff/identity-resolution/[...path].mjs`, the header rules,
+  the runtime, and the fact that exactly one function now deploys rather than
+  two — is asserted by `tests/staff-deployment-contract.test.mjs` against a
+  model of Vercel's documented routing. **No `vercel build` has been run**,
+  because the CLI is not a dependency of this repository and installing one
+  was out of bounds. The model is a check on the configuration, not on the
+  platform. In particular, that the file tracer bundles `server/` alongside
+  `api/` is expected — the imports are static, which is what
+  `api/assessments.mjs` and `api/analytics.mjs` already rely on — but it has
+  not been observed.
+- **Whether `server/` is ALSO served as a static asset.** The repository has no
+  `.vercelignore`, no `outputDirectory` and no build command, so on the
+  "Other" preset the root is served statically and
+  `/server/staff-identity-resolution.mjs` would be downloadable. Everything
+  else outside `api/` is already in that position — `shared/`, `tests/`,
+  `docs/`, and `supabase/migrations/*.sql` — and none of them, including this
+  one, contains a credential: the staff route names environment variables and
+  reads them at runtime.
+
+  **Superseded by run 8**, which replaced the root-as-output arrangement with
+  an explicit `outputDirectory` built from an allowlist. What that run does
+  *not* do is observe the platform honouring it; that is still owed. The
+  obvious fix was and remains wrong: adding `server/` to a `.vercelignore`
+  would very likely exclude it from the function's trace as well and take the
+  console down with a `MODULE_NOT_FOUND` no local test could see.
+
+**Migration 0007 is validated as SQL and as a migration, on PostgreSQL 18.3,
+over a direct SQL connection. It has never been applied to a hosted database,
+never run on PostgreSQL 17, never been reached through PostgREST, and never
+been raced. All four remain deployment blockers.**
+
+---
+
+## Run 7 — real browser request headers, against the real route
+
+| | Run 7 |
+|---|---|
+| Date | 2026-08-08 |
+| Target | The production entrypoint `api/staff/identity-resolution/[...path].mjs`, over a real TCP socket |
+| Browser | Headless Chrome, driven by the already-installed `puppeteer-core` |
+| Method | The real console page (`index.html`, `auth.js`, `page.js`), signed in through the real form. **`window.fetch` is NOT replaced.** |
+| Stubbed | Supabase Auth and the database only, through `handleRequest`'s existing dependency seam |
+| Result | **A release blocker found and fixed**; 5/5 checks pass |
+| Test | `tests/browser/staff-origin-headers.test.mjs` |
+
+### The defect it found
+
+The route required an exact `Origin` header on **every** request, GET included.
+That is not a rule a browser can satisfy. Per the Fetch standard an `Origin`
+header is appended when a request's response tainting is `cors` **or** the
+method is neither `GET` nor `HEAD`; a same-origin `fetch` keeps tainting
+`basic`, so a same-origin `GET` carries none. An `Authorization` header does
+not change it, because that forces a preflight only on a cross-origin request.
+
+The console therefore signed in successfully — `POST` does carry `Origin` — and
+then **every queue listing and every case read was refused `403
+origin_required`**. The queue was unreachable in every standards-compliant
+browser, and the subsystem was unusable.
+
+Every suite passed throughout, because none of them made a real request: the
+synthetic helpers attached an `Origin` by hand, and
+`tests/browser/staff-console-browser.test.mjs` replaces `window.fetch`, so its
+requests never reach a socket and never acquire browser-generated headers.
+
+### What run 7 DID validate — observed, not asserted
+
+| Request | `Origin` | `Sec-Fetch-Site` | Route |
+|---|---|---|---|
+| Same-origin `GET …/cases` | **absent** | `same-origin` | 200 |
+| Same-origin `GET …/cases/:id` | **absent** | `same-origin` | 200 |
+| Same-origin `GET` with no `Authorization` | **absent** | `same-origin` | — |
+| Same-origin `POST …/session` | present, exact | `same-origin` | not refused |
+| Same-origin `POST …/cases/:id/link` | present, exact | `same-origin` | not refused |
+| Cross-site `GET …/cases` | attacker's origin | `cross-site` | **403**, and no bucket, Auth client or privileged read |
+
+The cross-site refusal is observed to spend nothing: `dbCalls` is empty, no
+Supabase Auth client was built, and no token was verified. That is the property
+the original always-require-`Origin` rule existed to protect, and it is intact.
+
+### What run 7 did NOT validate — continued below at run 8
+
+- **Only Chromium was driven.** Firefox and Safari were not. The behaviour
+  relied on is specified in the Fetch standard rather than Chrome-specific, and
+  `Sec-Fetch-Site` is supported in Firefox and in Safari 16.4+, but neither was
+  observed here.
+- **It ran over plain http against loopback**, using the
+  `CED_ALLOW_INSECURE_STAFF` switch that exists for exactly that purpose. TLS
+  changes nothing about which headers are appended, but it was not exercised.
+- **Supabase Auth and the database were stubbed.** Run 7 is about headers, not
+  about Auth; see the Supabase Auth boundary above, which is unchanged.
+- **This is not a `vercel build`.** The request reached the production
+  entrypoint through a local server, not through Vercel's router.
+
+---
+
+## Run 8 — the static output boundary
+
+| | Run 8 |
+|---|---|
+| Date | 2026-08-08 |
+| Target | The deployment's static surface — what a browser may download |
+| Method | A zero-dependency Node build from an explicit allowlist, plus a contract test that walks the generated tree |
+| Result | 27 files published, everything else withheld; 38/38 checks pass |
+| Files | `tools/static-manifest.mjs`, `tools/build-static.mjs`, `tests/static-output-contract.test.mjs` |
+
+### What was wrong
+
+With no `buildCommand`, no `outputDirectory` and no `public/` directory, the
+output directory on Vercel's "Other" preset is the **repository root**. Every
+file outside `api/` was a static asset: `server/staff-identity-resolution.mjs`,
+all seven migrations, every document including the staff operations runbook,
+every test, and `.env.example`.
+
+**No credential was exposed.** `.env.example` carries variable names with blank
+values; the server modules read their secrets from the environment at runtime.
+This was source and operational disclosure, not a credential leak, and it
+should not be recorded as one. What made it worth fixing is that nothing had
+decided it — the root was published by omission.
+
+### What run 8 established
+
+- `vercel.json` now sets `"buildCommand": "node tools/build-static.mjs"` and
+  `"outputDirectory": "dist"`. The output directory is asserted not to be `.`,
+  empty, or the repository root.
+- The build copies **only** the 27 files named in the manifest, **byte for
+  byte**, at their existing relative paths — so every current URL still
+  resolves with no rewrite rule and no edited reference.
+- It is **deterministic**: two consecutive builds produce an identical
+  inventory and identical SHA-256 content hashes.
+- It **starts from empty**, so a file removed from the manifest leaves the
+  site; a stray file planted in the output does not survive a rebuild.
+- Because there is no transform step, **no secret can be injected at build
+  time**. Asserted anyway: no output file assigns a known secret variable,
+  contains an `sb_secret_` key, or contains a JWT-shaped literal.
+- `shared/security/` in the output contains **exactly**
+  `shared/security/continuation.js`. `origin.js`, `rate-limit.js`,
+  `read-body.js`, `staff-note.js`, `verify-challenge.js` and `limits.js` are
+  asserted absent by name.
+- `continuation.js` was **audited before being published**, and the audit is
+  executed rather than read: the generated copy is imported and called with
+  what a browser has — no secret, no HMAC function — and
+  `issueContinuationContext` returns `null` while `verifyContinuationContext`
+  returns `not_configured`. It can neither mint nor validate a trusted context.
+- `api/` holds exactly three deployable functions, one of them the staff
+  catch-all; none is inside the static output; no `.mjs` file of any kind is
+  published; there is no `.vercelignore`; and every static ESM import in the
+  entrypoint and the implementation still points at a file that exists.
+
+### What run 8 did NOT validate
+
+- **No `vercel build` and no preview deployment.** The Vercel CLI is not a
+  dependency of this repository and installing or authenticating one was out of
+  bounds. Everything above is a check on the *configuration and the generated
+  tree*, not on the platform.
+- **Whether Vercel honours `outputDirectory`** as documented.
+- **Whether `api/` functions are still discovered** when a `buildCommand` is
+  present. This is documented behaviour for the "Other" preset; it has not been
+  observed here.
+- **Whether the file tracer still follows** `api/` → `server/` → `shared/`.
+  The imports are static, which is what `api/assessments.mjs` already relies
+  on, but no trace has been produced.
+- **Whether the header rules match the generated paths on the platform.** They
+  are modelled from `vercel.json` exactly as the deployment-contract test
+  models routing.
+
+**Until a real preview deployment exists, the static boundary is configured and
+tested but not observed.** Do not describe it as verified on the strength of
+this run.
+
+---
+
 ## 0. Run 2 — migration 0004 and the two-stage assessment
 
 ### What was applied

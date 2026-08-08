@@ -40,7 +40,20 @@ const SERVER_RPCS = [
   'purge_expired_rate_limit_buckets(timestamp with time zone)',
   'purge_expired_analytics_events(timestamp with time zone, integer)',
   'purge_expired_analytics_sessions(timestamp with time zone, integer)',
-  'redact_business_pii(uuid, text, text, text)'
+  'redact_business_pii(uuid, text, text, text)',
+
+  /* 0007. The staff console's four, plus the one-time bootstrap.
+     staff_operator_guard IS server-callable and that is deliberate: the route
+     calls it directly, before it reads a case row or a stored payload, so an
+     unauthorized caller is refused BEFORE any privileged read happens on
+     their behalf. The privileged functions call it again inside their own
+     transactions; that repetition is defence in depth, not the reason for the
+     grant. */
+  'staff_operator_guard(uuid, text)',
+  'staff_identity_queue(uuid, text, integer, integer)',
+  'staff_identity_case(uuid, text, uuid)',
+  'resolve_identity_case_link_existing(uuid, text, uuid, uuid, uuid, text, text, jsonb, text, boolean, text)',
+  'bootstrap_staff_owner(uuid)'
 ];
 
 /* Trigger and helper functions. Nobody executes these directly: they run as
@@ -60,7 +73,20 @@ const NOT_CALLABLE = [
      SECURITY DEFINER and therefore runs it as the owner. Granting execute
      would let anyone ask "does this evidence contradict that record?" — a
      read of what a Business Record holds, one question at a time. */
-  'identity_proposal_conflict(jsonb, uuid)'
+  'identity_proposal_conflict(jsonb, uuid)',
+
+  /* 0007's internals. Each is called only from inside a SECURITY DEFINER
+     function in the same migration, which runs it as the owner.
+
+     identity_case_eligible_targets is the one that matters most: it answers
+     "which Business Records may this case attach to", and a direct grant
+     would let the server credential ask that with no operator guard in front
+     of it — the same objection 0006 raises against granting
+     identity_proposal_conflict. */
+  'identity_case_eligible_targets(uuid)',
+  'mask_contact_value(text)',
+  'identity_resolution_replay(identity_resolution_requests, text, uuid)',
+  'reject_case_evidence_change()'
 ];
 
 const growthPayload = ({ submissionId, sessionId }) => ({
@@ -246,7 +272,7 @@ test('server RPC permissions are explicit, and only service_role has them', asyn
         where n.nspname = 'public' and c.relkind = 'r'
           and c.relrowsecurity and c.relforcerowsecurity
         order by 1`)).map(r => r.relname);
-    assert.equal(tables.length, 14, 'RLS must be enabled AND forced on every table');
+    assert.equal(tables.length, 16, 'RLS must be enabled AND forced on every table');
 
     for (const table of tables) {
       const read = await asRole('anon', `select * from public.${table} limit 1`);

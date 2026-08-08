@@ -29,6 +29,15 @@ framework, no dependencies. Do not introduce a bundler, framework, package
 manager, or CSS preprocessor without being asked. A vertical must remain
 openable by double-clicking `index.html`.
 
+**The one exception, and it is not a build step in the sense above.**
+`tools/build-static.mjs` is a zero-dependency file copier that assembles the
+deployment's static output from an explicit allowlist — see section 13. It does
+not bundle, transpile, minify, inline, or rewrite anything: every published
+file is a byte-for-byte copy of its canonical source, which stays exactly where
+it is. Nothing imports it, no page depends on it, and a vertical is still
+openable by double-clicking `index.html`. It exists because the alternative was
+publishing the repository root.
+
 ---
 
 ## 2. Shared vs. vertical
@@ -140,21 +149,24 @@ has a rule that must not be quietly relaxed:
 See [docs/PRODUCTION_HARDENING.md](docs/PRODUCTION_HARDENING.md) and
 [docs/IMPLEMENTATION_MILESTONE_1.md](docs/IMPLEMENTATION_MILESTONE_1.md).
 
-**Known outstanding gaps:** no production database is connected; migration
-0006 has been validated against a disposable local PostgreSQL 18.3 — the whole
-chain, a clean install and an upgrade over populated pre-0006 data, with the
-full integration suite including sections O, P and Q passing — but has **never
-been applied to a hosted database and has never run against PostgreSQL 17**,
-which is what the hosted development project runs; nothing has ever run over
-PostgREST; migrations 0001–0005 are validated against that hosted development
-Postgres, but section M of the integration suite has not run over PostgREST
-either; the application is not deployed for public traffic; no challenge provider has
-been chosen; there is no surface for working the identity-resolution queue, so
-ambiguous submissions are stored safely but cannot yet be resolved by anyone —
-a queue the intelligence expansion sends *more* work to, since multi-location
-prospects now escalate, and escalate from Stage 1; and nothing yet reports how
+**Known outstanding gaps:** no production database is connected; migrations
+0006 and 0007 have been validated against a disposable local PostgreSQL 18.3 —
+the whole chain, a clean install and an upgrade over populated pre-0006 data,
+with the full integration suite including sections O through X passing — but
+neither has **ever been applied to a hosted database and neither has run
+against PostgreSQL 17**, which is what the hosted development project runs;
+nothing has ever run over PostgREST; migrations 0001–0005 are validated against
+that hosted development Postgres, but section M of the integration suite has
+not run over PostgREST either; the application is not deployed for public
+traffic; no challenge provider has been chosen; and nothing yet reports how
 many visitors open or finish the fit review, so there is no evidence about
 whether the two-stage split reduced abandonment or merely moved it.
+
+The identity-resolution queue now **has** a working surface — see section 12 —
+so ambiguous submissions can be resolved by a provisioned operator. What that
+surface has not had is any contact with the real world: no real Supabase Auth
+call, no real second factor, and no Vercel build. Section 12 lists that
+precisely.
 
 ---
 
@@ -593,8 +605,8 @@ step and **makes no recommendation**.
 ### Known outstanding gaps
 
 Migration 0005 **has** been executed against the hosted development
-PostgreSQL 17 project; migration 0006 has been executed only against a
-disposable local PostgreSQL 18.3 through PGlite, and has never run against
+PostgreSQL 17 project; migrations 0006 and 0007 have been executed only against
+a disposable local PostgreSQL 18.3 through PGlite, and have never run against
 PostgreSQL 17, hosted Supabase, or PostgREST. Nothing has ever run through
 PostgREST at all. The single record of what has and has not executed is
 [docs/REAL_POSTGRES_VALIDATION.md](docs/REAL_POSTGRES_VALIDATION.md).
@@ -603,3 +615,260 @@ The analytics consent policy is **pending professional review** and no
 compliance claim is made anywhere. There is no signed session token, so the
 endpoint's only real defences are the origin allowlist and rate limiting.
 Abandonment counts are a floor, not a total.
+
+---
+
+## 12. The staff identity-resolution console
+
+The first and only **authenticated** surface in this repository. Everything
+else is deliberately public, because the people filling in an assessment have
+no account. This one is the opposite, and it exists because migration 0001
+created `identity_resolution_cases`, called it "the human queue", and gave
+nobody a way to close one.
+
+Full runbook — provisioning, revocation, environment, and what an operator can
+and cannot do — is
+[docs/STAFF_IDENTITY_RESOLUTION_OPERATIONS.md](docs/STAFF_IDENTITY_RESOLUTION_OPERATIONS.md).
+
+### Where it lives
+
+| | |
+| --- | --- |
+| Page | `staff/identity-resolution/` — `index.html`, `page.js`, `auth.js`, `styles.css` |
+| Deployment entrypoint | `api/staff/identity-resolution/[...path].mjs` |
+| Implementation | `server/staff-identity-resolution.mjs` |
+| Migration | `supabase/migrations/0007_staff_identity_resolution.sql` |
+
+**The implementation is outside `api/` on purpose.** Vercel deploys every file
+under `api/` as its own function, so while it lived there the same privileged
+route deployed **twice** — once through the catch-all the console calls, and
+once at its own bare path, absent from `vercel.json` and therefore on platform
+defaults. One route, one function. The entrypoint is a catch-all segment
+because every path the console calls carries a sub-path, and a plain
+`api/<name>.mjs` serves its own path and nothing beneath it.
+
+**`server/` is a new top level, and the dependency direction is the same
+one-way rule section 2 states for verticals.** `server/` imports from
+`shared/`; `shared/` must never import from, reference, or special-case
+`server/`. The imports are static ESM so the platform's file tracer can follow
+them by reading the source — the same convention `api/assessments.mjs` and
+`api/analytics.mjs` already rely on.
+
+### Supabase Auth runs on the server
+
+The browser holds **no Supabase client and no key of any kind**. It posts to
+three same-origin endpoints — `/session`, `/session/refresh`,
+`/session/signout` — and the route makes every Auth call with the supported
+client, server-side. Nothing is hand-rolled.
+
+This repository has no build step and no bundler, so putting
+`@supabase/supabase-js` in the page would have meant committing a generated
+third-party bundle or loading one from a CDN at runtime. Neither belongs in the
+sign-in path of a console that performs permanent, unerasable attachments.
+
+Rules that must not be quietly relaxed:
+
+- **Two keys, kept strictly apart, failing closed in both directions.** The
+  publishable key (or the legacy `SUPABASE_ANON_KEY`) does password sign-in,
+  factor listing, challenge and verify, refresh, sign-out, and access-token
+  verification — *and nothing else*. The secret key (or the legacy
+  `SUPABASE_SERVICE_ROLE_KEY`) does the privileged RPC and the two direct table
+  reads — *and nothing else*. A secret key pasted into the publishable variable
+  is recognised and refused, so the route answers `503 auth_unavailable` rather
+  than verifying tokens with an elevated credential; the reverse is refused
+  too. Auth running server-side is **not** a reason to reach for the elevated
+  key.
+- **The Auth client is built per request and never cached.** It carries a
+  signed-in session in memory during sign-in, so two concurrent invocations
+  sharing one instance would be two operators sharing one session.
+  `persistSession`, `autoRefreshToken` and `detectSessionInUrl` are all off.
+- **Every `signOut` passes `{ scope: 'local' }`, explicitly.** The library's
+  default is `global`, which revokes every refresh token the user holds on
+  every device. Three of the four calls sit on the ordinary sign-in path,
+  including the one that runs when a correct password is waiting for its code —
+  so the default meant somebody holding only the password could evict a live
+  AAL2 operator, repeatedly, which is exactly what the second factor exists to
+  prevent.
+- **AAL2 is confirmed on the token, never assumed from the challenge,** and
+  re-confirmed on every refreshed token. Any post-password path that does not
+  end in a confirmed AAL2 session revokes the temporary one it created.
+- **A claim may decorate the interface and may never be the decision.**
+  Authorization is a live `staff_operators` lookup on every request, called
+  *before* any case row or stored payload is read. Revocation takes effect on
+  the next request, not the next token refresh.
+- **Provenance is proved before anything is spent** — before the rate limiter,
+  the body, Supabase, the operator guard and every privileged read. A request
+  carrying a body must also declare `application/json`. Without this, a `fetch`
+  from any page an operator opens is a CORS *simple* request with no preflight
+  to fail, and although it cannot read the answer it still consumes the
+  operator's budget. `shared/security/origin.js` is the canonical validator.
+
+  **The proof is method-sensitive, because browsers are.** Per the Fetch
+  standard an `Origin` header is appended when a request's response tainting is
+  `cors` **or** its method is neither `GET` nor `HEAD`. A same-origin `fetch`
+  keeps tainting `basic`, so **a same-origin `GET` carries no `Origin` at
+  all** — and an `Authorization` header does not change that, because it forces
+  a preflight only on a cross-origin request.
+
+  | | `Origin` present | `Origin` absent |
+  | --- | --- | --- |
+  | Unsafe (`POST`) | exact-matched against the allowlist | **refused** |
+  | Safe (`GET`, `HEAD`) | exact-matched against the allowlist | accepted only on `Sec-Fetch-Site: same-origin` or `none` |
+
+  `same-site` is **never** accepted: it means any host under the same
+  registrable domain, and this console must not inherit trust from whatever
+  else is hosted beside it. A missing, malformed or unrecognised
+  `Sec-Fetch-Site` on an absent-`Origin` read is refused rather than guessed
+  at. An approved non-browser client that states an exact `Origin` keeps
+  working unchanged.
+
+  This replaced a rule that required `Origin` on every method. It read as
+  strictly safer and was not: the console signed in, then every queue listing
+  and every case read was refused `403 origin_required`, and the queue was
+  unreachable in every standards-compliant browser. Nothing caught it because
+  the synthetic suites attached an `Origin` by hand and the browser suite
+  replaced `window.fetch`. `tests/browser/staff-origin-headers.test.mjs` now
+  **observes** the headers a real browser sends, over a real socket, against
+  the real entrypoint — do not replace it with a test that asserts them.
+- **Four rate-limit buckets, not one.** Pre-authentication (every request),
+  sign-in (`/session` only), session maintenance (`/session/refresh` and
+  `/session/signout`), and authenticated operator work. Refresh and sign-out
+  are not credential attempts and must not share the guessing budget — a
+  refused refresh ends the session, so counting them together ejected the
+  people the tight bucket protected. Separation lives inside the keyed HMAC,
+  never in the database's `scope` column, which keeps the vocabulary migration
+  0003 gave it.
+
+### Migration 0007
+
+Adds `staff_operators` (keyed to the immutable `auth.users` UUID, never an
+email), `identity_resolution_requests` (the operator-bound idempotency ledger,
+one row per case), the masked read surface, and one authoritative mutation that
+locks the case, submission, report, target and review state, rechecks every
+one, re-runs the conflict rule against the *current* target, and either commits
+the whole thing or leaves nothing behind. It writes no identifier, repoints no
+session or continuation, and splices no supersession chain. RLS is enabled and
+**forced** with no policies, exactly as every table since 0001.
+
+### What has never been validated
+
+Stated precisely, because everything below is still owed:
+
+- **PostgreSQL 17.** 0007 has run on 18.3 only, through PGlite.
+- **Hosted Supabase.** 0007 has never been applied to any hosted database.
+- **PostgREST.** The five functions the route calls have never been resolved
+  through it, and neither have the two direct table reads — local mode reaches
+  them as the database owner, so the `service_role` grants they depend on have
+  not been exercised as `service_role`.
+- **True multi-connection concurrency.** PGlite is a single connection. The
+  *mechanism* that decides a race is proven — a unique index, a `for update`
+  on the case, a ledger recheck after the lock — but the race itself has never
+  been run.
+- **`auth.users`.** Absent from PGlite, so the `staff_operators` foreign key
+  and the bootstrap's confirmed-email check are **skipped**, not passed.
+- **Real Supabase Auth and TOTP.** Every Auth call is covered against a stubbed
+  client on the server and a stubbed network in the browser. No real access
+  token has ever been verified, no real factor enrolled or challenged, and no
+  real session refreshed or revoked.
+- **Vercel.** No `vercel build` and no preview deployment. Routing, header
+  rules, function count and file tracing are asserted against a *model* of
+  documented behaviour. That is a check on the configuration, not on the
+  platform. What is no longer open is *what would be published*: the
+  deployment now has an explicit output directory built from an allowlist
+  (section 13). Whether Vercel honours that configuration is still platform
+  behaviour and still unobserved.
+
+Do not describe any of these as validated on the strength of a mock, PGlite, a
+configuration-model test, or a reading of the source.
+
+---
+
+## 13. What a browser may download
+
+Everything the deployment serves as a static file is named in
+[tools/static-manifest.mjs](tools/static-manifest.mjs). Nothing else is
+published.
+
+### Why this exists
+
+With no `buildCommand`, no `outputDirectory` and no `public/` directory, the
+output directory on Vercel's "Other" preset is the **repository root**. Every
+file outside `api/` was therefore a static asset:
+`server/staff-identity-resolution.mjs`, every migration, every document
+including the staff operations runbook, every test, and `.env.example`.
+
+**No credential was exposed** — `.env.example` holds only variable names with
+blank values, and the server modules read their secrets from the environment at
+runtime. Readable source is not a credential, and it should not be described as
+one. But nothing had *decided* that any of it should be public, and no test
+could see the question either way. That is what changed.
+
+### How it works
+
+`vercel.json` sets `"buildCommand": "node tools/build-static.mjs"` and
+`"outputDirectory": "dist"`. The build copies exactly the files named in the
+manifest into `dist/`, **byte for byte**, at their existing relative paths.
+
+**`vercel.json` carries configuration and nothing else.** It is strict JSON
+validated against a schema that sets `"additionalProperties": false`, so it can
+hold neither comments nor an invented property used as one — an unsupported
+key risks the whole file being refused, which would take `buildCommand` and
+`outputDirectory` down with it and republish the repository root. Every
+explanation lives in
+[docs/DEPLOYMENT_CONFIGURATION.md](docs/DEPLOYMENT_CONFIGURATION.md); a test
+asserts every top-level key is one Vercel actually defines.
+
+**The build is destructive code and is fenced as such** — one permitted output
+name, canonical containment, no environment override, no symlink followed, and
+a staging directory that is swapped in only after every file has been copied.
+The rules, and the three defects that produced them, are
+[docs/STATIC_OUTPUT_SAFETY.md](docs/STATIC_OUTPUT_SAFETY.md).
+
+- **A positive allowlist, never a denylist.** "Copy everything except…" fails
+  open: the next file added to the repository is public unless somebody
+  remembers to exclude it. This fails closed — a new browser asset is invisible
+  until it is named, which is a broken page in review rather than a published
+  document in production.
+- **Canonical sources do not move.** The manifest names files where they
+  already live. `dist/` is generated, git-ignored and disposable; it is never
+  an authoritative tree and must never be edited. There is no second copy for
+  anyone to change by mistake.
+- **Paths are preserved, not rewritten.** Every current URL keeps working with
+  no rewrite rule, and no HTML or CSS reference has to change — so the build
+  cannot introduce a broken link by construction.
+- **It starts from empty.** A file that leaves the manifest leaves the site.
+- **No `.vercelignore`.** Excluding `server/` or `shared/` would break the
+  function tracer that follows the static ESM imports out of `api/`. Those
+  modules must stay traceable *and* stay unpublished — they are, because the
+  allowlist decides publication and the tracer reads the source tree.
+
+### `shared/security/` is decided by content, not by directory name
+
+Exactly one file from it is published: **`shared/security/continuation.js`**,
+because both public pages load it and `engine.js` and `controller.js` call
+`window.CEDContinuation`. Removing it would break both reviews.
+
+It is safe to publish, and that was audited rather than assumed: it holds no
+secret and reads no environment variable; `secret` and `hmacFn` are injected by
+`api/assessments.mjs`; `issueContinuationContext` returns `null` and
+`verifyContinuationContext` returns `not_configured` without them, so the
+browser copy can neither mint nor validate a trusted context; and a token
+forged with an attacker's own secret fails the server's signature check.
+
+`origin.js`, `rate-limit.js`, `read-body.js`, `staff-note.js`,
+`verify-challenge.js` and `limits.js` are server-only and are asserted absent
+**by name**. Do not add a file to the manifest because a neighbour is already
+there — the directory is not the boundary, the audit is.
+
+### Adding an asset
+
+Add it to the manifest, with a comment saying why a browser needs it. If it is
+under `shared/security/`, audit it first and record the audit.
+[tests/static-output-contract.test.mjs](tests/static-output-contract.test.mjs)
+proves the build is deterministic, that the output is exactly the manifest,
+that every referenced asset resolves, and that no forbidden path appears.
+
+**Still unvalidated:** no `vercel build` and no preview deployment has been
+run. Whether the platform honours `outputDirectory`, still discovers `api/`
+functions alongside a build command, and still traces `server/` and `shared/`
+is documented behaviour that this repository models but has not observed.
