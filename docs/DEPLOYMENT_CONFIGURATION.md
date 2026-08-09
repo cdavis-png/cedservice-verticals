@@ -82,23 +82,76 @@ browsers honour; both are sent because they disagree about nothing here.
 
 ## The staff Content-Security-Policy
 
-`default-src 'none'`, and then exactly what the page actually uses: two
-same-origin scripts (`auth.js`, `page.js`), one same-origin stylesheet, and
-`fetch` to the same-origin staff API.
+The policy is delivered in **two halves**, and the split is deliberate — see
+"Why the header policy is narrower than it looks" below.
+
+- The **response header** on `/staff/(.*)` carries `frame-ancestors 'none'`
+  plus the directives that are identical on every staff page:
+  `script-src 'self'`, `style-src 'self'`, `form-action 'none'`,
+  `base-uri 'none'`, `object-src 'none'`.
+- Each **page** carries a `<meta>` policy with `default-src 'none'` and its own
+  `connect-src` — `'self'` for the console, and `'self'` plus the generated
+  Supabase project origin for the onboarding page.
+
+Between them: exactly what the pages actually use — same-origin scripts
+(`auth.js`, `page.js`, the vendored Supabase client), one same-origin
+stylesheet, and `fetch` to the same-origin staff API plus, on the onboarding
+page only, one Supabase Auth origin.
 
 There is no inline script, no inline style, no `url()` and no `@import`
-anywhere in the page, so no `'unsafe-inline'`, no `'unsafe-eval'`, no `data:`
-and no host is needed to make it load. **A policy that has to be widened to
-work is not a policy.**
+anywhere in either page, so no `'unsafe-inline'`, no `'unsafe-eval'`, no
+`data:` and no CDN host is needed to make them load. **A policy that has to be
+widened to work is not a policy.**
 
 - `form-action 'none'` — both forms are handled in JavaScript and never submit.
   If the scripts failed to load, the default submit would put a password in a
   navigation, and this refuses that.
 - `base-uri 'none'` — both scripts fetch path-absolute URLs, which an injected
   `<base>` would re-point at another origin.
-- `img-src` is **deliberately absent**. The page loads no image, so
+- `img-src` is **deliberately absent**. The pages load no image, so
   `default-src 'none'` covering an automatic `/favicon.ico` request is correct
-  rather than something to widen for.
+  rather than something to widen for. Supabase returns a TOTP QR code as a
+  `data:` image and the onboarding page deliberately does not render it: the
+  setup key is shown as text instead, because widening a security header to
+  save an operator from typing sixteen characters is the wrong trade.
+
+### `connect-src` is generated, not configured here
+
+The onboarding page (`staff/identity-resolution/accept-invite.html`) talks to
+Supabase Auth directly, because a password, a session token and a TOTP secret
+must never pass through a CED endpoint (CLAUDE.md §9). Its policy therefore has
+to name the **exact Supabase project origin** — which differs between Preview
+and Production.
+
+**That origin is not in this file, and must never be.** It is generated at
+build time by `tools/build-static.mjs` from `SUPABASE_URL`, the same variable
+`GET /auth-config` reads, through the same validator
+(`shared/security/supabase-origin.js`). One variable, one validator, two
+consumers — so the origin the page is told to call and the origin it is
+permitted to reach cannot diverge.
+
+This replaced a literal `https://REPLACE-WITH-PROJECT-REF.supabase.co` that
+had to be edited by hand after review. A deployable file with a placeholder in
+it is a deployment waiting to ship the placeholder; hardcoding the development
+origin instead would have been worse, because the production deployment would
+then have been permitted to reach the development project's Auth server.
+
+### Why the header policy is narrower than it looks
+
+The `/staff/(.*)` header CSP carries **no `default-src` and no
+`connect-src`**, and that is a correction rather than a relaxation.
+
+A response-header CSP and a `<meta>` CSP are **both** enforced, and the browser
+applies their **intersection**. A header saying `connect-src 'self'` would
+therefore have blocked the Supabase origin the onboarding page's own generated
+policy permits — and `default-src 'none'` would have done it too, being
+`connect-src`'s fallback. So the two directives that differ per page live in
+each page's `<meta>`, first in `<head>`, before any script or stylesheet.
+
+The header keeps what a meta policy cannot express — `frame-ancestors 'none'`,
+which is **ignored** in a meta policy — plus the directives that are identical
+on every staff page. `Referrer-Policy: no-referrer` stays a header for the same
+reason it always was, and is declared again on the page.
 
 ## `buildCommand` and `outputDirectory` — the static output
 

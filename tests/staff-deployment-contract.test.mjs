@@ -79,7 +79,16 @@ const SESSION_PATHS = [
   '/api/staff/identity-resolution/session/signout'
 ];
 
-const ALL_PATHS = [...CONSOLE_PATHS, ...SESSION_PATHS];
+/* The onboarding paths, which accept-invite.js calls before the operator has
+   a session of any kind. They sit two segments below the prefix, so they are
+   the deepest thing the catch-all has to carry — an `api/<name>.mjs` would
+   have served none of them. */
+const ONBOARDING_PATHS = [
+  '/api/staff/identity-resolution/onboarding/invite',
+  '/api/staff/identity-resolution/onboarding/verify'
+];
+
+const ALL_PATHS = [...CONSOLE_PATHS, ...SESSION_PATHS, ...ONBOARDING_PATHS];
 
 /* ---------- a model of Vercel filesystem routing for api/ ----------
    Documented behaviour, in three rules:
@@ -423,9 +432,8 @@ test('the function budget is configured for the staff route as well', () => {
 /* The exact policy, written out. Pinning the string rather than probing for
    directives means a widening — an added 'unsafe-inline', a host, a data: —
    fails here rather than passing a loose contains() check. */
-const STAFF_CSP = "default-src 'none'; script-src 'self'; style-src 'self'; "
-  + "connect-src 'self'; form-action 'none'; base-uri 'none'; object-src 'none'; "
-  + "frame-ancestors 'none'";
+const STAFF_CSP = "frame-ancestors 'none'; script-src 'self'; style-src 'self'; "
+  + "form-action 'none'; base-uri 'none'; object-src 'none'";
 
 test('the staff page is not framable, not cached and not indexed', () => {
   /* The JSON responses set these themselves and a test already pins that.
@@ -446,21 +454,80 @@ test('the staff CSP is the minimum the page actually needs, and nothing is relax
     return [name, values.join(' ')];
   }));
 
-  /* A password, a TOTP code and bearer tokens pass through this page. */
-  assert.equal(directives['default-src'], "'none'", 'everything is denied by default');
-  assert.equal(directives['script-src'], "'self'", 'auth.js and page.js, and nothing else');
+  /* A password, a TOTP code and bearer tokens pass through these pages. */
+  assert.equal(directives['frame-ancestors'], "'none'",
+    'the one directive a meta policy cannot express, which is why the header exists');
+  assert.equal(directives['script-src'], "'self'",
+    'auth.js, page.js and the VENDORED Supabase client — all same-origin. Vendoring '
+    + 'rather than using a CDN is what keeps this directive at \'self\'');
   assert.equal(directives['style-src'], "'self'", 'styles.css, and nothing else');
-  assert.equal(directives['connect-src'], "'self'", 'the same-origin staff API only');
   assert.equal(directives['form-action'], "'none'",
     'both forms are handled in JavaScript; a default submit would put a password in a navigation');
   assert.equal(directives['base-uri'], "'none'",
     'both scripts fetch path-absolute URLs, which an injected <base> would re-point');
   assert.equal(directives['object-src'], "'none'");
-  assert.equal(directives['frame-ancestors'], "'none'");
 
+  /* THE TWO DIRECTIVES THAT MUST NOT BE HERE, and this is the defect that
+     put them in a test rather than a comment.
+
+     A header CSP and a meta CSP are both enforced and the browser applies
+     their INTERSECTION. The onboarding page's meta policy permits one extra
+     origin in `connect-src`; a header that also named `connect-src` — or
+     `default-src`, which is connect-src's fallback — would intersect with it
+     and block the very request the page exists to make. Per-page directives
+     belong in the per-page policy. */
+  assert.equal('default-src' in directives, false,
+    'default-src in the header would intersect with the generated connect-src and block it');
+  assert.equal('connect-src' in directives, false,
+    'connect-src in the header would intersect with the generated one');
+
+  assert.equal(csp.includes('wss'), false, 'no WebSocket source');
   for (const weakness of ["'unsafe-inline'", "'unsafe-eval'", 'data:', 'blob:', '*',
-                          'http:', 'https:', "'unsafe-hashes'"]) {
+                          'http:', "'unsafe-hashes'"]) {
     assert.equal(csp.includes(weakness), false, `the policy must not contain ${weakness}`);
+  }
+  assert.equal(/(^|[\s;])https:([\s;]|$)/.test(csp), false,
+    'https: as a scheme-wide source would allow any host');
+});
+
+test('no deployable configuration carries a placeholder or a Supabase host', () => {
+  /* THE DEFECT THIS PINS. The staff CSP once carried
+     `https://REPLACE-WITH-PROJECT-REF.supabase.co`, to be replaced by hand
+     after review. A deployable file with a placeholder in it is a deployment
+     waiting to ship the placeholder; hardcoding the development origin
+     instead would have been worse, because the production deployment would
+     then have been permitted to reach the development project's Auth server.
+
+     The origin is generated per environment by tools/build-static.mjs from
+     SUPABASE_URL, so vercel.json names no Supabase host at all. */
+  const raw = readFileSync(join(ROOT, 'vercel.json'), 'utf8');
+  assert.equal(raw.includes('REPLACE-WITH-PROJECT-REF'), false, 'no placeholder');
+  assert.equal(raw.includes('supabase'), false, 'and no Supabase host, of any kind');
+  assert.equal(/PROJECT-REF|YOUR-PROJECT|TODO|FIXME|<your-/i.test(raw), false,
+    'nothing that reads as "fill this in later"');
+});
+
+test('the per-page meta policies carry what the header deliberately does not', () => {
+  /* The header is only safe to narrow because each page states the rest. A
+     page that lost its meta would be governed by a header that permits any
+     connection, which is the failure mode this pair of tests exists for. */
+  for (const page of ['index.html', 'accept-invite.html']) {
+    const html = readFileSync(join(ROOT, 'staff/identity-resolution', page), 'utf8');
+    const meta = html.match(/<meta http-equiv="Content-Security-Policy" content="([^"]+)">/);
+    assert.ok(meta, `${page} declares no meta CSP`);
+    const policy = meta[1];
+
+    assert.ok(policy.startsWith("default-src 'none'"), `${page}: ${policy}`);
+    assert.ok(policy.includes("connect-src 'self'"), page);
+    assert.equal(policy.includes('frame-ancestors'), false,
+      `${page}: frame-ancestors is ignored in a meta policy and stays in the header`);
+
+    /* The SOURCE carries the fail-closed baseline. Only the built copy of the
+       onboarding page gets an origin appended, and only from a validated
+       SUPABASE_URL — so an unbuilt or misbuilt copy reaches no Supabase at
+       all rather than the wrong one. */
+    assert.equal(policy.includes('supabase'), false,
+      `${page}: the source policy names no host; the build generates it`);
   }
 });
 

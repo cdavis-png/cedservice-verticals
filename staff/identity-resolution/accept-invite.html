@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow, noarchive">
+  <!-- EXPLICIT, not only inherited. vercel.json sets Referrer-Policy:
+       no-referrer for /staff/(.*), and this states it again on the page
+       itself so the guarantee survives being served any other way. The
+       invitation token arrives in this page's query string; a referrer that
+       carried it to any other origin would hand over the invitation. -->
+  <meta name="referrer" content="no-referrer">
+  <!-- THE POLICY, BEFORE ANY SCRIPT OR RESOURCE. A meta CSP governs only what
+       is fetched after it is parsed, so it is the first thing in the document
+       that could restrict anything.
+
+       `connect-src 'self'` here is the FAIL-CLOSED baseline. The published
+       copy has the exact Supabase project origin appended by
+       tools/build-static.mjs, from SUPABASE_URL, validated as an exact
+       scheme-host-port. This file is never edited to add it, no deployable
+       configuration carries a placeholder, and an unbuilt copy simply cannot
+       reach Supabase.
+
+       `frame-ancestors` is deliberately NOT here: it is ignored in a meta
+       policy, so it stays in the response header where it works. The header
+       policy carries no `default-src` and no `connect-src`, so it cannot
+       intersect with — and silently block — the origin generated below. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; form-action 'none'; base-uri 'none'; object-src 'none'">
+  <title>Accept your invitation — CED Service staff</title>
+  <!-- Exempt from the file:// rule in CLAUDE.md §1, and it says so here so
+       the exemption is never mistaken for an oversight: this page completes a
+       Supabase Auth invitation over TLS and cannot work from a local file.
+
+       WHERE THE CREDENTIALS GO. The password, the Supabase session, the TOTP
+       secret and the TOTP code go from this page to Supabase Auth DIRECTLY,
+       with the publishable key. None of them is ever sent to a CED endpoint —
+       CLAUDE.md §9 forbids this platform from transmitting credentials, and
+       an earlier version of this page broke that rule by proxying all of them
+       through /api. The only CED call this page makes is a GET for the
+       project URL and the publishable key, neither of which is a secret. -->
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to the form</a>
+
+  <header class="bar">
+    <p class="eyebrow">CED SERVICE — STAFF</p>
+    <h1>Set up your staff account</h1>
+  </header>
+
+  <main id="main" tabindex="-1">
+
+    <!-- Shown while the page fetches the Supabase configuration, and left up
+         if that fails: without it nothing on this page can work. -->
+    <section id="loading" class="panel" aria-labelledby="loading-h">
+      <h2 id="loading-h">Loading</h2>
+      <p class="muted" id="loading-message" role="status">Preparing the sign-up form…</p>
+      <p class="error" id="loading-error" role="alert" hidden></p>
+    </section>
+
+    <!-- No invitation token in the URL. Offers the RECOVERY path rather than
+         a dead end: somebody who already accepted their invitation and then
+         reloaded lands here, and their invitation cannot be replayed. -->
+    <!-- An invitation offered in the QUERY string rather than the fragment.
+         It has already been sent to a server and written to logs, so it is
+         refused rather than used — see the note in accept-invite.js. -->
+    <section id="query-token" class="panel" aria-labelledby="query-token-h" hidden>
+      <h2 id="query-token-h">That invitation link is not safe to use</h2>
+      <p class="warn">The link carried your invitation in the part of the address
+        that gets sent to servers and written into logs, so it has to be treated
+        as already used. Ask an owner to send a new invitation.</p>
+      <p class="muted">If you already set a password here, you do not need a new
+        invitation — choose "Finish an interrupted set-up" below.</p>
+    </section>
+
+    <section id="no-invite" class="panel" aria-labelledby="no-invite-h" hidden>
+      <h2 id="no-invite-h">No invitation link</h2>
+      <p class="muted">This page finishes setting up a staff account. Open it
+        from the link in your invitation email.</p>
+      <p class="muted">If you already set your password here and were
+        interrupted before adding your authenticator app, you do not need a new
+        invitation — sign in below to finish.</p>
+      <button type="button" class="btn" id="show-resume">Finish an interrupted set-up</button>
+
+      <!-- THE OTHER HALF OF RECOVERY. Accepting an invitation is two steps
+           against Supabase: the invitation is consumed, then the password is
+           created. Somebody interrupted BETWEEN them has an account with no
+           usable password, so "sign in to finish" cannot help — and the
+           invitation cannot be reissued. A password reset is a second way in
+           that does not depend on the invitation at all. -->
+      <p class="muted">Never got as far as setting a password, or not sure it
+        saved? Request a password reset instead — it works even if your
+        invitation was already used.</p>
+      <button type="button" class="btn" id="show-reset">Send me a password reset</button>
+    </section>
+
+    <!-- Password reset request. Deliberately says the same thing whether the
+         account exists or not: whether an email address is a staff account is
+         not something an unauthenticated page should reveal. -->
+    <section id="step-reset" class="panel" aria-labelledby="step-reset-h" hidden>
+      <h2 id="step-reset-h">Request a password reset</h2>
+      <p class="muted">Enter the work email you were invited with. If there is an
+        account for it, you will get a link to set a new password. Then come back
+        here and choose <em>Finish an interrupted set-up</em>.</p>
+      <form id="reset-form" novalidate>
+        <div class="field">
+          <label for="reset-email">Work email</label>
+          <input id="reset-email" name="reset-email" type="email" inputmode="email"
+                 autocomplete="username" required>
+        </div>
+        <button type="submit" class="btn btn--primary" id="reset-submit">Send the link</button>
+      </form>
+      <p class="ok" id="reset-sent" role="status" hidden></p>
+      <p class="error" id="reset-error" role="alert" aria-live="assertive" hidden></p>
+    </section>
+
+    <!-- Step 1 — password, from an invitation. -->
+    <section id="step-password" class="panel" aria-labelledby="step-password-h" hidden>
+      <h2 id="step-password-h">Step 1 of 2 — choose a password</h2>
+      <p class="muted">Your invitation is used when you submit this form. If you
+        are interrupted after that, you will not need a new invitation: come
+        back to this page and choose <em>Finish an interrupted set-up</em>.</p>
+      <form id="password-form" novalidate>
+        <div class="field">
+          <label for="password">New password</label>
+          <input id="password" name="password" type="password"
+                 autocomplete="new-password" minlength="12" required>
+          <p class="hint">At least 12 characters. Longer is better than more
+            complicated.</p>
+        </div>
+        <div class="field">
+          <label for="password-confirm">Repeat the password</label>
+          <input id="password-confirm" name="password-confirm" type="password"
+                 autocomplete="new-password" minlength="12" required>
+        </div>
+        <button type="submit" class="btn btn--primary" id="password-submit">
+          Set password and continue
+        </button>
+      </form>
+      <p class="error" id="password-error" role="alert" aria-live="assertive" hidden></p>
+    </section>
+
+    <!-- RECOVERY — the interrupted set-up path. Signs in with the password
+         the person already created and resumes enrollment. It grants nothing:
+         the session it produces is aal1 until a factor is verified, and being
+         enrolled is still not being authorized. -->
+    <section id="step-resume" class="panel" aria-labelledby="step-resume-h" hidden>
+      <h2 id="step-resume-h">Finish an interrupted set-up</h2>
+      <p class="muted">Use the work email you were invited with and the password
+        you already chose on this page. This only finishes adding your
+        authenticator app — it does not sign you in to the console.</p>
+      <form id="resume-form" novalidate>
+        <div class="field">
+          <label for="resume-email">Work email</label>
+          <input id="resume-email" name="resume-email" type="email" inputmode="email"
+                 autocomplete="username" required>
+        </div>
+        <div class="field">
+          <label for="resume-password">Password</label>
+          <input id="resume-password" name="resume-password" type="password"
+                 autocomplete="current-password" required>
+        </div>
+        <button type="submit" class="btn btn--primary" id="resume-submit">Continue</button>
+      </form>
+      <p class="error" id="resume-error" role="alert" aria-live="assertive" hidden></p>
+      <p class="warn" id="resume-already" role="status" hidden></p>
+    </section>
+
+    <!-- Step 2 — the authenticator. -->
+    <section id="step-factor" class="panel" aria-labelledby="step-factor-h" hidden>
+      <h2 id="step-factor-h">Step 2 of 2 — add your authenticator app</h2>
+      <p class="muted">In your authenticator app, add an account by entering
+        this key by hand. Every common app supports typing a key: look for
+        "enter a setup key", "manual entry", or similar.</p>
+
+      <div class="field">
+        <label for="factor-secret">Setup key</label>
+        <output class="secret" id="factor-secret"></output>
+        <p class="hint">Account name: your work email. Type: time-based. This
+          key is shown once and is not saved anywhere.</p>
+      </div>
+
+      <details id="factor-uri-wrap">
+        <summary>The full <code>otpauth://</code> link, if your app accepts one</summary>
+        <output class="secret" id="factor-uri"></output>
+      </details>
+
+      <form id="factor-form" novalidate>
+        <div class="field">
+          <label for="code">Authentication code</label>
+          <input id="code" name="code" type="text" inputmode="numeric"
+                 autocomplete="one-time-code" pattern="[0-9]*" maxlength="6" required>
+          <p class="hint">The six digits your app is showing now.</p>
+        </div>
+        <button type="submit" class="btn btn--primary" id="factor-submit">
+          Verify and finish
+        </button>
+      </form>
+      <p class="error" id="factor-error" role="alert" aria-live="assertive" hidden></p>
+    </section>
+
+    <!-- Done. Deliberately does NOT open the queue: enrollment proves who you
+         are and grants nothing at all. -->
+    <section id="step-done" class="panel" aria-labelledby="step-done-h" hidden>
+      <h2 id="step-done-h">Your account is ready</h2>
+      <p class="ok" role="status">Your password is set and your authenticator app
+        is verified.</p>
+      <p class="warn">Being set up is not the same as being authorized. An owner
+        must add you as an operator before the identity-resolution queue will
+        open for you. Until then, signing in will tell you that you are not an
+        operator — that is expected, not a fault.</p>
+      <p class="muted">Once an owner confirms you have been added, sign in at
+        <a href="index.html">the staff console</a>.</p>
+    </section>
+
+  </main>
+
+  <script src="../vendor/supabase-js-2.112.0.umd.js"></script>
+  <script src="accept-invite.js" defer></script>
+</body>
+</html>

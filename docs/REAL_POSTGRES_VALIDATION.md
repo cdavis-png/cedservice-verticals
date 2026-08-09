@@ -447,6 +447,285 @@ this run.
 
 ---
 
+## Run 12 — the invitation failure window
+
+Runs 10 and 11 left one gap. Accepting an invitation is two calls —
+`verifyOtp({ type: 'invite' })` then `updateUser({ password })` — and between
+them the account exists with **no usable password**. The password-based resume
+path needs a password, and the invitation cannot be reissued, so that person
+was stranded. Password recovery closes it, because it depends on the account
+rather than on the invitation.
+
+### What run 12 DID validate
+
+- **Window A — `updateUser` refused.** Driven end to end in a real browser:
+  the account is created with no password, the invitation is proven
+  unreplayable, a reset is requested, a new password is set on
+  `reset-password.html`, and the MFA-resume flow is then reached and
+  enrollment completed.
+- **Window B — `updateUser` succeeded and its response was lost.** The fixture
+  sets the password and destroys the socket, through auth-js's own retries, so
+  the account has a password its owner never learned. Proven that the resume
+  path cannot help (a guessed password is refused) and that recovery restores
+  access anyway.
+- **Not an account oracle.** An unknown address produces the *same words* and
+  the same absence of an error as a real one, and so does an unreachable
+  Supabase — asserted by comparing the rendered strings, not by reading the
+  code.
+- **The redirect is exact and same-origin.** `redirect_to` on the observed
+  `POST /auth/v1/recover` equals the CED origin plus the exact recovery page
+  path, and the request carried the publishable key.
+- **Recovery tokens fail safely**: wrong type, absent, expired/never-issued,
+  malformed, replayed after use, and supplied in the query string. A refused
+  query token consumes nothing — the genuinely issued reset is still
+  available afterwards.
+- **Nothing leaks.** Across the whole recovery flow, CED sees only
+  `GET …/auth-config`: no body, no query, no `Referer` carrying a token, and
+  the ten sensitive values are absent from every CED request, response and log
+  line. `localStorage`, `sessionStorage` and `document.cookie` are empty.
+- **Recovery grants nothing.** No factor enrolled, no aal2 session produced,
+  no database touched (the injected `db` throws on any access), and a genuine
+  aal2 token is still refused `not_an_operator` with no queue read.
+- **Under the generated CSP**, served as built, with only the CED and Supabase
+  origins contacted and zero CSP violations.
+
+### What run 12 did NOT validate
+
+- **No real recovery email has been sent.** The reset-password template in
+  runbook §2.0 is written from Supabase's documented variables; whether
+  `{{ .RedirectTo }}` renders as the URL the browser supplied, and
+  `{{ .TokenHash }}` into the fragment, is unobserved.
+- **The redirect URL has never been added to a project's allowed list**, so
+  Supabase has never accepted or refused it — and a refused `redirectTo`
+  falls back to the Site URL, which is the wrong-host outcome the
+  `{{ .RedirectTo }}` template exists to avoid. That fallback has not been
+  observed either.
+- **The invitation template still depends on `{{ .SiteURL }}`**, necessarily:
+  invitations are created from the Dashboard with no `redirectTo`, so
+  `{{ .RedirectTo }}` would be empty. Whether a per-project Site URL routes
+  invitations to the right environment is a configuration constraint this
+  repository documents and tests for, not one it has observed.
+- The Auth server remains a fixture, and every gap from runs 6, 8, 10 and 11
+  is unchanged.
+
+---
+
+## Run 11 — the CSP origin is generated, and the invitation moved to the fragment
+
+Run 10 left one deployment defect: `vercel.json`'s staff CSP carried
+`https://REPLACE-WITH-PROJECT-REF.supabase.co`, to be replaced by hand after
+review. A deployable file with a placeholder in it is a deployment waiting to
+ship the placeholder, and hardcoding the development origin instead would have
+pointed a production page at development data.
+
+### What run 11 DID validate
+
+- **Two environments, two exact origins, one source tree.** Building with
+  `SUPABASE_URL=https://qkpptajglstgucadhfwq.supabase.co` and with a second,
+  different project origin produces two policies that differ **only** in that
+  origin — asserted by substring-removal equality, not by eyeballing.
+- **The build fails closed** on absent, empty, whitespace, `http`, no-scheme,
+  credential-bearing, path-bearing, query-bearing, fragment-bearing,
+  ported, foreign-host, bare-domain, nested-subdomain, wildcard,
+  suffix-trick, too-short, whitespace-separated, `;`-injecting, quote-bearing
+  and key-shaped values — 24 cases, each refused by the validator **and** by
+  the whole build. Each refusal leaves the previous `dist/` byte-identical and
+  no staging directory behind, because the origin is resolved before anything
+  is deleted.
+- **The refusal never echoes the value**, so a pasted key cannot land in a
+  build log.
+- **No placeholder anywhere.** `vercel.json` contains neither
+  `REPLACE-WITH-PROJECT-REF` nor the string `supabase` at all, and every one of
+  the 30 published files is scanned for placeholder-shaped text.
+- **One line, one file.** The byte-for-byte test now exempts exactly one
+  named file, and a companion test proves that file differs from its source by
+  exactly one line, that the line is the base CSP line, that the replacement is
+  what `cspLineFor` produces, and that `connect-src` holds exactly two sources
+  with no wildcard and no `wss:`.
+- **The build and the route cannot diverge** — one variable, one validator,
+  three configured spellings (bare, trailing slash, second project) each
+  produce a generated `connect-src` and an `/auth-config` `supabaseUrl` that
+  are the same string.
+- **The header/meta split works in a real browser.** The onboarding suite now
+  serves the page **as built**, through the build's own `cspLineFor`, under the
+  real `vercel.json` header policy. The full flow completes with zero CSP
+  violation messages — which would not be true if the header still carried
+  `default-src` or `connect-src`, because the intersection would block the
+  Auth origin.
+- **The invitation never reaches CED.** It travels in the URL **fragment**, so
+  it is absent from the page load's own request line — observed on every
+  request Chrome made to the CED origin, on `pathname + search`, plus every
+  `Referer`, plus everything the server recorded, plus the logs.
+- **A query-string invitation is refused**, on its own and even when a valid
+  fragment token is also present, with zero Supabase calls. The page says why.
+- **`/auth-config`** returns exactly `{ ok, supabaseUrl, publishableKey }`,
+  normalised, `Cache-Control: no-store`, GET-only, with no secret, no legacy
+  service-role key and no unrelated configuration.
+- **The loopback exception is fenced.** Local development needs
+  `SUPABASE_URL` pointed at an http stub; that is accepted **only** with
+  `CED_ALLOW_INSECURE_STAFF=true`, a loopback request host, and a non-production
+  `NODE_ENV` — all three asserted individually — and the **build** refuses it
+  regardless, so no published page can name a loopback origin.
+
+### What run 11 did NOT validate
+
+- **No deployment has set `SUPABASE_URL`,** so no browser has been permitted to
+  reach a real `*.supabase.co` origin from a staff page. The generation is
+  exercised; the deployed result is not.
+- **Whether Vercel serves the header policy on the generated paths**, and
+  whether it honours `outputDirectory` and still discovers `api/` alongside a
+  `buildCommand` — the run 8 gaps, unchanged.
+- **Whether a real Supabase invite email renders `{{ .TokenHash }}` into a
+  fragment** the way the template in the runbook specifies. Never sent.
+- Everything run 10 left open: the Auth server is still a fixture, no real
+  invitation, no real TOTP, and PostgREST / hosted Supabase / PostgreSQL 17 are
+  unchanged from run 6.
+
+---
+
+## Run 10 — onboarding moved out of CED
+
+Run 9's onboarding was **withdrawn**. It put two CED endpoints in the credential
+path: they accepted the invited user's password and invitation token and
+returned the Supabase session, the TOTP secret and the `otpauth://` URI.
+CLAUDE.md §9 forbids this platform from transmitting or storing credentials.
+The reasoning behind it — "the browser must hold no Supabase key" — confused
+the **secret** key, which must never reach a browser, with the **publishable**
+key, which is designed for one.
+
+Onboarding now runs between the browser and Supabase Auth directly, with the
+vendored supported client. Run 9's results below are superseded except where
+this run repeats them.
+
+### What run 10 DID validate
+
+- **No credential reaches CED, observed on the wire.** The browser suite runs
+  two servers on two origins and records the raw body of every request to
+  both. Across the full flow and the recovery flow, CED receives exactly one
+  request — `GET …/auth-config` — with an empty body, an empty query string,
+  and no `Referer` carrying the token. The password, both tokens, the secret,
+  the URI and the code are asserted absent from every CED request, response
+  and log line.
+- **The browser reaches only two origins**, recorded from Chrome's own request
+  events: the CED origin and the configured Supabase origin. No CDN.
+- **The real vendored client against a real GoTrue wire shape.** The fixture
+  Auth server implements `/auth/v1/verify`, `/token?grant_type=password`,
+  `/user` (GET and PUT), `/factors`, `/factors/:id/challenge`,
+  `/factors/:id/verify`, `/factors/:id` (DELETE) and `/logout`, taken from the
+  installed `@supabase/auth-js` 2.112.0. Every request carried the publishable
+  key; none carried the secret key.
+- **Under the shipped CSP.** The static server sets the real `/staff/(.*)`
+  policy read from `vercel.json`, with the placeholder replaced by the fixture
+  origin. The console is watched for CSP violation messages; there are none.
+- **The publishable key can reach nothing**, in real PostgreSQL through
+  PGlite, against the full chain including 0007:
+  `tests/migration/0007-anon-grants.test.mjs` proves `anon` and
+  `authenticated` are refused SELECT/INSERT/UPDATE/DELETE on six staff tables
+  and EXECUTE on six staff functions including the attach mutation, that RLS
+  is enabled **and forced** with **no policies**, and that `service_role`
+  reaches the same function body — so the refusals are about the role, not a
+  broken fixture.
+- **Type confinement.** `signup`, `magiclink`, `recovery`, `email_change`,
+  `email`, `sms` and an explicitly empty `type` all refuse the link with zero
+  Supabase calls. The token is still stripped from the URL when the type is
+  refused.
+- **Recovery works.** Reload after the password step, with no link parameters:
+  password sign-in, stale unverified factor deleted, fresh factor enrolled,
+  code verified — and **no `verifyOtp` call**, so no second invitation was
+  needed. A wrong password enrolls nothing; an already-verified account is
+  refused and signed out.
+- **Nothing is persisted.** `localStorage`, `sessionStorage` and
+  `document.cookie` are all empty after a completed flow.
+- **Enrollment still grants nothing.** A genuine `aal2` token is refused
+  `not_an_operator`, from a real browser, with no queue read on its behalf.
+- **The dead credential path is gone.** A test names
+  `handleInviteAccept`, `handleInviteVerify`, `onboardingPayload`,
+  `TOKEN_HASH_RE`, `TOTP_CODE_RE`, `MIN_PASSWORD` and `MAX_TOKEN_HASH` and
+  fails if any reappears in the route, and fires a full credential payload at
+  seven paths asserting none answers `200`.
+- **The vendored client is a copy, not a fork** — byte-identical to the
+  installed package, checksum recorded and re-verified.
+
+### What run 10 did NOT validate
+
+- **Supabase Auth is still a fixture.** It speaks the right protocol on the
+  right paths; it is not Supabase. No real invitation, no real password
+  change, no real factor, no real TOTP code.
+- **The invite email template has never been sent.** Whether
+  `{{ .TokenHash }}` and `{{ .SiteURL }}` render as documented, and whether
+  the link arrives intact, is unobserved.
+- **TOTP has never been enabled on a project.**
+- **The CSP placeholder has never been replaced.** No browser has been
+  permitted to reach a real `*.supabase.co` origin from a staff page, and
+  whether Vercel serves that header on the generated paths is still the run 8
+  gap.
+- **PostgREST, hosted Supabase and PostgreSQL 17** — unchanged from run 6. The
+  anon-grant proof ran on PGlite 18.3 as the database owner switching roles,
+  not through PostgREST as `anon`.
+
+---
+
+## Run 9 — invitation onboarding *(superseded by run 10 — the endpoints it validated have been removed)*
+
+The runbook told an invited person to accept an invitation, set a password and
+enroll a second factor. The repository could do none of it, and `/session`
+correctly refuses an account with no verified factor — so an invited operator
+met `mfa_enrollment_required` and stopped. The queue was unreachable for
+everybody this repository could actually onboard, which was nobody.
+
+Two endpoints now close it: `POST …/onboarding/invite` and
+`POST …/onboarding/verify`, with `staff/identity-resolution/accept-invite.html`
+as the page.
+
+### What run 9 DID validate
+
+- **The server half**, against a stubbed Auth client whose shape is pinned to
+  the installed `@supabase/auth-js` 2.112.0 — `verifyOtp`, `updateUser`,
+  `setSession`, `signOut`, `mfa.enroll`, `mfa.challengeAndVerify` all exist on
+  a genuinely constructed production client, and the stub invents nothing the
+  library lacks. 29 tests in
+  [tests/staff-invite-onboarding.test.mjs](../tests/staff-invite-onboarding.test.mjs).
+- **The browser half over a real socket** — real Chrome, `window.fetch` NOT
+  replaced, the real page, the real `handleRequest`. 10 tests in
+  [tests/browser/staff-invite-browser.test.mjs](../tests/browser/staff-invite-browser.test.mjs).
+- **Invite-only**, twice over: the page shows no form without a `token_hash`,
+  and the route hard-codes `type: 'invite'` so the request cannot ask for
+  another type.
+- **The invitation is not spent on refusable input.** A short password, an
+  over-long one, and a malformed token are all refused with zero Supabase
+  calls — observed against a call recorder, not read off the source.
+- **Onboarding emits `aal1` and only `aal1`,** and `/onboarding/verify`
+  returns no session at all. The `aal2` token was checked as absent from the
+  raw HTTP response body on the wire, not just from a parsed object.
+- **Neither endpoint touches the database.** Both suites inject a `db` proxy
+  that throws on any property access; both flows complete.
+- **A fully enrolled account is still refused the queue** with
+  `not_an_operator`, and no queue read runs on its behalf.
+- **Nothing sensitive is logged.** Console output is captured at
+  `CED_LOG_LEVEL=debug` across seven paths, including every failure path, and
+  asserted free of the invitation token, the password, the TOTP secret, the
+  `otpauth://` URI, both access tokens, the refresh token and the code.
+
+### What run 9 did NOT validate
+
+- **No real invitation has ever been accepted.** The Auth client is a stub in
+  both suites. No real `verifyOtp`, no real password change, no real
+  `mfa.enroll`, no real `challengeAndVerify`.
+- **The invite email template has never been sent.** The template in runbook
+  §2.0 is written from Supabase's documented variables. Whether
+  `{{ .TokenHash }}` and `{{ .SiteURL }}` render as expected, and whether the
+  resulting link reaches `accept-invite.html` intact, is unobserved.
+- **TOTP has never been enabled on a project**, so `mfa.enroll` returning
+  `502 enrollment_unavailable` when it is disabled is a path this repository
+  models rather than one it has seen.
+- **No authenticator app has read a real secret.** Manual key entry is
+  documented app behaviour, not a thing observed here.
+- **Vercel.** The two new static files are in the manifest and the build
+  copies 29 rather than 27, but no `vercel build` and no preview deployment
+  has run — unchanged from run 8.
+
+---
+
 ## 0. Run 2 — migration 0004 and the two-stage assessment
 
 ### What was applied

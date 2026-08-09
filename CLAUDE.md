@@ -34,7 +34,9 @@ openable by double-clicking `index.html`.
 deployment's static output from an explicit allowlist — see section 13. It does
 not bundle, transpile, minify, inline, or rewrite anything: every published
 file is a byte-for-byte copy of its canonical source, which stays exactly where
-it is. Nothing imports it, no page depends on it, and a vertical is still
+it is — with exactly one, named exception: one line of the staff onboarding
+page, where the Supabase project origin is generated into its
+Content-Security-Policy. See section 13. Nothing imports it, no page depends on it, and a vertical is still
 openable by double-clicking `index.html`. It exists because the alternative was
 publishing the repository root.
 
@@ -635,6 +637,7 @@ and cannot do — is
 | | |
 | --- | --- |
 | Page | `staff/identity-resolution/` — `index.html`, `page.js`, `auth.js`, `styles.css` |
+| Onboarding page | `staff/identity-resolution/` — `accept-invite.html`, `accept-invite.js` |
 | Deployment entrypoint | `api/staff/identity-resolution/[...path].mjs` |
 | Implementation | `server/staff-identity-resolution.mjs` |
 | Migration | `supabase/migrations/0007_staff_identity_resolution.sql` |
@@ -656,15 +659,108 @@ them by reading the source — the same convention `api/assessments.mjs` and
 
 ### Supabase Auth runs on the server
 
-The browser holds **no Supabase client and no key of any kind**. It posts to
-three same-origin endpoints — `/session`, `/session/refresh`,
+The **console** page holds no Supabase client and no key of any kind. It posts
+to three same-origin endpoints — `/session`, `/session/refresh`,
 `/session/signout` — and the route makes every Auth call with the supported
 client, server-side. Nothing is hand-rolled.
+
+The **onboarding** page is deliberately the opposite; see below.
 
 This repository has no build step and no bundler, so putting
 `@supabase/supabase-js` in the page would have meant committing a generated
 third-party bundle or loading one from a CDN at runtime. Neither belongs in the
 sign-in path of a console that performs permanent, unerasable attachments.
+
+### Onboarding runs in the browser, and that is the point
+
+`identity_resolution_cases` had a human queue with nobody able to close one;
+the console had a sign-in with nobody able to reach it. `/session` correctly
+refuses an account with no verified factor, and nothing here could give an
+invited person one. `staff/identity-resolution/accept-invite.html` closes
+that.
+
+**The first attempt did it with two CED endpoints that accepted the password
+and the invitation token and returned the session, the TOTP secret and the
+otpauth URI. That was wrong** — CLAUDE.md §9 says this platform never
+transmits or stores passwords, tokens or credentials, and it did all of it.
+The reasoning behind it confused two keys: the **secret** key must never reach
+a browser; the **publishable** key is designed for one. Avoiding a public key
+by routing private credentials through a CED function traded a non-problem for
+a real one. Do not reintroduce it — a test names those endpoints and fails if
+they come back.
+
+- **No credential touches CED.** The password, both session tokens, the TOTP
+  secret, the `otpauth://` URI and the six-digit code go from the browser to
+  Supabase Auth directly. The page's only CED call is
+  `GET …/auth-config`, which returns the project URL and the publishable key
+  and takes no body.
+- **The publishable key grants nothing, and that is a catalog fact.**
+  `tests/migration/0007-anon-grants.test.mjs` proves in real PostgreSQL that
+  `anon` and `authenticated` are refused SELECT, INSERT, UPDATE and DELETE on
+  every staff table and EXECUTE on every staff function, with RLS forced and
+  no policies. The same test proves `service_role` reaches them, so the
+  refusals are about the role rather than a broken fixture.
+- **`lowPrivilegeKey` guards the config endpoint,** so a secret key pasted
+  into the publishable variable is refused and the endpoint answers
+  `503 auth_unavailable` rather than serving an elevated credential.
+- **There is no registration path.** `OTP_TYPE` is a constant in the page and
+  is never read from the URL; a `type` parameter that is present and is not
+  `invite` refuses the link outright. Without a `token_hash`, the page offers
+  only recovery, which is a password sign-in against an account that must
+  already exist.
+- **Enrollment grants nothing.** The page cannot write `staff_operators` — it
+  cannot even see the table — and signs out when it finishes. A fully enrolled
+  account is refused the queue with `not_an_operator` until an owner
+  provisions it, and the page says so instead of letting them discover it.
+- **Interruption is recoverable without a second invitation, in both of its
+  shapes.** Accepting an invitation is two calls — `verifyOtp` consumes the
+  one-time token, then `updateUser` creates the password — and **between them
+  the account exists with no usable password**. Supabase cannot re-invite an
+  existing user, so:
+  - *password already set* → the page resumes with it, clears any abandoned
+    *unverified* factor, and re-enrolls;
+  - *password never set, or set with its response lost* → a **password
+    reset**, requested from the same page and completed on
+    `reset-password.html`. It depends on the account rather than the
+    invitation, so it works in every state that window can leave behind — and
+    the two are indistinguishable from the browser, which is why the reset is
+    offered rather than inferred.
+
+  An account that already has a *verified* factor is sent to sign in instead:
+  recovery is not a second way in. **The recovery page enrolls no factor,
+  writes no `staff_operators` row, and grants no queue access** — it sets a
+  password and signs out. The reset request answers identically for a real
+  account, an unknown address and an unreachable Supabase, so it is not an
+  account oracle.
+- **The client is vendored, not loaded from a CDN,** so `script-src` stays
+  `'self'`. `connect-src` is the only directive widened, to one exact project
+  origin — no wildcard, no `wss:`.
+- **That origin is GENERATED per build from `SUPABASE_URL`,** by
+  `tools/build-static.mjs`, through the same validator `GET /auth-config`
+  uses — so the origin the page is told to call and the origin it is permitted
+  to reach cannot diverge. `vercel.json` names no Supabase host at all: a
+  placeholder is a deployment waiting to ship a placeholder, and a hardcoded
+  development origin would point production at development data. Missing or
+  invalid configuration **fails the build**, and the committed page carries
+  `connect-src 'self'` with no host, so an unbuilt copy reaches nothing.
+- **The header CSP carries no `default-src` and no `connect-src`.** A header
+  policy and a meta policy are both enforced and the browser applies their
+  intersection, so either directive in the header would block the generated
+  origin. Per-page directives live in each page's `<meta>`, first in
+  `<head>`; `frame-ancestors` stays in the header, where a meta policy is
+  ignored.
+- **The invitation travels in the URL FRAGMENT, never the query.** A fragment
+  is never transmitted, so the token is absent from the page load itself —
+  the one request no page JavaScript could have cleaned up. The page removes
+  it with `replaceState` before its first fetch, and **refuses** a
+  `token_hash` offered in the query, because by then it has already leaked.
+- **`persistSession`, `autoRefreshToken` and `detectSessionInUrl` are all
+  off** in the browser client, for the same reasons they are off server-side
+  and one more: a persisted session would leave an `aal1` token in storage on
+  a shared machine.
+- **No QR image.** Supabase returns the QR as a `data:` image and the staff
+  CSP is `default-src 'none'` with no `img-src`. The setup key and the URI are
+  shown as text. Do not widen the header to render a convenience.
 
 Rules that must not be quietly relaxed:
 
@@ -770,6 +866,20 @@ Stated precisely, because everything below is still owed:
   client on the server and a stubbed network in the browser. No real access
   token has ever been verified, no real factor enrolled or challenged, and no
   real session refreshed or revoked.
+- **Real invitations.** No `verifyOtp` on a token Supabase minted, no real
+  password change, no real `mfa.enroll`, and no authenticator app has ever
+  read a real secret. The invite email template the runbook specifies is
+  written from Supabase's documented variables and **has never been sent**;
+  until it is, `{{ .TokenHash }}` reaching `accept-invite.html` is a
+  documented behaviour this repository models rather than one it has seen.
+  The onboarding browser suite drives the real page and the real vendored
+  client over real sockets, but the Auth server it reaches is a fixture
+  speaking GoTrue's shape, not Supabase.
+- **A real Supabase origin in a real CSP.** The generation is exercised with
+  two different project origins and its refusals are pinned, but no
+  deployment has set `SUPABASE_URL`, so no browser has been permitted to
+  reach a real `*.supabase.co` origin from a staff page. Whether Vercel
+  serves the header policy on the generated paths is still the run 8 gap.
 - **Vercel.** No `vercel build` and no preview deployment. Routing, header
   rules, function count and file tracing are asserted against a *model* of
   documented behaviour. That is a check on the configuration, not on the
@@ -808,6 +918,25 @@ could see the question either way. That is what changed.
 `vercel.json` sets `"buildCommand": "node tools/build-static.mjs"` and
 `"outputDirectory": "dist"`. The build copies exactly the files named in the
 manifest into `dist/`, **byte for byte**, at their existing relative paths.
+
+**One line of one file is generated, and that is the whole exception.**
+`staff/identity-resolution/accept-invite.html` talks to Supabase Auth
+directly, so its `connect-src` must name the exact project origin — which
+differs between Preview and Production. `tools/build-static.mjs` reads
+`SUPABASE_URL`, validates it as an exact scheme-host-port through
+`shared/security/supabase-origin.js` (the same validator `GET /auth-config`
+uses, so the two cannot diverge), and replaces one known line. It then proves
+the substitution: the base line was present exactly once, it is gone, the new
+line is there, the file changed by exactly that delta, and nothing key-shaped
+appeared. Missing or invalid configuration fails the build before anything is
+deleted or staged.
+
+**No secret is ever substituted.** The publishable key is fetched at run time
+from `/auth-config` and is deliberately not built in, so "no secret can be
+inlined at build time" remains a property of the build rather than of care.
+`SUPABASE_URL` is the only variable read and it reaches only the CSP text —
+no path, no output directory and no part of the delete fence can be
+influenced by the environment.
 
 **`vercel.json` carries configuration and nothing else.** It is strict JSON
 validated against a schema that sets `"additionalProperties": false`, so it can

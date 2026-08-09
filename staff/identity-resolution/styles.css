@@ -171,6 +171,24 @@ legend { font-weight: 600; padding-inline: 6px; }
 .error { color: var(--staff-danger); font-weight: 600; }
 .ok    { color: var(--staff-success); font-weight: 600; }
 
+/* The TOTP setup key and its otpauth:// link, on accept-invite.html. Shown
+   once, typed by hand into an authenticator app, so it is monospaced, it
+   wraps at any character rather than overflowing a phone, and it is
+   selectable. `display: block` because <output> is inline by default. */
+.secret {
+  display: block;
+  font-family: ui-monospace, "SFMono-Regular", monospace;
+  font-size: 0.95rem;
+  letter-spacing: 0.04em;
+  word-break: break-all;
+  user-select: all;
+  padding: 12px 14px;
+  border: 1px solid var(--staff-line);
+  border-radius: var(--staff-radius);
+  background: var(--staff-surface);
+}
+details summary { cursor: pointer; margin-block: 12px; }
+
 @media (min-width: 720px) {
   .bar { display: grid; grid-template-columns: 1fr auto; align-items: end; }
   .bar__who { grid-column: 2; margin: 0; }
@@ -185,6 +203,7 @@ legend { font-weight: 600; padding-inline: 6px; }
   body { background: #14141a; color: #ececf1; }
   .panel { background: #1c1c24; border-color: #2e2e3a; }
   input, select, textarea, .btn { background: #14141a; color: #ececf1; border-color: #3a3a48; }
+  .secret { background: #14141a; border-color: #3a3a48; }
   .btn--primary { background: #ececf1; color: #14141a; }
   .warn, .override { background: #2a2214; }
 }

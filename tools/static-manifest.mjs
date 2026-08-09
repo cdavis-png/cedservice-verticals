@@ -79,6 +79,60 @@ export const STATIC_MANIFEST = Object.freeze([
   'staff/identity-resolution/auth.js',
   'staff/identity-resolution/page.js',
 
+  /* ---------- the staff console: invitation onboarding ----------
+     The page an invited operator opens from their invitation email, and its
+     script. It must be published: the Supabase invite template links a real
+     browser to it by URL, and an unpublished page is an invitation that
+     404s.
+
+     UNLIKE THE CONSOLE, THIS PAGE HOLDS A SUPABASE CLIENT — and it must. It
+     sets a password, enrolls a TOTP factor and verifies it, and none of
+     those values may pass through a CED endpoint (CLAUDE.md §9). So it talks
+     to Supabase Auth directly, with the PUBLISHABLE key, which it fetches at
+     runtime from /auth-config. That key grants nothing: RLS is enabled and
+     FORCED on every table with no policies, and no function is executable by
+     `anon`.
+
+     Publishing the page grants nothing either. Without a `token_hash`
+     Supabase minted for a specific invited address it offers only the
+     recovery form, which is a password sign-in against an account that must
+     already exist. */
+  'staff/identity-resolution/accept-invite.html',
+  'staff/identity-resolution/accept-invite.js',
+
+  /* ---------- the staff console: password recovery ----------
+     The other half of onboarding recovery, and it must be published for the
+     same reason: Supabase's password-reset email links a real browser to it
+     by URL, and an unpublished page is a reset link that 404s. It is also
+     the exact path that has to be on the project's allowed-redirect list.
+
+     IT EXISTS FOR A WINDOW. Accepting an invitation is two calls —
+     `verifyOtp` consumes the one-time token, then `updateUser` creates the
+     password. Between them the account exists with no usable password, the
+     invitation cannot be reissued, and the password-based resume path has no
+     password to use. A recovery email does not depend on the invitation, so
+     it is the only thing that recovers that state.
+
+     Publishing it grants nothing: without a `token_hash` Supabase minted for
+     one specific address it shows no form, and setting a password is not
+     access — the page enrolls no factor, writes no `staff_operators` row,
+     and signs out when it is done. */
+  'staff/identity-resolution/reset-password.html',
+  'staff/identity-resolution/reset-password.js',
+
+  /* ---------- the one vendored browser dependency ----------
+     @supabase/supabase-js 2.112.0, byte-for-byte the published UMD build, so
+     the onboarding page can use the SUPPORTED client rather than a
+     hand-rolled reimplementation of the Auth protocol.
+
+     VENDORED RATHER THAN LOADED FROM A CDN so `script-src 'self'` stays
+     exactly as it is. A CDN would mean trusting a third-party origin to run
+     script on the page that handles an operator's password; this way only
+     `connect-src` widens, and only to the one Supabase project origin.
+     Provenance, checksum and the update procedure: staff/vendor/README.md,
+     which is deliberately NOT published. */
+  'staff/vendor/supabase-js-2.112.0.umd.js',
+
   /* ---------- shared: the assessment engine ---------- */
   'shared/assessment-engine/engine.js',
   'shared/assessment-engine/intelligence.js',
@@ -178,6 +232,7 @@ export const PUBLIC_SECURITY_MODULES = Object.freeze([
 /* Named so their absence is proven by name rather than inferred. */
 export const SERVER_ONLY_SECURITY_MODULES = Object.freeze([
   'shared/security/origin.js',
+  'shared/security/supabase-origin.js',
   'shared/security/rate-limit.js',
   'shared/security/read-body.js',
   'shared/security/staff-note.js',

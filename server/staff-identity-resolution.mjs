@@ -77,9 +77,16 @@
    not the next token refresh, and the only thing that can promise
    that is a lookup.
 
-   The browser never touches an identity table, never calls a
-   privileged function, and never holds a Supabase key of any
-   kind. It calls this route; this route holds the keys.
+   The browser never touches an identity table and never calls a
+   privileged function. The console page holds no Supabase key at
+   all; the onboarding page holds the PUBLISHABLE key, which is
+   the key Supabase publishes for browser clients and which grants
+   nothing here — RLS is forced with no policies and no function
+   is executable by `anon`. The SECRET key never leaves this
+   function's environment, and no password, session token, TOTP
+   code or TOTP secret is ever accepted by, returned by, or logged
+   by any endpoint in this file. See the note above the route
+   table for what that replaced and why.
    ============================================================ */
 
 import { randomUUID, createHash, createHmac } from 'node:crypto';
@@ -88,6 +95,7 @@ import staffNote from '../shared/security/staff-note.js';
 import rateLimit from '../shared/security/rate-limit.js';
 import bodyReader from '../shared/security/read-body.js';
 import originPolicy from '../shared/security/origin.js';
+import supabaseOriginPolicy from '../shared/security/supabase-origin.js';
 
 const { screenResolutionNote } = staffNote;
 const {
@@ -96,12 +104,35 @@ const {
 } = rateLimit;
 const { readBoundedBody, parseJsonSafely, OUTCOME: BODY } = bodyReader;
 const { configuredOrigins, isAllowedOrigin } = originPolicy;
+const { validateSupabaseOrigin, validateLocalSupabaseOrigin } = supabaseOriginPolicy;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_BODY_BYTES = 8192;
 const MAX_NOTE = 2000;
 const MIN_NOTE = 8;
 const MIN_SUBSTANTIVE_NOTE = 40;
+
+/* ---------- what onboarding does NOT come through here ----------
+   An earlier version of this file carried two onboarding endpoints that
+   accepted the invitation token and the new password, and returned the
+   Supabase session, the TOTP secret and the otpauth URI. That was wrong, and
+   it was wrong in the direction this repository is least willing to be wrong
+   in: CLAUDE.md §9 says this platform never stores or transmits passwords,
+   tokens or other credentials, and those endpoints did all of it.
+
+   The reasoning that produced them — "the browser must hold no Supabase key"
+   — confused two different keys. The SECRET key must never reach a browser.
+   The PUBLISHABLE key is designed for exactly that: it is what every
+   documented Supabase browser client uses, it carries no privilege of its
+   own, and every table has RLS enabled and FORCED with no policies so it can
+   read nothing. Avoiding a public key by routing private credentials through
+   a CED function traded a non-problem for a real one.
+
+   Onboarding is now done by the browser, directly with Supabase Auth, using
+   the vendored supported client. The only thing this route still does for it
+   is answer `GET /auth-config` with the project URL and the publishable key —
+   neither of which is a credential, and neither of which is any of the seven
+   values that must never touch a CED endpoint. */
 
 const hmac = (secret, input) => createHmac('sha256', secret).update(input).digest('hex');
 
@@ -699,6 +730,7 @@ const handleSignOut = async (body, client) => {
   return { ok: true };
 };
 
+
 /* ============================================================
    handleRequest
    ============================================================ */
@@ -831,6 +863,62 @@ export async function handleRequest(request, deps = {}) {
         return json(200, await handleSignOut(body, client), correlationId);
       }
       return json(200, await handleSignIn(body, client, log), correlationId);
+    }
+
+    /* ---------- 4a. the browser's Supabase configuration ----------
+       The onboarding page talks to Supabase Auth directly, so it needs the
+       project URL and the publishable key. It cannot be given them at build
+       time: this repository has no build-time substitution anywhere, by
+       design (CLAUDE.md §13), and inventing one to inline a value would be a
+       larger change than reading it at runtime.
+
+       NOTHING HERE IS A CREDENTIAL. The publishable key is the key Supabase
+       publishes for browser clients; it grants nothing on its own, because
+       every table has RLS enabled and FORCED with no policies and no execute
+       grant on any function. `lowPrivilegeKey` is what reads it, so the
+       cross-check applies in both directions and a SECRET key pasted into the
+       publishable variable is refused rather than served to a browser.
+
+       No body, no token, no password, no session, no secret. It is a GET, so
+       a same-origin call carries no Origin and is judged on Fetch Metadata by
+       the same gate as every other read. */
+    if (/\/auth-config$/.test(path)) {
+      if (request.method !== 'GET') {
+        return json(405, { ok: false, code: 'method_not_allowed', message: 'GET is required.' },
+          correlationId, { Allow: 'GET' });
+      }
+      /* THE SAME VALIDATOR THE BUILD USES, on the same variable, so the
+         origin this hands the browser and the origin the browser is
+         PERMITTED to reach by the generated connect-src cannot disagree.
+         Two spellings of one host would be a blocked request at run time
+         with nothing to explain it. `.origin` is returned rather than the raw
+         value for the same reason: one host, one spelling. */
+      let project = validateSupabaseOrigin(env.SUPABASE_URL);
+      /* The local-development exception, behind the switch that already
+         requires all three of the variable, a loopback request host and a
+         non-production NODE_ENV. `insecureAllowed` is the same gate that
+         lets this route answer over plain http at all, so a deployment
+         cannot reach this branch. The BUILD has no such exception: it stays
+         strict, so a published page never names a loopback origin. */
+      if (!project.ok && insecureAllowed(env, url)) {
+        project = validateLocalSupabaseOrigin(env.SUPABASE_URL);
+      }
+      const key = lowPrivilegeKey(env);
+      if (!project.ok || !key) {
+        /* The same refusal the Auth path gives, for the same reason and by
+           the same rule: a crossed key is a misconfiguration, not a fallback.
+           The reason is logged, never returned — it describes the
+           deployment's configuration, not the caller's request. */
+        log('error', 'staff_auth_config_unavailable', {
+          reason: project.ok ? 'no_publishable_key' : project.reason
+        });
+        return json(503, {
+          ok: false, code: 'auth_unavailable', message: 'Staff authentication is not configured.'
+        }, correlationId);
+      }
+      return json(200, {
+        ok: true, supabaseUrl: project.origin, publishableKey: key
+      }, correlationId);
     }
 
     /* ---------- 5. the access token ---------- */

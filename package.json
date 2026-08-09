@@ -14,7 +14,7 @@
     "test:migration": "node tests/migration/run.mjs",
     "test:all": "npm run test:unit && npm run test:integration",
     "test:watch": "node --test --watch \"tests/*.test.mjs\"",
-    "test:browser": "node --test tests/browser/*.test.mjs",
+    "test:browser": "node --test --test-concurrency=1 tests/browser/*.test.mjs",
     "serve": "node tests/browser/serve.mjs"
   },
   "dependencies": {
@@ -23,7 +23,7 @@
   "comments": {
     "moduleFormat": "Deliberately no \"type\": \"module\". The shared/ schema files are dual CommonJS/browser scripts loaded directly by static pages with no build step; declaring the package as ESM would break both. Server code uses .mjs, which Node and Vercel treat as ESM regardless.",
     "dependencies": "@supabase/supabase-js is the only production dependency and is imported lazily inside the endpoint, so the unit suite runs without it installed. test:integration DOES require it.",
-    "testScripts": "test and test:unit are deliberately identical and never touch a database — the default must be safe. test:integration writes permanent, append-only rows to a real Supabase development project and refuses to run without explicit opt-in. test:integration:local runs the same suite against a disposable PostgreSQL created inside the process, with no credential and nothing to leave behind. test:migration covers the migration chain itself: a clean install and an upgrade over populated pre-0006 data. test:browser drives the real page in headless Chrome over http. See tests/integration/README.md.",
+    "testScripts": "test and test:unit are deliberately identical and never touch a database — the default must be safe. test:integration writes permanent, append-only rows to a real Supabase development project and refuses to run without explicit opt-in. test:integration:local runs the same suite against a disposable PostgreSQL created inside the process, with no credential and nothing to leave behind. test:migration covers the migration chain itself: a clean install and an upgrade over populated pre-0006 data. test:browser drives the real page in headless Chrome over http, ONE FILE AT A TIME: node's test runner runs files concurrently, and five suites each launching their own browser and pair of servers contend for CPU until unrelated interactions time out. Serial is slower and is the difference between a suite that fails on load and one that fails on defects. See tests/integration/README.md.",
     "devDependencies": "Both are test-only and neither is imported by any shipped file. @electric-sql/pglite is PostgreSQL compiled to WebAssembly and is what makes real-Postgres validation possible with no Docker, no daemon and no hosted project. puppeteer-core drives a browser the machine already has and downloads none."
   },
   "devDependencies": {
