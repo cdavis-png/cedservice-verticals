@@ -100,7 +100,7 @@ import supabaseOriginPolicy from '../shared/security/supabase-origin.js';
 const { screenResolutionNote } = staffNote;
 const {
   buildRateLimitKeys, staffRateLimitPolicy, staffSignInRateLimitPolicy,
-  staffSessionRateLimitPolicy, NAMESPACES
+  staffSessionRateLimitPolicy, NAMESPACES, readAddress, isUsableAddress
 } = rateLimit;
 const { readBoundedBody, parseJsonSafely, OUTCOME: BODY } = bodyReader;
 const { configuredOrigins, isAllowedOrigin } = originPolicy;
@@ -527,6 +527,83 @@ const assertNoBody = request => {
   }
 };
 
+/* ---------- bounding the rate-limit call ----------
+   THE BUDGET THIS PROTECTS. The pre-authentication rate-limit pass runs on
+   EVERY request, before the access token is verified, and it is a network
+   call to Supabase. It had no timeout. A slow or unreachable database could
+   therefore consume the platform's entire 15-second function budget on its
+   own, and the caller would get 504 FUNCTION_INVOCATION_TIMEOUT — no body, no
+   code, nothing to act on.
+
+   TWO SECONDS. Short enough that even three sequential passes cannot approach
+   the budget, and far longer than a healthy `check_rate_limit`, which is a
+   single indexed upsert. Configurable so an unusually distant database can be
+   accommodated without editing code, and clamped so a mistyped value cannot
+   reintroduce the unbounded case.
+
+   THE SIGNAL IS SENT AND THE PROMISE IS RACED, both — the same reasoning as
+   the helper in api/assessments.mjs. An abort signal only helps if the
+   transport honours it; a driver that ignores it, or a test double that never
+   settles, would hang the function anyway.
+
+   ONE TIMER, NOT TWO, and this differs from that helper deliberately. Two
+   timers armed at the same delay race each other: the expiry timer resolves
+   first, the `finally` then clears the abort timer, and the abort never
+   fires — so a real PostgREST call is left running into a void rather than
+   cancelled. Aborting inside the single timer, before resolving, makes the
+   cancellation actually happen. A test asserts the signal is aborted. */
+const DEFAULT_RATE_LIMIT_TIMEOUT_MS = 2000;
+const MIN_RATE_LIMIT_TIMEOUT_MS = 250;
+/* Four seconds, not five. A request takes at most two passes today
+   (pre-authentication, then one of sign-in / session / authenticated), but
+   the bound is chosen so that even THREE at the ceiling — 12s — still leave
+   headroom inside the platform's 15s. A maximum that could exactly consume
+   the budget is not a bound. */
+const MAX_RATE_LIMIT_TIMEOUT_MS = 4000;
+
+const rateLimitTimeoutMs = env => {
+  const configured = Number(env.CED_RATE_LIMIT_TIMEOUT_MS);
+  if (!Number.isFinite(configured) || configured <= 0) return DEFAULT_RATE_LIMIT_TIMEOUT_MS;
+  return Math.min(MAX_RATE_LIMIT_TIMEOUT_MS, Math.max(MIN_RATE_LIMIT_TIMEOUT_MS,
+    Math.floor(configured)));
+};
+
+/* A sentinel rather than a thrown error, so a timeout is a value the caller
+   handles explicitly instead of an exception that could be swallowed by a
+   catch written for something else. */
+const TIMED_OUT = Symbol('rate_limit_timed_out');
+
+/* Fixed and short. Not derived from anything upstream — nothing upstream
+   answered — so it cannot leak a window length or a bucket state. */
+const RATE_LIMIT_UNAVAILABLE_RETRY_SECONDS = 5;
+
+const runWithTimeout = async (factory, timeoutMs) => {
+  const controller = new AbortController();
+  let timer = null;
+  try {
+    const work = Promise.resolve(factory(controller.signal));
+    const expiry = new Promise(resolve => {
+      timer = setTimeout(() => {
+        /* Abort FIRST, then resolve. Reversing these lets the race settle and
+           the finally clear the timer before the abort ever runs. */
+        try { controller.abort(); } catch { /* nothing depends on it landing */ }
+        resolve(TIMED_OUT);
+      }, timeoutMs);
+    });
+    return await Promise.race([work, expiry]);
+  } finally {
+    /* Always, so a prompt answer never leaves the event loop pinned. */
+    if (timer) clearTimeout(timer);
+  }
+};
+
+/* PostgREST exposes `.abortSignal()` on a query builder. A test double that
+   does not is called plainly — the race still bounds it. */
+const callRpc = (db, name, args, signal) => {
+  const call = db.rpc(name, args);
+  return (call && typeof call.abortSignal === 'function') ? call.abortSignal(signal) : call;
+};
+
 const readBody = async request => {
   const read = await readBoundedBody(request, MAX_BODY_BYTES);
   if (read.outcome === BODY.tooLarge) {
@@ -661,6 +738,59 @@ const assertOrigin = (request, env, url) => {
   if (!SAFE_FETCH_SITES.has(site)) {
     fail(403, 'origin_required', 'This endpoint accepts staff-console requests only.');
   }
+};
+
+/* ---------- the method each path serves ----------
+   ONE TABLE, CHECKED BEFORE ANYTHING IS SPENT.
+
+   THE DEFECT THIS CLOSES. Only two paths validated their method inline —
+   /session and /auth-config — so every other path let an unsupported method
+   fall through the whole chain and answer with whatever it happened to hit:
+   `OPTIONS /cases` reached the bearer-token check and returned 401,
+   `PUT /cases/:id` the same, and an unrecognised path returned 404 only after
+   authentication. None of those is an answer about the METHOD, and none
+   carries an `Allow` header a client can act on.
+
+   Every method is now decided here, from one table, in one place.
+
+   ORDER MATTERS AND IS DELIBERATE:
+
+     · AFTER the origin gate, so a cross-origin caller still gets the uniform
+       403 it always got and cannot enumerate which methods a path serves.
+     · BEFORE the rate limiter, so a refusal costs no bucket, no database
+       round trip and no Supabase client — the same reasoning the origin gate
+       already follows — and so a limiter that is unavailable cannot mask a
+       405 with a 503.
+
+   MORE SPECIFIC PATTERNS FIRST: `/cases/:id/link` is a POST route that would
+   otherwise be matched by the `/cases/:id` GET rule.
+
+   This adds no accepted operation. Every path serves exactly the one method
+   it served before; the table only makes the refusal deterministic. */
+const ROUTE_METHODS = Object.freeze([
+  [/\/session(?:\/(?:refresh|signout))?$/, 'POST'],
+  [/\/auth-config$/, 'GET'],
+  [/\/cases\/[^/]+\/link$/, 'POST'],
+  [/\/cases\/[^/]+$/, 'GET'],
+  [/\/cases$/, 'GET']
+]);
+
+/* Returns a 405 Response when the method is wrong for a KNOWN path, and null
+   otherwise. An unknown path is left to the existing chain, which answers 404
+   after authentication — deliberately, so the set of real paths is not
+   enumerable by an unauthenticated caller. */
+const methodRefusal = (request, path, correlationId) => {
+  const method = String(request.method || '').toUpperCase();
+  for (const [pattern, allowed] of ROUTE_METHODS) {
+    if (!pattern.test(path)) continue;
+    if (method === allowed) return null;
+    /* The established shape, unchanged: same code, same message, same header
+       the two inline checks produced. */
+    return json(405, {
+      ok: false, code: 'method_not_allowed', message: `${allowed} is required.`
+    }, correlationId, { Allow: allowed });
+  }
+  return null;
 };
 
 /* A JSON body is declared as JSON. `text/plain` is what a cross-site simple
@@ -908,6 +1038,12 @@ export async function handleRequest(request, deps = {}) {
       assertJsonContentType(request);
     }
 
+    /* ---------- 2a. the method, deterministically ----------
+       Before the rate limiter, so a wrong method costs no bucket and cannot
+       be masked by a limiter that is unavailable. See ROUTE_METHODS. */
+    const wrongMethod = methodRefusal(request, path, correlationId);
+    if (wrongMethod) return wrongMethod;
+
     /* The elevated client, built at most once per request and only when
        something actually needs it. */
     let dbPromise = null;
@@ -919,30 +1055,97 @@ export async function handleRequest(request, deps = {}) {
 
     /* One rate-limit pass. Returns a Response when the caller must be
        refused, and null when they may continue. Nothing about the bucket, the
-       address or the operator reaches the caller — only how long to wait. */
+       address or the operator reaches the caller — only how long to wait.
+
+       FAILS CLOSED IN EVERY DIRECTION, and two of those reverse earlier
+       decisions:
+
+         · no secret     used to mean NO RATE LIMITING AT ALL, logged at error
+                         level in production and otherwise silent. That is an
+                         unmetered authentication path created by forgetting
+                         one environment variable — the exact configuration
+                         mistake a limiter exists to survive.
+         · unavailable   used to allow the request through: "a rate limiter
+                         that cannot answer must not take the console down
+                         with it". Treating an unavailable limiter as
+                         permission turns a database wobble into an unmetered
+                         path, silently.
+
+       Both now refuse. `503` rather than `429` because the caller did
+       nothing wrong and their quota is not the reason, and `Retry-After` is a
+       fixed short value — not derived from anything upstream, because nothing
+       upstream answered.
+
+       THE REASON TOKEN IS FIXED VOCABULARY. An upstream error body can carry
+       the statement, the parameters and the shape of the schema; the
+       configured secret must never be echoed at all. Only which pass failed,
+       and which of a closed set of reasons. */
+    const unavailable = (event, reason) => {
+      log('error', 'staff_rate_limit_unavailable', { pass: event, reason });
+      return json(503, {
+        ok: false, code: 'rate_limit_unavailable',
+        message: 'Staff requests cannot be processed right now. Please try again shortly.'
+      }, correlationId, { 'Retry-After': String(RATE_LIMIT_UNAVAILABLE_RETRY_SECONDS) });
+    };
+
     const limitPass = async ({ namespace, policy, sessionId = null, includeSession, event }) => {
+      /* THE SECRET IS CHECKED HERE, EXPLICITLY, AND NOT INFERRED FROM AN
+         EMPTY KEY LIST. buildRateLimitKeys returns [] for two unrelated
+         reasons — no secret, and no derivable caller address — and conflating
+         them is what let a missing variable read as "nothing to limit".
+         Whitespace counts as missing: a variable set to " " is a variable
+         somebody meant to set and did not. */
+      const secret = typeof env.CED_RATE_LIMIT_SECRET === 'string'
+        ? env.CED_RATE_LIMIT_SECRET.trim() : '';
+      if (!secret) return unavailable(event, 'missing_secret');
+
+      /* THE CALLER MUST BE IDENTIFIABLE, or there is nothing to meter.
+
+         A bucket keyed on nothing is not a bucket, and a bucket keyed on
+         garbage is one nobody else shares — both are "no limit" wearing a
+         limiter's clothes. This was the last unmetered shape: a request with
+         no forwarding header used to pass straight through.
+
+         Checked against the resolved address, not inferred from an empty key
+         list, so a missing identifier is distinguishable from a missing
+         secret and each gets its own fixed reason. The value itself is never
+         logged: it is the caller's IP address. */
+      const address = readAddress(request.headers);
+      if (!isUsableAddress(address)) return unavailable(event, 'missing_identifier');
+
       const keys = buildRateLimitKeys({
         headers: request.headers, sessionId, env, hmacFn: hmac, namespace, includeSession
       });
       if (!keys.length) {
-        if (String(env.NODE_ENV || '').toLowerCase() === 'production') {
-          /* No secret configured means no rate limiting at all — visible, not silent. */
-          log('error', 'staff_rate_limit_not_configured', { pass: event });
-        }
-        return null;
+        /* Belt and braces: a usable address that still derived no key means
+           the builder and this check disagree, which is a defect rather than
+           a caller problem — and it must not become permission. */
+        return unavailable(event, 'missing_identifier');
       }
-      const db = await database();
-      const { data: limit, error: limitError } = await db.rpc('check_rate_limit', {
-        p_keys: keys,
-        p_window_seconds: policy.windowSeconds,
-        p_max_requests: policy.maxRequests
-      });
-      if (limitError) {
-        /* A rate limiter that cannot answer must not take the console down
-           with it; every other layer still applies. */
-        log('warn', 'staff_rate_limit_unavailable', { pass: event, reason: 'rpc_error' });
-        return null;
+
+      let outcome;
+      try {
+        const db = await database();
+        outcome = await runWithTimeout(
+          signal => callRpc(db, 'check_rate_limit', {
+            p_keys: keys,
+            p_window_seconds: policy.windowSeconds,
+            p_max_requests: policy.maxRequests
+          }, signal),
+          rateLimitTimeoutMs(env));
+      } catch (err) {
+        /* A thrown driver error, an aborted call, or an unconfigured elevated
+           key. `StaffError` is the route's own refusal — 503
+           database_unavailable from getServiceClient — and is re-thrown so it
+           keeps its own status and code. */
+        if (err instanceof StaffError) throw err;
+        outcome = { error: { message: 'threw' } };
       }
+
+      if (outcome === TIMED_OUT) return unavailable(event, 'timeout');
+      if (!outcome || outcome.error) return unavailable(event, 'rpc_error');
+
+      const limit = outcome.data;
       if (limit && limit.allowed === false) {
         const retryAfter = Number(limit.retryAfterSeconds) > 0
           ? Math.ceil(Number(limit.retryAfterSeconds)) : policy.windowSeconds;
@@ -982,6 +1185,9 @@ export async function handleRequest(request, deps = {}) {
        consume the other. */
     const sessionRoute = path.match(/\/session(?:\/(refresh|signout))?$/);
     if (sessionRoute) {
+      /* Unreachable while ROUTE_METHODS carries this path — kept as a second
+         line so the branch is correct on its own terms, whatever the table
+         says. */
       if (request.method !== 'POST') {
         return json(405, { ok: false, code: 'method_not_allowed', message: 'POST is required.' },
           correlationId, { Allow: 'POST' });
@@ -1026,6 +1232,7 @@ export async function handleRequest(request, deps = {}) {
        a same-origin call carries no Origin and is judged on Fetch Metadata by
        the same gate as every other read. */
     if (/\/auth-config$/.test(path)) {
+      /* Second line, as above. */
       if (request.method !== 'GET') {
         return json(405, { ok: false, code: 'method_not_allowed', message: 'GET is required.' },
           correlationId, { Allow: 'GET' });
@@ -1322,5 +1529,9 @@ export const __testing = {
   assertOrigin, SAFE_METHODS, SAFE_FETCH_SITES,
   MAX_BODY_BYTES, MAX_NOTE, MIN_NOTE, MIN_SUBSTANTIVE_NOTE,
   classifyKey, legacyKeyRole, selectKey, assertNoBody,
-  PUBLISHABLE_KEY_FORMAT, SECRET_KEY_FORMAT
+  PUBLISHABLE_KEY_FORMAT, SECRET_KEY_FORMAT,
+  ROUTE_METHODS, methodRefusal,
+  rateLimitTimeoutMs, runWithTimeout, callRpc, TIMED_OUT,
+  DEFAULT_RATE_LIMIT_TIMEOUT_MS, MIN_RATE_LIMIT_TIMEOUT_MS, MAX_RATE_LIMIT_TIMEOUT_MS,
+  RATE_LIMIT_UNAVAILABLE_RETRY_SECONDS
 };

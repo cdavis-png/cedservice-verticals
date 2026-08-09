@@ -40,6 +40,10 @@ const ENV = {
     'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiJ9.anon-never-real',
   SUPABASE_SERVICE_ROLE_KEY:
     'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoic2VydmljZV9yb2xlIn0.service-never-real',
+  /* Rate limiting FAILS CLOSED on a missing secret, so every staff fixture
+     must configure one or the route answers 503 before the test's own
+     subject is reached. Never a real value. */
+  CED_RATE_LIMIT_SECRET: 'test-rate-limit-secret',
   CED_LOG_LEVEL: 'error'
 };
 
@@ -107,15 +111,34 @@ const signOutScopes = calls =>
 
 const ORIGIN = 'https://staff.example.com';
 
+/* A caller identifier, on every request, because the staff limiter now FAILS
+   CLOSED without one. TEST-NET-3 (RFC 5737) — reserved for documentation, so
+   it can never be a real client. */
+const CALLER_IP = '203.0.113.9';
+
+/* The limiter now runs on every request and needs a database. This answers
+   that one call and nothing else, for tests whose subject is elsewhere. */
+const limiterDb = () => ({
+  async rpc(name) {
+    if (name === 'check_rate_limit') return { data: { allowed: true }, error: null };
+    return { data: null, error: null };
+  },
+  from() { return { select() { return this; }, eq() { return { data: [] }; } }; }
+});
+
 const post = async (path, body, {
-  env = ENV, authClient, db, origin = ORIGIN, contentType = 'application/json'
+  env = ENV, authClient, db, origin = ORIGIN, contentType = 'application/json',
+  callerIp = CALLER_IP
 } = {}) => {
   const request = new Request(
     `https://staff.example.com/api/staff/identity-resolution${path}`, {
       method: 'POST',
       headers: {
         ...(contentType ? { 'content-type': contentType } : {}),
-        'x-forwarded-proto': 'https',
+        'x-forwarded-proto': 'https', 'x-vercel-forwarded-for': '203.0.113.9',
+        /* The staff limiter fails closed without a caller identifier.
+           TEST-NET-3 (RFC 5737), reserved for documentation. */
+        ...(callerIp ? { 'x-vercel-forwarded-for': callerIp } : {}),
         ...(origin ? { origin } : {})
       },
       body: JSON.stringify(body)
@@ -131,9 +154,24 @@ const post = async (path, body, {
 
 /* ---------- missing configuration ---------- */
 
-test('an unconfigured deployment says sign-in is unavailable, and says nothing else', async () => {
+test('a deployment with no rate-limit secret fails closed before sign-in is attempted', async () => {
+  /* The limiter is the first thing that can refuse after provenance and the
+     method, so a WHOLLY unconfigured deployment reports the limiter rather
+     than Auth. Both are 503; this pins which, so the ordering is a decision
+     rather than an accident — and it proves a missing secret cannot become a
+     free sign-in attempt. */
   const res = await post('/session', { email: 'owner@example.test', password: 'x' },
     { env: { CED_LOG_LEVEL: 'error' } });
+  assert.equal(res.status, 503);
+  assert.equal(res.body.code, 'rate_limit_unavailable');
+  assert.equal(res.headers.get('Retry-After'), '5');
+  assert.equal(/secret|key|url|supabase.co/i.test(res.body.message), false,
+    'the message names no variable and no project');
+});
+
+test('an unconfigured deployment says sign-in is unavailable, and says nothing else', async () => {
+  const res = await post('/session', { email: 'owner@example.test', password: 'x' },
+    { env: { CED_LOG_LEVEL: 'error', CED_RATE_LIMIT_SECRET: 'test-rate-limit-secret' } });
   assert.equal(res.status, 503);
   assert.equal(res.body.code, 'auth_unavailable');
   assert.equal(/key|url|supabase\.co/i.test(res.body.message), false,
@@ -377,8 +415,8 @@ test('the session endpoints refuse anything but POST', async () => {
   for (const path of ['/session', '/session/refresh', '/session/signout']) {
     const request = new Request(
       `https://staff.example.com/api/staff/identity-resolution${path}`,
-      { method: 'GET', headers: { 'x-forwarded-proto': 'https', origin: ORIGIN } });
-    const res = await handleRequest(request, { env: ENV, db: {} });
+      { method: 'GET', headers: { 'x-forwarded-proto': 'https', 'x-vercel-forwarded-for': '203.0.113.9', origin: ORIGIN } });
+    const res = await handleRequest(request, { env: ENV, db: limiterDb() });
     assert.equal(res.status, 405, path);
     assert.equal(res.headers.get('allow'), 'POST', path);
   }
@@ -387,11 +425,11 @@ test('the session endpoints refuse anything but POST', async () => {
 test('the session endpoints require HTTPS like everything else on this route', async () => {
   const request = new Request('http://staff.example.com/api/staff/identity-resolution/session', {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-forwarded-proto': 'http',
+    headers: { 'content-type': 'application/json', 'x-forwarded-proto': 'http', 'x-vercel-forwarded-for': '203.0.113.9',
                origin: 'http://staff.example.com' },
     body: JSON.stringify({ email: 'a@b.test', password: 'x' })
   });
-  const res = await handleRequest(request, { env: ENV, db: {} });
+  const res = await handleRequest(request, { env: ENV, db: limiterDb() });
   assert.equal(res.status, 403);
   assert.equal((await res.json()).code, 'https_required');
 });
@@ -408,8 +446,12 @@ test('signing in reads no case, no submission and no operator row', async () => 
     { authClient: stub.factory, db });
 
   assert.equal(res.status, 200);
-  assert.deepEqual(reads, [],
+  /* The two limiter passes — pre-authentication and sign-in — are
+     infrastructure. Nothing PRIVILEGED is touched until a token arrives. */
+  assert.deepEqual(reads, ['check_rate_limit', 'check_rate_limit'],
     'sign-in is not authorization: nothing privileged is touched until a token arrives');
+  assert.equal(reads.some(r => r !== 'check_rate_limit'), false,
+    'no case row, no submission, no operator row');
 });
 
 test('a session response never carries a key of any privilege level', async () => {
@@ -657,9 +699,9 @@ test('an oversized sign-in body is cancelled mid-stream, not buffered', async ()
   const stub = authStub();
   const request = new Request('https://staff.example.com/api/staff/identity-resolution/session', {
     method: 'POST', body, duplex: 'half',
-    headers: { 'content-type': 'application/json', 'x-forwarded-proto': 'https', origin: ORIGIN }
+    headers: { 'content-type': 'application/json', 'x-forwarded-proto': 'https', 'x-vercel-forwarded-for': '203.0.113.9', origin: ORIGIN }
   });
-  const res = await handleRequest(request, { env: ENV, authClient: stub.factory, db: {} });
+  const res = await handleRequest(request, { env: ENV, authClient: stub.factory, db: limiterDb() });
 
   assert.equal(res.status, 413);
   assert.equal((await res.json()).code, 'body_too_large');
@@ -674,10 +716,10 @@ test('a declared Content-Length over the limit never opens the sign-in stream', 
   }, new CountQueuingStrategy({ highWaterMark: 0 }));
   const request = new Request('https://staff.example.com/api/staff/identity-resolution/session', {
     method: 'POST', body, duplex: 'half',
-    headers: { 'content-type': 'application/json', 'x-forwarded-proto': 'https', origin: ORIGIN,
+    headers: { 'content-type': 'application/json', 'x-forwarded-proto': 'https', 'x-vercel-forwarded-for': '203.0.113.9', origin: ORIGIN,
                'content-length': '900000' }
   });
-  const res = await handleRequest(request, { env: ENV, db: {} });
+  const res = await handleRequest(request, { env: ENV, db: limiterDb() });
   assert.equal(res.status, 413);
   assert.equal((await res.json()).code, 'body_too_large');
   assert.equal(pulled, 0, 'the stream was never read at all');

@@ -45,6 +45,14 @@ import { handleRequest } from '../../server/staff-identity-resolution.mjs';
 import { __testing as buildTesting } from '../../tools/build-static.mjs';
 import { PUBLISHABLE_FIXTURE, SECRET_FIXTURE } from '../helpers/supabase-keys.mjs';
 
+/* Vercel's edge stamps a caller identifier on every request; these fixtures
+   stand where the edge would, so they add one. Without it the staff limiter
+   fails closed — correctly — and no test here would reach its own subject.
+   TEST-NET-3 (RFC 5737), reserved for documentation. */
+const EDGE_CALLER_IP = '203.0.113.9';
+
+const withCallerIp = headers => ({ ...headers, 'x-vercel-forwarded-for': EDGE_CALLER_IP });
+
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const INVITE_PAGE = '/staff/identity-resolution/accept-invite.html';
 const RESET_PAGE = '/staff/identity-resolution/reset-password.html';
@@ -319,13 +327,25 @@ const startCedServer = auth => new Promise(res => {
   };
 
   const env = {
-    CED_ALLOW_INSECURE_STAFF: 'true', CED_LOG_LEVEL: 'debug',
+    CED_ALLOW_INSECURE_STAFF: 'true', CED_RATE_LIMIT_SECRET: 'test-rate-limit-secret', CED_LOG_LEVEL: 'debug',
     SUPABASE_URL: auth.origin, SUPABASE_PUBLISHABLE_KEY: PUBLISHABLE,
     SUPABASE_SECRET_KEY: SECRET_FIXTURE
   };
-  const db = new Proxy({}, {
-    get(_t, prop) { throw new Error(`the database was reached: ${String(prop)}`); }
-  });
+  /* THE LIMITER IS THE ONLY DATABASE CALL THESE PAGES MAY CAUSE.
+
+     Rate limiting fails closed, so every request needs a `check_rate_limit`
+     round trip. That is infrastructure, not a privileged read. Every other
+     rpc and every table read throws, which is what keeps "onboarding touches
+     no privileged data" a property of the code rather than of the fixture. */
+  const db = {
+    async rpc(name) {
+      if (name !== 'check_rate_limit') {
+        throw new Error(`the database was reached: rpc(${String(name)})`);
+      }
+      return { data: { allowed: true }, error: null };
+    },
+    from(table) { throw new Error(`the database was reached: from(${String(table)})`); }
+  };
 
   const server = createServer(async (req, resp) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
@@ -346,7 +366,7 @@ const startCedServer = auth => new Promise(res => {
       let answer;
       try {
         answer = await handleRequest(new Request(url.href, {
-          method: req.method, headers: req.headers, ...(body.length ? { body } : {})
+          method: req.method, headers: withCallerIp(req.headers), ...(body.length ? { body } : {})
         }), { env, db, correlationId: 'browser-recovery-test' });
       } finally {
         console.log = original.log; console.warn = original.warn; console.error = original.error;
@@ -823,9 +843,9 @@ it('the recovery page grants no operator or queue access', async () => {
   const server = createServer(async (req, resp) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const answer = await handleRequest(new Request(url.href, {
-      method: req.method, headers: req.headers
+      method: req.method, headers: withCallerIp(req.headers)
     }), {
-      env: { CED_ALLOW_INSECURE_STAFF: 'true', CED_LOG_LEVEL: 'error' },
+      env: { CED_ALLOW_INSECURE_STAFF: 'true', CED_RATE_LIMIT_SECRET: 'test-rate-limit-secret', CED_LOG_LEVEL: 'error' },
       db: {
         async rpc(name) {
           seen.push(name);

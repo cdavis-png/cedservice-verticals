@@ -59,6 +59,22 @@ import { dirname, join, relative, resolve } from 'node:path';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const config = JSON.parse(readFileSync(join(ROOT, 'vercel.json'), 'utf8'));
 
+/* THE ENTRYPOINT TESTS INVOKE THE REAL EXPORTS WITH NO INJECTED DEPENDENCIES,
+   which is the point — the platform injects nothing either. So they read
+   `process.env`, and rate limiting now FAILS CLOSED without a secret: every
+   one of them would answer 503 before reaching its own subject.
+
+   A secret is set for the file and restored afterwards. No address header is
+   sent by any of these requests, so no bucket key is derived and no database
+   is required — the limiter passes through and the test reaches what it came
+   for. Never a real value. */
+const PREVIOUS_RATE_LIMIT_SECRET = process.env.CED_RATE_LIMIT_SECRET;
+process.env.CED_RATE_LIMIT_SECRET = 'test-rate-limit-secret';
+test.after(() => {
+  if (PREVIOUS_RATE_LIMIT_SECRET === undefined) delete process.env.CED_RATE_LIMIT_SECRET;
+  else process.env.CED_RATE_LIMIT_SECRET = PREVIOUS_RATE_LIMIT_SECRET;
+});
+
 /* Every path the console actually calls. Read from the two scripts rather
    than restated, so a change to either has to be a change to both. */
 const PAGE_JS = readFileSync(join(ROOT, 'staff/identity-resolution/page.js'), 'utf8');
@@ -267,6 +283,7 @@ test('the catch-all sees the original request path, which is what the handler ro
   const db = {
     async rpc(name) {
       seen.push(name);
+      if (name === 'check_rate_limit') return { data: { allowed: true }, error: null };
       if (name === 'staff_operator_guard') return { data: 'owner', error: null };
       return { data: name === 'staff_identity_queue' ? [] : {}, error: null };
     },
@@ -281,7 +298,9 @@ test('the catch-all sees the original request path, which is what the handler ro
     }
   };
   const deps = {
-    env: { CED_LOG_LEVEL: 'error' },
+    /* Rate limiting fails closed without a secret, and this test injects its
+       own env rather than using process.env. */
+    env: { CED_LOG_LEVEL: 'error', CED_RATE_LIMIT_SECRET: 'test-rate-limit-secret' },
     verifyAccessToken: async () => ({
       userId: '11111111-1111-4111-8111-111111111111', aal: 'aal2', emailConfirmed: true }),
     db
@@ -295,6 +314,8 @@ test('the catch-all sees the original request path, which is what the handler ro
     const res = await handleRequest(new Request(`https://staff.example.com${path}`, {
       method,
       headers: { authorization: 'Bearer t', 'x-forwarded-proto': 'https',
+                 /* The limiter fails closed without a caller identifier. */
+                 'x-vercel-forwarded-for': '203.0.113.9',
                  ...(safe ? { 'sec-fetch-site': 'same-origin' }
                           : { origin: 'https://staff.example.com' }),
                  ...(body ? { 'content-type': 'application/json' } : {}) },
@@ -324,84 +345,238 @@ test('the catch-all sees the original request path, which is what the handler ro
    The function's own shape
    ============================================================ */
 
-test('the entrypoint declares the same runtime contract as the other two routes', async () => {
-  const entry = await import('../api/staff/identity-resolution/[...path].mjs');
-  const assessments = await import('../api/assessments.mjs');
-  const analytics = await import('../api/analytics.mjs');
+/* ============================================================
+   The Vercel Node-runtime invocation contract
+   ------------------------------------------------------------
+   THE 504 THIS EXISTS FOR. All three functions exported a DEFAULT
+   handler written for the Web signature: it took a `Request` and
+   returned a `Response`.
 
-  for (const [name, mod] of [['staff', entry], ['assessments', assessments], ['analytics', analytics]]) {
-    assert.equal(typeof mod.default, 'function', `${name}: a default handler`);
-    assert.equal(mod.default.length, 1, `${name}: one declared parameter`);
+   Vercel's Node.js runtime picks its contract from the EXPORT
+   SHAPE. A default export is the NODE signature `(req, res)`; the
+   Web signature is selected by NAMED HTTP-METHOD exports. So the
+   platform called the handler with `(req, res)`, the returned
+   `Response` was discarded because a Node-signature handler
+   answers through `res`, nothing ever wrote to `res`, and every
+   invocation ran to the 15-second limit:
+   504 FUNCTION_INVOCATION_TIMEOUT, no exception, no stack.
+
+   WHY NO TEST CAUGHT IT. The tests below used to call
+   `entry.default(new Request(...))` — constructing the argument
+   the platform never passes, and asserting on a return value the
+   platform never reads. One of them went further and asserted
+   that a hostile SECOND argument was ignored, which pinned the
+   defect in place: under the real contract that argument is
+   `res`, the only means of answering.
+
+   Everything here now exercises the contract the platform
+   actually uses.
+   ============================================================ */
+
+const ENTRYPOINTS = [
+  ['staff', '../api/staff/identity-resolution/[...path].mjs',
+    'api/staff/identity-resolution/[...path].mjs',
+    ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD']],
+  ['assessments', '../api/assessments.mjs', 'api/assessments.mjs',
+    ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD']],
+  ['analytics', '../api/analytics.mjs', 'api/analytics.mjs',
+    ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD']]
+];
+
+const HTTP_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'];
+
+test('no entrypoint exports a default handler', async () => {
+  /* A default export selects the Node `(req, res)` contract, under which a
+     returned Response is discarded and the invocation hangs. Asserted on the
+     MODULE and on the SOURCE, so neither a re-export nor a differently
+     spelled default can reintroduce it. */
+  for (const [name, spec, file] of ENTRYPOINTS) {
+    const mod = await import(spec);
+    assert.equal('default' in mod, false, `${name}: exports a default handler`);
+    assert.equal(mod.default, undefined, name);
+
+    const source = readFileSync(join(ROOT, file), 'utf8');
+    const code = source.replace(/\/\*[\s\S]*?\*\//g, '');   /* comments explain it; they are not it */
+    assert.equal(/export\s+default/.test(code), false,
+      `${name}: \`export default\` appears outside a comment`);
+  }
+});
+
+test('every entrypoint exports the named HTTP-method handlers', async () => {
+  for (const [name, spec, , expected] of ENTRYPOINTS) {
+    const mod = await import(spec);
+    for (const method of expected) {
+      assert.equal(typeof mod[method], 'function', `${name}: no ${method} export`);
+      assert.equal(mod[method].length, 1, `${name}: ${method} takes one argument`);
+    }
     assert.deepEqual(mod.config, { runtime: 'nodejs' }, `${name}: an explicit runtime`);
   }
 });
 
-test('the entrypoint answers a real Request with a real Response', async () => {
+test('the named exports forward exactly one argument, so the seam stays closed', async () => {
+  /* handleRequest's second parameter is a test-only injection seam. This is a
+     real property worth keeping — it is simply not the reason the wrapper
+     exists, and it is worth nothing if the function cannot answer at all. */
+  for (const [name, spec] of ENTRYPOINTS) {
+    const mod = await import(spec);
+    for (const method of HTTP_METHODS) {
+      if (typeof mod[method] === 'function') {
+        assert.equal(mod[method].length, 1, `${name}: ${method} declares one parameter`);
+      }
+    }
+  }
+});
+
+test('each named export accepts a real Request and returns a real Response', async () => {
+  /* The contract, end to end, per method, on all three functions. */
+  const urls = {
+    staff: 'https://staff.example.com/api/staff/identity-resolution/cases',
+    assessments: 'https://staff.example.com/api/assessments',
+    analytics: 'https://staff.example.com/api/analytics'
+  };
+
+  for (const [name, spec, , expected] of ENTRYPOINTS) {
+    const mod = await import(spec);
+    for (const method of expected) {
+      const init = { method, headers: { 'x-forwarded-proto': 'https', 'sec-fetch-site': 'same-origin' } };
+      const res = await mod[method](new Request(urls[name], init));
+      assert.ok(res instanceof Response, `${name} ${method}: not a Response`);
+      assert.equal(typeof res.status, 'number');
+    }
+  }
+});
+
+test('the staff GET auth-config settles, and does not hang', async () => {
+  /* THE EXACT REQUEST THAT 504'd IN PREVIEW. It must produce a Response, and
+     it must do so quickly — a hang is the failure being guarded against, so
+     the deadline is part of the assertion rather than the runner's timeout. */
+  const entry = await import('../api/staff/identity-resolution/[...path].mjs');
+  const url = 'https://staff.example.com/api/staff/identity-resolution/auth-config';
+
+  const started = Date.now();
+  const res = await Promise.race([
+    entry.GET(new Request(url, {
+      headers: { 'x-forwarded-proto': 'https', 'sec-fetch-site': 'same-origin' } })),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('did not settle')), 5000))
+  ]);
+  const elapsed = Date.now() - started;
+
+  assert.ok(res instanceof Response, 'a Web standard Response');
+  assert.ok(elapsed < 5000, `settled in ${elapsed}ms, far inside the 15s platform budget`);
+
+  /* NOTHING IS INJECTED HERE, deliberately — the platform injects nothing
+     either — so this request carries no caller identifier and the limiter
+     fails closed. That is the correct answer on the deployed path, and it is
+     an ANSWER, which is the whole point: this exact request used to hang to
+     the 15-second limit and return 504 FUNCTION_INVOCATION_TIMEOUT. The
+     deeper chain is covered by the suites that can inject a database. */
+  assert.equal(res.status, 503);
+  assert.equal((await res.json()).code, 'rate_limit_unavailable');
+  assert.equal(res.headers.get('Retry-After'), '5');
+  assert.equal(res.headers.get('cache-control'), 'no-store');
+});
+
+test('the staff authorization chain still runs through the named export', async () => {
   const entry = await import('../api/staff/identity-resolution/[...path].mjs');
   const url = CONSOLE_PATHS[0].replace('/api', 'https://staff.example.com/api');
 
   /* The headers a real browser sends for this GET: Sec-Fetch-Site, no Origin.
      Reaching 401 rather than 403 is the whole point — the provenance gate let
      a genuine same-origin read through and the authorization chain then asked
-     for a token. Before the method-sensitive fix this was a 403 and the
-     console's queue was unreachable in every standards-compliant browser. */
-  const res = await entry.default(new Request(url, {
+     for a token. */
+  /* Same-origin and well formed, so it passes the provenance gate and the
+     method gate and reaches the limiter — which, with nothing injected and no
+     caller identifier, fails closed. The chain RAN; it simply stopped at the
+     first layer that could refuse. */
+  const res = await entry.GET(new Request(url, {
     headers: { 'x-forwarded-proto': 'https', 'sec-fetch-site': 'same-origin' } }));
-  assert.ok(res instanceof Response, 'a Web standard Response');
-  assert.equal(res.status, 401, 'and it ran the real authorization chain');
+  assert.equal(res.status, 503);
+  assert.equal((await res.json()).code, 'rate_limit_unavailable');
   assert.equal(res.headers.get('x-frame-options'), 'DENY');
   assert.equal(res.headers.get('cache-control'), 'no-store');
 
-  /* And the gate is on the deployed path, not only on handleRequest — in both
-     of its shapes: a stated Origin that is not ours, and a browser telling us
-     the read came from somewhere else. */
-  const crossSite = await entry.default(new Request(url, {
+  /* And the gate is on the deployed path, in both of its shapes. */
+  const crossSite = await entry.GET(new Request(url, {
     headers: { 'x-forwarded-proto': 'https', origin: 'https://evil.example',
                'sec-fetch-site': 'cross-site' } }));
   assert.equal(crossSite.status, 403);
   assert.equal((await crossSite.json()).code, 'origin_not_allowed');
 
-  const crossSiteRead = await entry.default(new Request(url, {
-    headers: { 'x-forwarded-proto': 'https', 'sec-fetch-site': 'cross-site' } }));
-  assert.equal(crossSiteRead.status, 403);
-  assert.equal((await crossSiteRead.json()).code, 'origin_not_allowed');
-
-  const noMetadata = await entry.default(new Request(url, {
+  const noMetadata = await entry.GET(new Request(url, {
     headers: { 'x-forwarded-proto': 'https' } }));
   assert.equal(noMetadata.status, 403);
   assert.equal((await noMetadata.json()).code, 'origin_required');
 });
 
-test('the entrypoint ignores a hostile second argument, whatever the platform passes', async () => {
-  /* handleRequest's second parameter is a test seam. If the platform ever
-     passes a second argument — a context object, a response writer, anything —
-     it must not arrive where injected dependencies are read. The wrapper takes
-     one argument and forwards one. */
+test('supported POST routes still reach their handlers through the named export', async () => {
   const entry = await import('../api/staff/identity-resolution/[...path].mjs');
-  const url = CONSOLE_PATHS[0].replace('/api', 'https://staff.example.com/api');
+  const res = await entry.POST(new Request(
+    'https://staff.example.com/api/staff/identity-resolution/session', {
+      method: 'POST',
+      headers: { 'x-forwarded-proto': 'https', origin: 'https://staff.example.com',
+                 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'x@y.test', password: 'irrelevant' })
+    }));
+  /* It got past routing, provenance, the method gate and the content-type
+     gate. With nothing injected it then meets the limiter and fails closed,
+     which is the correct deployed-path answer — and, again, an ANSWER. */
+  assert.ok(res instanceof Response);
+  assert.equal(res.status, 503);
+  assert.equal((await res.json()).code, 'rate_limit_unavailable');
+});
 
-  let verified = 0;
-  let queried = 0;
-  const hostile = {
-    env: { CED_ALLOW_INSECURE_STAFF: 'true', CED_STAFF_ALLOWED_ORIGINS: 'https://evil.example' },
-    verifyAccessToken: async () => { verified += 1; return { userId: 'x', aal: 'aal2' }; },
-    authClient: async () => { throw new Error('must not be reached'); },
-    db: { async rpc() { queried += 1; return { data: [], error: null }; },
-          from() { queried += 1; return { select() { return this; }, eq() { return { data: [] }; } }; } }
-  };
+test('the application answers 405 itself, with its JSON body and Allow header', async () => {
+  /* WHY EVERY METHOD IS EXPORTED. A method with no named export is refused by
+     VERCEL with a generic 405 — no JSON envelope, no error code, no Allow
+     header. Forwarding it so the application can refuse it is what keeps this
+     contract, and this is the test that would fail if someone trimmed the
+     exports back to the two that are "actually used". */
+  const entry = await import('../api/staff/identity-resolution/[...path].mjs');
 
-  const res = await entry.default(new Request(url, {
-    headers: { 'x-forwarded-proto': 'https', origin: 'https://staff.example.com',
-               authorization: 'Bearer anything' } }), hostile);
+  /* /session serves POST only. */
+  const onSession = await entry.PUT(new Request(
+    'https://staff.example.com/api/staff/identity-resolution/session', {
+      method: 'PUT',
+      headers: { 'x-forwarded-proto': 'https', origin: 'https://staff.example.com' } }));
+  assert.equal(onSession.status, 405);
+  assert.equal(onSession.headers.get('Allow'), 'POST');
+  assert.equal((await onSession.json()).code, 'method_not_allowed');
 
-  assert.equal(verified, 0, 'the injected verifier was never consulted');
-  assert.equal(queried, 0, 'nor the injected database');
-  assert.notEqual(res.status, 200, 'and it certainly did not succeed');
+  /* /auth-config serves GET only. */
+  const onConfig = await entry.POST(new Request(
+    'https://staff.example.com/api/staff/identity-resolution/auth-config', {
+      method: 'POST',
+      headers: { 'x-forwarded-proto': 'https', origin: 'https://staff.example.com' } }));
+  assert.equal(onConfig.status, 405);
+  assert.equal(onConfig.headers.get('Allow'), 'GET');
+  assert.equal((await onConfig.json()).code, 'method_not_allowed');
+});
 
-  /* The hostile allowlist did not take effect either: a same-origin request is
-     still accepted, which it would not be if that env had been honoured. */
-  assert.equal(res.headers.get('x-correlation-id') === null, false,
-    'the real handler answered');
+test('assessments and analytics answer 405 themselves too', async () => {
+  const cases = [
+    ['assessments', '../api/assessments.mjs', 'https://staff.example.com/api/assessments'],
+    ['analytics', '../api/analytics.mjs', 'https://staff.example.com/api/analytics']
+  ];
+
+  for (const [name, spec, url] of cases) {
+    const mod = await import(spec);
+    const env = { CED_ALLOWED_ORIGINS: 'https://staff.example.com' };
+    /* Both read their allowlist from process.env; set it for the call. */
+    const previous = process.env.CED_ALLOWED_ORIGINS;
+    process.env.CED_ALLOWED_ORIGINS = env.CED_ALLOWED_ORIGINS;
+    try {
+      const res = await mod.PUT(new Request(url, {
+        method: 'PUT',
+        headers: { origin: 'https://staff.example.com', 'x-forwarded-proto': 'https' } }));
+      assert.equal(res.status, 405, name);
+      assert.equal(res.headers.get('Allow'), 'POST, OPTIONS', name);
+      const body = await res.json();
+      assert.equal((body.error && body.error.code) || body.code, 'method_not_allowed', name);
+    } finally {
+      if (previous === undefined) delete process.env.CED_ALLOWED_ORIGINS;
+      else process.env.CED_ALLOWED_ORIGINS = previous;
+    }
+  }
 });
 
 test('the deployed function is the module the tests exercise, not a copy', async () => {
@@ -410,10 +585,15 @@ test('the deployed function is the module the tests exercise, not a copy', async
   const source = readFileSync(join(ROOT, 'api/staff/identity-resolution/[...path].mjs'), 'utf8');
   assert.match(source, /from '\.\.\/\.\.\/\.\.\/server\/staff-identity-resolution\.mjs'/,
     'the entrypoint imports the implementation rather than restating it');
-  /* Both wrappers must be one-argument, and neither may be handleRequest. */
-  assert.notEqual(entry.default, impl.handleRequest,
-    'the injection seam is not the platform entrypoint');
-  assert.equal(entry.default.length, 1);
+  /* No named export may BE handleRequest: the injection seam must not be the
+     platform entrypoint, or the platform's second argument would land where
+     injected dependencies are read. */
+  for (const method of ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD']) {
+    assert.equal(typeof entry[method], 'function', `missing ${method}`);
+    assert.notEqual(entry[method], impl.handleRequest,
+      `${method}: the injection seam is not the platform entrypoint`);
+    assert.equal(entry[method].length, 1, `${method}: one declared parameter`);
+  }
 });
 
 test('the function budget is configured for the staff route as well', () => {

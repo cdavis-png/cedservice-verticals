@@ -710,7 +710,8 @@ Everything the console needs, and nothing else. Full descriptions in
 | `SUPABASE_URL` | yes | both clients |
 | `SUPABASE_PUBLISHABLE_KEY` (or `SUPABASE_ANON_KEY`) | yes | server-side sign-in, **and served to the onboarding page** via `GET …/auth-config` |
 | `SUPABASE_SECRET_KEY` (or `SUPABASE_SERVICE_ROLE_KEY`) | yes | the RPC and the two table reads |
-| `CED_RATE_LIMIT_SECRET` | strongly | all four rate-limit passes |
+| `CED_RATE_LIMIT_SECRET` | **yes** | all four rate-limit passes — the route fails closed without it |
+| `CED_RATE_LIMIT_TIMEOUT_MS` | no | default 2000, clamped 250–4000 |
 | `CED_STAFF_ALLOWED_ORIGINS` | no | defaults to the request's own origin |
 | `CED_STAFF_RATE_LIMIT_WINDOW_SECONDS` / `_MAX_REQUESTS` | no | defaults 900 / 240 |
 | `CED_STAFF_SIGNIN_RATE_LIMIT_WINDOW_SECONDS` / `_MAX_REQUESTS` | no | defaults 900 / 30 |
@@ -841,8 +842,16 @@ Recorded rather than implied away.
   configuration has not been observed**; it needs a real `vercel build` or a
   preview deployment. See
   [REAL_POSTGRES_VALIDATION.md](REAL_POSTGRES_VALIDATION.md), runs 6 and 8.
-- **Rate limiting depends on `CED_RATE_LIMIT_SECRET`.** With no secret there
-  is none, and the route logs that at error level in production.
+- **Rate limiting is REQUIRED, and fails closed.** `CED_RATE_LIMIT_SECRET`
+  is not optional for the staff route. Without it — or without a usable
+  caller identifier, or when `check_rate_limit` fails or exceeds its
+  timeout — every rate-limited staff route answers
+  `503 rate_limit_unavailable` with `Retry-After: 5`. The reason
+  (`missing_secret`, `missing_identifier`, `rpc_error`, `timeout`) is a
+  fixed token in the server log; the secret, the caller's address and any
+  upstream error body are never logged. This reverses an earlier note saying
+  a missing secret simply disabled limiting: it did, and that was an
+  unmetered authentication path created by forgetting one variable.
 - **The queue is the only surface.** There is still no path to dismiss a case,
   create a record, request more information, or merge. Cases outside
   link-to-existing stay open, visibly, and say so.

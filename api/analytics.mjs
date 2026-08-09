@@ -559,9 +559,49 @@ export async function handleRequest(request, deps = {}) {
   }
 }
 
-export default async function handler(request) {
-  return handleRequest(request);
-}
+/* ============================================================
+   NAMED METHOD EXPORTS — the Vercel Node runtime contract.
+
+   Vercel's Node.js runtime selects its invocation contract from
+   the EXPORT SHAPE:
+
+     export default handler        -> Node signature (req, res)
+     export function POST(request) -> Web signature (Request)
+
+   This file is written for the Web signature, so it must use
+   named method exports. As a DEFAULT export it was called with
+   (req, res): `req.url` is a path rather than an absolute URL,
+   `req.headers` has no `.get()`, and — decisively — the returned
+   `Response` was DISCARDED because a Node-signature handler
+   answers through `res`. Nothing ever wrote to `res`, so every
+   invocation ran to the platform's 15-second limit and answered
+   504 FUNCTION_INVOCATION_TIMEOUT with no exception to show.
+
+   EVERY STANDARD METHOD IS EXPORTED, and that does NOT widen what
+   this endpoint accepts. POST is the endpoint; OPTIONS is its CORS preflight, answered 204. handleRequest
+   already answers a deterministic `405 method_not_allowed` with
+   `Allow: POST, OPTIONS` for anything else. A method with no
+   named export is refused by VERCEL with a generic 405 instead,
+   losing the JSON envelope, the error code, the correlation id
+   and the CORS headers. Forwarding the method so the application
+   can refuse it is what preserves that contract.
+   ============================================================ */
+
+/* One argument in, one argument forwarded: handleRequest's second parameter
+   is a test-only injection seam and nothing the platform passes may reach
+   it. */
+const respond = request => handleRequest(request);
+
+export const POST = respond;
+export const OPTIONS = respond;
+
+/* Forwarded ONLY so the application's own 405 answers them, never to accept
+   them. */
+export const GET = respond;
+export const PUT = respond;
+export const PATCH = respond;
+export const DELETE = respond;
+export const HEAD = respond;
 
 export const config = { runtime: 'nodejs' };
 

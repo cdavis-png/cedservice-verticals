@@ -64,6 +64,10 @@ const ENV = {
   SUPABASE_URL: 'https://qkpptajglstgucadhfwq.supabase.co',
   SUPABASE_PUBLISHABLE_KEY: PUBLISHABLE_FIXTURE,
   SUPABASE_SECRET_KEY: SECRET_FIXTURE,
+  /* Rate limiting FAILS CLOSED on a missing secret, so every staff fixture
+     must configure one or the route answers 503 before the test's own
+     subject is reached. Never a real value. */
+  CED_RATE_LIMIT_SECRET: 'test-rate-limit-secret',
   CED_LOG_LEVEL: 'debug'
 };
 
@@ -71,10 +75,24 @@ const b64 = v => Buffer.from(JSON.stringify(v)).toString('base64url');
 const jwt = c => `${b64({ alg: 'HS256', typ: 'JWT' })}.${b64(c)}.sig`;
 const AAL2 = jwt({ sub: USER, aal: 'aal2', exp: 1893456000 });
 
-/* Any database access at all is a failure on these paths. */
-const noDatabase = new Proxy({}, {
-  get(_t, prop) { throw new Error(`the database was reached: ${String(prop)}`); }
-});
+/* THE LIMITER IS THE ONLY DATABASE CALL THESE PATHS MAY MAKE.
+
+   Rate limiting fails closed, so every request needs a caller identifier and
+   therefore a `check_rate_limit` round trip. That is infrastructure, not a
+   privileged read. Anything else — an RPC by another name, any table read —
+   throws, which is what keeps "onboarding touches no privileged data" a
+   property of the code rather than of the fixture. */
+const limiterCalls = [];
+const noDatabase = {
+  async rpc(name, args) {
+    if (name !== 'check_rate_limit') {
+      throw new Error(`the database was reached: rpc(${String(name)})`);
+    }
+    limiterCalls.push(args);
+    return { data: { allowed: true }, error: null };
+  },
+  from(table) { throw new Error(`the database was reached: from(${String(table)})`); }
+};
 
 /* Any Supabase Auth client construction is a failure on these paths. */
 const noAuthClient = async () => { throw new Error('an Auth client was built'); };
@@ -87,16 +105,23 @@ const capture = async fn => {
   finally { console.log = original.log; console.warn = original.warn; console.error = original.error; }
 };
 
+/* A caller identifier, on every request, because the staff limiter now FAILS
+   CLOSED without one. TEST-NET-3 (RFC 5737) — an address reserved for
+   documentation, so it can never be a real client. Tests that are ABOUT a
+   missing or malformed identifier override it explicitly. */
+const CALLER_IP = '203.0.113.9';
+
 const get = (path, { env = ENV, headers = {}, db = noDatabase } = {}) =>
   handleRequest(new Request(`${PREFIX}${path}`, {
     method: 'GET',
-    headers: { 'sec-fetch-site': 'same-origin', ...headers }
+    headers: { 'sec-fetch-site': 'same-origin', 'x-vercel-forwarded-for': CALLER_IP, ...headers }
   }), { env, db, authClient: noAuthClient, correlationId: 'boundary-test' });
 
 const post = (path, body, { env = ENV, db = noDatabase } = {}) =>
   handleRequest(new Request(`${PREFIX}${path}`, {
     method: 'POST',
-    headers: { origin: ORIGIN, 'content-type': 'application/json' },
+    headers: { origin: ORIGIN, 'content-type': 'application/json',
+               'x-vercel-forwarded-for': CALLER_IP },
     body: JSON.stringify(body)
   }), { env, db, authClient: noAuthClient, correlationId: 'boundary-test' });
 
@@ -112,8 +137,9 @@ test('the onboarding credential endpoints no longer exist', async () => {
       const response = await handleRequest(new Request(`${PREFIX}${path}`, {
         method,
         headers: method === 'POST'
-          ? { origin: ORIGIN, 'content-type': 'application/json' }
-          : { 'sec-fetch-site': 'same-origin' },
+          ? { origin: ORIGIN, 'content-type': 'application/json',
+              'x-vercel-forwarded-for': CALLER_IP }
+          : { 'sec-fetch-site': 'same-origin', 'x-vercel-forwarded-for': CALLER_IP },
         ...(method === 'POST' ? { body: '{}' } : {})
       }), { env: ENV, db: noDatabase, authClient: noAuthClient, correlationId: 'boundary-test' });
 
@@ -417,7 +443,8 @@ test('the elevated key fails closed on exactly the same terms', async () => {
      rather than attempted. */
   const request = new Request(`${PREFIX}/cases`, {
     method: 'GET',
-    headers: { authorization: `Bearer ${AAL2}`, 'sec-fetch-site': 'same-origin' }
+    headers: { authorization: `Bearer ${AAL2}`, 'sec-fetch-site': 'same-origin',
+               'x-vercel-forwarded-for': CALLER_IP }
   });
   const response = await handleRequest(request, {
     env: { ...ENV, SUPABASE_SECRET_KEY: 'not-a-key', SUPABASE_SERVICE_ROLE_KEY: '' },
@@ -447,7 +474,8 @@ test('the elevated key fails closed on exactly the same terms', async () => {
 const getWithBody = ({ headers = {}, body = null } = {}) => ({
   method: 'GET',
   url: `${PREFIX}/auth-config`,
-  headers: new Headers({ 'sec-fetch-site': 'same-origin', ...headers }),
+  headers: new Headers({ 'sec-fetch-site': 'same-origin',
+                         'x-vercel-forwarded-for': CALLER_IP, ...headers }),
   body
 });
 
@@ -544,10 +572,14 @@ test('auth-config still proves provenance before it answers', async () => {
   assert.equal(real.status, 200);
 });
 
-test('auth-config touches no database and builds no Auth client', async () => {
-  /* Both injected dependencies throw on any use. A 200 is the proof. */
+test('auth-config reaches the rate limiter and nothing else, and builds no Auth client', async () => {
+  /* The db throws on every call except `check_rate_limit`, and the Auth
+     client factory throws when called at all. A 200 is the proof that the
+     limiter was the only thing touched. */
+  limiterCalls.length = 0;
   const response = await get('/auth-config');
   assert.equal(response.status, 200);
+  assert.equal(limiterCalls.length, 1, 'exactly one limiter pass, and no other query');
 });
 
 /* ============================================================
@@ -637,7 +669,8 @@ test('a verified aal2 account is still refused the queue without an operator row
   };
 
   const response = await handleRequest(new Request(`${PREFIX}/cases`, {
-    method: 'GET', headers: { authorization: `Bearer ${AAL2}`, 'sec-fetch-site': 'same-origin' }
+    method: 'GET', headers: { authorization: `Bearer ${AAL2}`,
+      'sec-fetch-site': 'same-origin', 'x-vercel-forwarded-for': CALLER_IP }
   }), {
     env: ENV, db,
     verifyAccessToken: async () => ({ userId: USER, aal: 'aal2', emailConfirmed: true }),
@@ -662,7 +695,8 @@ test('an aal1 account — enrollment incomplete — is refused too', async () =>
   };
 
   const response = await handleRequest(new Request(`${PREFIX}/cases`, {
-    method: 'GET', headers: { authorization: 'Bearer x.y.z', 'sec-fetch-site': 'same-origin' }
+    method: 'GET', headers: { authorization: 'Bearer x.y.z',
+      'sec-fetch-site': 'same-origin', 'x-vercel-forwarded-for': CALLER_IP }
   }), {
     env: ENV, db,
     verifyAccessToken: async () => ({ userId: USER, aal: 'aal1', emailConfirmed: true }),

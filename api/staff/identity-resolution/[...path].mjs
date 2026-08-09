@@ -40,17 +40,68 @@
    at its own bare path, unconfigured by vercel.json. One route,
    one function, one thing to secure.
 
-   ONE ARGUMENT. handleRequest's second parameter is a dependency
-   -injection seam for the tests. Exporting it directly as the
-   entrypoint would let whatever the platform passes second — now
-   or after a runtime upgrade — arrive where injected dependencies
-   are expected.
+   ============================================================
+   NAMED METHOD EXPORTS, AND WHY A DEFAULT EXPORT WAS A 504.
+
+   Vercel's Node.js runtime offers two invocation contracts, and
+   the export SHAPE is what selects between them:
+
+     export default handler        -> Node signature (req, res)
+     export function GET(request)  -> Web signature (Request)
+
+   This file used to be a DEFAULT export written for the Web
+   signature: it took a `Request` and returned a `Response`. The
+   platform therefore called it with `(req, res)`, and:
+
+     · `req.url` is a PATH, not an absolute URL, so `new URL()`
+       inside handleRequest threw `Invalid URL`;
+     · the generic catch turned that into a 500 `Response`;
+     · that Response was RETURNED, and the return value of a Node
+       -signature handler is discarded;
+     · `res` was never written, never ended, so the invocation ran
+       to the 15-second limit and the platform answered
+       504 FUNCTION_INVOCATION_TIMEOUT with no exception to show
+       for it.
+
+   The old comment here claimed that taking one argument and
+   forwarding one was a SAFETY BOUNDARY protecting handleRequest's
+   dependency-injection seam. That was exactly backwards. The
+   second argument was `res` — the only means of answering — and
+   discarding it is what made every invocation hang. The seam is
+   protected below by not forwarding a second argument, which is
+   true of these named exports as well; it was never the reason
+   the wrapper existed, and it was never worth a 504.
+
+   EVERY STANDARD METHOD IS EXPORTED, deliberately, and this does
+   NOT widen what the application accepts. handleRequest already
+   answers a deterministic `405 method_not_allowed` with an
+   `Allow` header for the methods a path does not serve — POST for
+   /session, GET for /auth-config. A method with no named export
+   is answered by VERCEL with a generic 405 instead, losing the
+   JSON body, the error code and the `Allow` header the console
+   and the contract tests depend on. Forwarding the method so the
+   application can refuse it is what preserves that behaviour.
    ============================================================ */
 
 import { handleRequest } from '../../../server/staff-identity-resolution.mjs';
 
-export default async function handler(request) {
-  return handleRequest(request);
-}
+/* One argument in, one argument forwarded: `handleRequest`'s second
+   parameter is a test-only injection seam and nothing the platform passes may
+   reach it. Written once and reused by every method below, so no export can
+   drift into forwarding something extra. */
+const respond = request => handleRequest(request);
+
+/* The two the console actually uses. */
+export const GET = respond;
+export const POST = respond;
+
+/* Forwarded ONLY so the application's own 405 answers them. Adding an export
+   here does not add a route: handleRequest matches path and method itself,
+   and anything it does not serve gets its deterministic refusal. */
+export const PUT = respond;
+export const PATCH = respond;
+export const DELETE = respond;
+export const OPTIONS = respond;
+export const HEAD = respond;
 
 export const config = { runtime: 'nodejs' };

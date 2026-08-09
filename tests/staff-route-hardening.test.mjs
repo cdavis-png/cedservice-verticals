@@ -44,6 +44,10 @@ const ENV = {
   SUPABASE_URL: 'https://example.supabase.co',
   SUPABASE_ANON_KEY: 'anon-never-real',
   SUPABASE_SERVICE_ROLE_KEY: 'service-never-real',
+  /* Rate limiting FAILS CLOSED on a missing secret, so every staff fixture
+     must configure one or the route answers 503 before the test's own
+     subject is reached. Never a real value. */
+  CED_RATE_LIMIT_SECRET: 'test-rate-limit-secret',
   CED_LOG_LEVEL: 'error'
 };
 
@@ -118,7 +122,7 @@ const ORIGIN = 'https://staff.example.com';
    older clients that send neither. */
 const call = async ({ method = 'GET', path = '/cases', token = 'good', body, rawBody,
                       headers = {}, db, env = ENV, verify, authClient,
-                      origin, fetchSite = 'same-origin' } = {}) => {
+                      origin, fetchSite = 'same-origin', callerIp = ADDRESS } = {}) => {
   /* `undefined` means "whatever a browser would send for this method"; `null`
      means "explicitly none", which is what the absent-Origin tests need. An
      unsafe method really does carry an Origin, so its default is the console's
@@ -131,6 +135,7 @@ const call = async ({ method = 'GET', path = '/cases', token = 'good', body, raw
     headers: {
       ...(token ? { authorization: `Bearer ${token}` } : {}),
       'x-forwarded-proto': 'https',
+      ...(callerIp ? { 'x-vercel-forwarded-for': callerIp } : {}),
       ...(effectiveOrigin ? { origin: effectiveOrigin } : {}),
       ...(fetchSite ? { 'sec-fetch-site': fetchSite } : {}),
       ...((body || rawBody) ? { 'content-type': 'application/json' } : {}),
@@ -231,7 +236,10 @@ test('separate operators and separate addresses are separate buckets', async () 
   const other = '99999999-9999-4999-8999-999999999999';
   const keysFor = async (address, operator) => {
     const db = stubDb();
-    await call({ db, env: LIMITED_ENV, headers: { 'x-real-ip': address },
+    /* `callerIp`, not an x-real-ip header: x-vercel-forwarded-for is resolved
+       FIRST now, so a header set alongside the helper's default would be
+       shadowed and every address would hash identically. */
+    await call({ db, env: LIMITED_ENV, callerIp: address,
       verify: verifier({ userId: operator, aal: 'aal2', emailConfirmed: true }) });
     const authed = db.calls.filter(c => c.name === 'check_rate_limit')[1].args.p_keys;
     return {
@@ -260,7 +268,7 @@ test('a pre-authentication refusal verifies no token and reads nothing', async (
   const request = new Request(
     `https://staff.example.com/api/staff/identity-resolution/cases/${CASE_ID}/link`, {
       method: 'POST',
-      headers: { authorization: 'Bearer good', 'x-forwarded-proto': 'https', origin: ORIGIN,
+      headers: { authorization: 'Bearer good', 'x-forwarded-proto': 'https', 'x-vercel-forwarded-for': '203.0.113.9', origin: ORIGIN,
                  'x-real-ip': ADDRESS, 'content-type': 'application/json' },
       body: JSON.stringify(linkBody())
     });
@@ -482,7 +490,7 @@ test('an oversized body is refused without being buffered', async () => {
   const request = new Request(
     `https://staff.example.com/api/staff/identity-resolution/cases/${CASE_ID}/link`,
     { method: 'POST', body, duplex: 'half',
-      headers: { authorization: 'Bearer good', 'x-forwarded-proto': 'https', origin: ORIGIN,
+      headers: { authorization: 'Bearer good', 'x-forwarded-proto': 'https', 'x-vercel-forwarded-for': '203.0.113.9', origin: ORIGIN,
                  'content-type': 'application/json' } });
 
   const res = await handleRequest(request, {
@@ -506,7 +514,7 @@ test('a declared Content-Length over the limit is refused before the stream open
   const request = new Request(
     `https://staff.example.com/api/staff/identity-resolution/cases/${CASE_ID}/link`,
     { method: 'POST', body, duplex: 'half',
-      headers: { authorization: 'Bearer good', 'x-forwarded-proto': 'https', origin: ORIGIN,
+      headers: { authorization: 'Bearer good', 'x-forwarded-proto': 'https', 'x-vercel-forwarded-for': '203.0.113.9', origin: ORIGIN,
                  'content-type': 'application/json', 'content-length': '900000' } });
 
   const res = await handleRequest(request, {
@@ -813,7 +821,7 @@ test('provenance is checked before the rate limiter, so a flood cannot be launde
 
 test('HTTPS is still checked before the origin, so an http request says so', async () => {
   const request = new Request('http://staff.example.com/api/staff/identity-resolution/cases', {
-    headers: { 'x-forwarded-proto': 'http', origin: 'https://evil.example' }
+    headers: { 'x-forwarded-proto': 'http', 'x-vercel-forwarded-for': '203.0.113.9', origin: 'https://evil.example' }
   });
   const res = await handleRequest(request, { env: ENV, db: stubDb() });
   assert.equal(res.status, 403);
@@ -917,6 +925,7 @@ test('a misconfigured browser key makes sign-in unavailable rather than elevated
   const env = {
     CED_LOG_LEVEL: 'error',
     SUPABASE_URL: 'https://example.supabase.co',
+    CED_RATE_LIMIT_SECRET: 'test-rate-limit-secret',
     SUPABASE_PUBLISHABLE_KEY: 'sb_secret_pasted_in_the_wrong_box',
     SUPABASE_SECRET_KEY: 'sb_secret_pasted_in_the_wrong_box'
   };
@@ -935,6 +944,7 @@ test('paging past the last row reports the real total, not zero', async () => {
   const db = {
     calls: [],
     async rpc(name, args) {
+      if (name === 'check_rate_limit') return { data: { allowed: true }, error: null };
       if (name === 'staff_operator_guard') return { data: 'owner', error: null };
       asked.push({ limit: args.p_limit, offset: args.p_offset });
       if (args.p_offset > 0) return { data: [], error: null };
@@ -962,6 +972,9 @@ test('a first page that is empty asks for nothing extra', async () => {
   const asked = [];
   const db = {
     async rpc(name, args) {
+      /* The limiter runs before the guard now and must not be mistaken for a
+         queue page — without this it would record a bogus offset. */
+      if (name === 'check_rate_limit') return { data: { allowed: true }, error: null };
       if (name === 'staff_operator_guard') return { data: 'owner', error: null };
       asked.push(args.p_offset);
       return { data: [], error: null };

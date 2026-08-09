@@ -44,6 +44,14 @@ import { handleRequest } from '../../server/staff-identity-resolution.mjs';
 import { __testing as buildTesting } from '../../tools/build-static.mjs';
 import { PUBLISHABLE_FIXTURE, SECRET_FIXTURE } from '../helpers/supabase-keys.mjs';
 
+/* Vercel's edge stamps a caller identifier on every request; these fixtures
+   stand where the edge would, so they add one. Without it the staff limiter
+   fails closed — correctly — and no test here would reach its own subject.
+   TEST-NET-3 (RFC 5737), reserved for documentation. */
+const EDGE_CALLER_IP = '203.0.113.9';
+
+const withCallerIp = headers => ({ ...headers, 'x-vercel-forwarded-for': EDGE_CALLER_IP });
+
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const PAGE = '/staff/identity-resolution/accept-invite.html';
 
@@ -262,6 +270,11 @@ const startCedServer = auth => new Promise(res => {
 
   const env = {
     CED_ALLOW_INSECURE_STAFF: 'true',
+    /* Rate limiting fails closed without a secret. No forwarding header is
+       sent by a browser talking straight to a loopback server, so no bucket
+       key is derived and the limiter passes through without a database — the
+       throwing db proxy below stays untouched, which is the point. */
+    CED_RATE_LIMIT_SECRET: 'test-rate-limit-secret',
     CED_LOG_LEVEL: 'debug',
     SUPABASE_URL: auth.origin,
     SUPABASE_PUBLISHABLE_KEY: PUBLISHABLE,
@@ -269,9 +282,21 @@ const startCedServer = auth => new Promise(res => {
   };
 
   /* Throws on any access: onboarding must not reach a database. */
-  const db = new Proxy({}, {
-    get(_t, prop) { throw new Error(`the database was reached: ${String(prop)}`); }
-  });
+  /* THE LIMITER IS THE ONLY DATABASE CALL THESE PAGES MAY CAUSE.
+
+     Rate limiting fails closed, so every request needs a `check_rate_limit`
+     round trip. That is infrastructure, not a privileged read. Every other
+     rpc and every table read throws, which is what keeps "onboarding touches
+     no privileged data" a property of the code rather than of the fixture. */
+  const db = {
+    async rpc(name) {
+      if (name !== 'check_rate_limit') {
+        throw new Error(`the database was reached: rpc(${String(name)})`);
+      }
+      return { data: { allowed: true }, error: null };
+    },
+    from(table) { throw new Error(`the database was reached: from(${String(table)})`); }
+  };
 
   const logs = [];
   const server = createServer(async (req, resp) => {
@@ -295,7 +320,7 @@ const startCedServer = auth => new Promise(res => {
       let answer;
       try {
         answer = await handleRequest(new Request(url.href, {
-          method: req.method, headers: req.headers, ...(body.length ? { body } : {})
+          method: req.method, headers: withCallerIp(req.headers), ...(body.length ? { body } : {})
         }), { env, db, correlationId: 'browser-invite-test' });
       } finally {
         console.log = original.log; console.warn = original.warn; console.error = original.error;
@@ -748,9 +773,9 @@ it('a completed enrollment is still refused the queue', async () => {
       from() { throw new Error('no table read before the guard passes'); }
     };
     const answer = await handleRequest(new Request(url.href, {
-      method: req.method, headers: req.headers
+      method: req.method, headers: withCallerIp(req.headers)
     }), {
-      env: { CED_ALLOW_INSECURE_STAFF: 'true', CED_LOG_LEVEL: 'error' },
+      env: { CED_ALLOW_INSECURE_STAFF: 'true', CED_RATE_LIMIT_SECRET: 'test-rate-limit-secret', CED_LOG_LEVEL: 'error' },
       db,
       verifyAccessToken: async () => ({ userId: USER, aal: 'aal2', emailConfirmed: true }),
       correlationId: 'browser-invite-test'

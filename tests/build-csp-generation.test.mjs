@@ -48,6 +48,17 @@ const { GENERATED_FILES, CSP_SOURCE_LINE, cspLineFor, resolveSupabaseOrigin } = 
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
+/* Rate limiting fails closed, so /auth-config now needs a caller identifier
+   and a limiter round trip. This answers that one call. */
+const CALLER_IP = '203.0.113.9';
+const limiterDb = {
+  async rpc(name) {
+    if (name === 'check_rate_limit') return { data: { allowed: true }, error: null };
+    return { data: null, error: null };
+  },
+  from() { return { select() { return this; }, eq() { return { data: [] }; } }; }
+};
+
 /* Two real project origins, deliberately different, standing in for Preview
    and Production. The first is this project's actual development project —
    used as an EXAMPLE of the shape, never as a default anything falls back
@@ -152,12 +163,13 @@ test('the loopback exception needs the switch, a loopback host and non-productio
 
   const call = (env, host = 'localhost') => handleRequest(
     new Request(`http://${host}/api/staff/identity-resolution/auth-config`, {
-      method: 'GET', headers: { 'sec-fetch-site': 'same-origin' }
-    }), { env, correlationId: 'csp-test' });
+      method: 'GET', headers: { 'sec-fetch-site': 'same-origin',
+                  'x-vercel-forwarded-for': CALLER_IP }
+    }), { env, db: limiterDb, correlationId: 'csp-test' });
 
   /* All three present: accepted. */
   const ok = await call({
-    SUPABASE_URL: local, SUPABASE_PUBLISHABLE_KEY: key,
+    SUPABASE_URL: local, SUPABASE_PUBLISHABLE_KEY: key, CED_RATE_LIMIT_SECRET: 'test-rate-limit-secret',
     CED_ALLOW_INSECURE_STAFF: 'true', CED_LOG_LEVEL: 'error'
   });
   assert.equal(ok.status, 200);
@@ -165,13 +177,13 @@ test('the loopback exception needs the switch, a loopback host and non-productio
 
   /* Switch off: refused, and the request is refused for being http anyway. */
   const noSwitch = await call({
-    SUPABASE_URL: local, SUPABASE_PUBLISHABLE_KEY: key, CED_LOG_LEVEL: 'error'
+    SUPABASE_URL: local, SUPABASE_PUBLISHABLE_KEY: key, CED_RATE_LIMIT_SECRET: 'test-rate-limit-secret', CED_LOG_LEVEL: 'error'
   });
   assert.notEqual(noSwitch.status, 200);
 
   /* NODE_ENV=production: refused even with the switch and a loopback host. */
   const production = await call({
-    SUPABASE_URL: local, SUPABASE_PUBLISHABLE_KEY: key,
+    SUPABASE_URL: local, SUPABASE_PUBLISHABLE_KEY: key, CED_RATE_LIMIT_SECRET: 'test-rate-limit-secret',
     CED_ALLOW_INSECURE_STAFF: 'true', NODE_ENV: 'production', CED_LOG_LEVEL: 'error'
   });
   assert.notEqual(production.status, 200);
@@ -179,12 +191,14 @@ test('the loopback exception needs the switch, a loopback host and non-productio
   /* A real deployment host: the switch cannot reach the exception. */
   const deployed = await handleRequest(
     new Request('https://staff.example.com/api/staff/identity-resolution/auth-config', {
-      method: 'GET', headers: { 'sec-fetch-site': 'same-origin' }
+      method: 'GET', headers: { 'sec-fetch-site': 'same-origin',
+                  'x-vercel-forwarded-for': CALLER_IP }
     }), {
       env: {
-        SUPABASE_URL: local, SUPABASE_PUBLISHABLE_KEY: key,
+        SUPABASE_URL: local, SUPABASE_PUBLISHABLE_KEY: key, CED_RATE_LIMIT_SECRET: 'test-rate-limit-secret',
         CED_ALLOW_INSECURE_STAFF: 'true', CED_LOG_LEVEL: 'error'
       },
+      db: limiterDb,
       correlationId: 'csp-test'
     });
   assert.equal(deployed.status, 503);
@@ -200,10 +214,12 @@ test('auth-config refuses exactly what the build refuses', async () => {
                        'sb_secret_abcdefghijk', 'http://qkpptajglstgucadhfwq.supabase.co']) {
     const response = await handleRequest(
       new Request('https://staff.example.com/api/staff/identity-resolution/auth-config', {
-        method: 'GET', headers: { 'sec-fetch-site': 'same-origin' }
+        method: 'GET', headers: { 'sec-fetch-site': 'same-origin',
+                  'x-vercel-forwarded-for': CALLER_IP }
       }), {
-        env: { SUPABASE_URL: value, SUPABASE_PUBLISHABLE_KEY: PUBLISHABLE_FIXTURE,
+        env: { SUPABASE_URL: value, SUPABASE_PUBLISHABLE_KEY: PUBLISHABLE_FIXTURE, CED_RATE_LIMIT_SECRET: 'test-rate-limit-secret',
                CED_LOG_LEVEL: 'error' },
+        db: limiterDb,
         correlationId: 'csp-test'
       });
     assert.equal(response.status, 503, value);
@@ -217,16 +233,19 @@ test('auth-config refuses exactly what the build refuses', async () => {
 test('auth-config returns only the origin and a publishable key, and is never cached', async () => {
   const response = await handleRequest(
     new Request('https://staff.example.com/api/staff/identity-resolution/auth-config', {
-      method: 'GET', headers: { 'sec-fetch-site': 'same-origin' }
+      method: 'GET', headers: { 'sec-fetch-site': 'same-origin',
+                  'x-vercel-forwarded-for': CALLER_IP }
     }), {
       env: {
         SUPABASE_URL: `${DEVELOPMENT}/`,
         SUPABASE_PUBLISHABLE_KEY: PUBLISHABLE_FIXTURE,
+        CED_RATE_LIMIT_SECRET: 'test-rate-limit-secret',
         SUPABASE_SECRET_KEY: SECRET_FIXTURE,
         CED_RATE_LIMIT_SECRET: 'never-this-either',
         CED_CONTINUATION_SECRET: 'nor-this',
         CED_LOG_LEVEL: 'error'
       },
+      db: limiterDb,
       correlationId: 'csp-test'
     });
 

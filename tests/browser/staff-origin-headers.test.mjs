@@ -68,6 +68,14 @@ import { dirname, resolve, extname, normalize, sep } from 'node:path';
 
 import { handleRequest } from '../../server/staff-identity-resolution.mjs';
 
+/* Vercel's edge stamps a caller identifier on every request; these fixtures
+   stand where the edge would, so they add one. Without it the staff limiter
+   fails closed — correctly — and no test here would reach its own subject.
+   TEST-NET-3 (RFC 5737), reserved for documentation. */
+const EDGE_CALLER_IP = '203.0.113.9';
+
+const withCallerIp = headers => ({ ...headers, 'x-vercel-forwarded-for': EDGE_CALLER_IP });
+
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const PAGE = '/staff/identity-resolution/index.html';
 
@@ -220,7 +228,7 @@ const startStaffServer = () => new Promise(res => {
 
       const request = new Request(url.href, {
         method: req.method,
-        headers: req.headers,
+        headers: withCallerIp(req.headers),
         ...(body.length ? { body } : {})
       });
 
@@ -230,6 +238,7 @@ const startStaffServer = () => new Promise(res => {
              plain http by a browser suite. Loopback-only and refused under
              NODE_ENV=production, both enforced by the route itself. */
           CED_ALLOW_INSECURE_STAFF: 'true',
+          CED_RATE_LIMIT_SECRET: 'test-rate-limit-secret',
           CED_LOG_LEVEL: 'error'
         },
         db,
