@@ -188,7 +188,8 @@ test('clean installation of the whole chain', async t => {
       const before = await snapshotSchema(CLEAN.pg);
       const again = await CLEAN.upgrade('0005');
       assert.deepEqual(again.map(a => a.file),
-        ['0006_service_mix_review.sql', '0007_staff_identity_resolution.sql']);
+        ['0006_service_mix_review.sql', '0007_staff_identity_resolution.sql',
+         '0008_staff_migration_hardening.sql']);
 
       const after = await snapshotSchema(CLEAN.pg);
       assert.deepEqual(after, before, 'a rerun must be a no-op, not a second set of objects');
