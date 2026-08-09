@@ -311,13 +311,14 @@ assessments then log locally and nothing is sent.
 ## 10. Known limitations
 
 1. ~~**The SQL is unverified at runtime.** It has never been executed.~~
-   *Historical, superseded.* Migrations **0001–0007** are present on Supabase
-   PostgreSQL 17.6.1.155, and 0006–0008 run against a disposable local
-   PostgreSQL 18.3 through PGlite. The remaining gap is narrower and still
-   real: **no deployed definition has been compared against its committed
-   file**, nothing has been successfully called through PostgREST, and 0008 has
-   been applied nowhere. See
-   [REAL_POSTGRES_VALIDATION.md](REAL_POSTGRES_VALIDATION.md) run 14, which is
+   *Historical, superseded.* Migrations **0001–0008** are applied and recorded
+   on Supabase PostgreSQL 17.6.1.155, 0008 at ledger version `20260809173146`
+   with its verification passed, and 0006–0008 also run against a disposable
+   local PostgreSQL 18.3 through PGlite. The remaining gap is narrower and
+   still real: **only one deployed definition has been compared against its
+   committed file**, and nothing has been successfully called through
+   PostgREST. See
+   [REAL_POSTGRES_VALIDATION.md](REAL_POSTGRES_VALIDATION.md) run 16, which is
    the one place execution status is stated.
 2. **No manual identity-resolution surface.** `identity_resolution_cases` rows
    accumulate with nothing to work them. Ambiguous submissions are stored safely

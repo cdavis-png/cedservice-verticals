@@ -5,16 +5,19 @@ Manual steps to connect the Milestone 1 implementation to a real project.
 > **This document once opened "none of this has been done yet — no project
 > exists".** That is wrong and has been for some time. A persistent hosted
 > **development** project exists — `qkpptajglstgucadhfwq`, PostgreSQL
-> 17.6.1.155 — and it holds migrations **0001 through 0007**, recorded in
-> `supabase_migrations.schema_migrations`. A read-only preflight has since
-> verified the migration history, the deployed supersession function, and the
-> two ACL findings 0008 addresses; see runs 14 and 15 in
+> 17.6.1.155 — and its `supabase_migrations.schema_migrations` records
+> migrations **0001 through 0008**.
+>
+> 0008 was applied on 2026-08-09 through the tracked `apply_migration`
+> operation, at ledger version `20260809173146`, and its post-application
+> verification passed in full. A read-only preflight confirmed all three of its
+> findings on the real database first. See runs 14, 15 and 16 in
 > [REAL_POSTGRES_VALIDATION.md](REAL_POSTGRES_VALIDATION.md).
 >
-> Nothing is deployed for public traffic, no production project exists,
-> migration **0008 has been applied nowhere**, and **no elevated credential is
-> configured on any Vercel environment** — which is why protected staff
-> operations are unavailable regardless of what the database holds.
+> Nothing is deployed for public traffic, no production project exists, and
+> **no elevated credential is configured on any Vercel environment** — which is
+> why protected staff operations are unavailable regardless of what the
+> database holds. The schema is ready; the deployment is not.
 
 ---
 
@@ -101,19 +104,32 @@ than one that stopped cleanly.
 > one. Both prohibitions are listed in full in §2b and apply to every project,
 > not only the existing one.
 
-### 2b. The existing development project — applying 0008
+### 2b. The existing development project — 0008 is applied
 
-**Only 0008 remains.**
+> **DONE. Nothing in this section needs running against
+> `qkpptajglstgucadhfwq` again.** Migration `0008_staff_migration_hardening`
+> was applied through the tracked `apply_migration` operation and recorded at
+> ledger version **`20260809173146`**, from blob
+> `f992a3a85c40abf429d7d346de09fb0ad9102f19` (commit `6939887`). The hosted
+> ledger records migrations **through 0008**, and the post-application
+> verification passed in full — see
+> [REAL_POSTGRES_VALIDATION.md run 16](REAL_POSTGRES_VALIDATION.md).
+>
+> The rest of §2b is **retained as the worked procedure**, because it is the
+> pattern the next migration follows and because the preflight it describes is
+> the evidence that made applying 0008 a repair rather than a guess. Read the
+> preflight table as the *before* state. Do not re-run the apply step.
 
-Migration 0008 is forward-only. It repairs three defects in 0006 — F3 trigger
-coverage, F6 a `service_role` grant, F7 two unpinned `search_path`s — and edits
-no earlier file. The rule behind that is in
+**What was applied.** Migration 0008 is forward-only. It repairs three defects
+in 0006 — F3 trigger coverage, F6 a `service_role` grant, F7 two unpinned
+`search_path`s — and edits no earlier file. The rule behind that is in
 [CLAUDE.md §14](../CLAUDE.md): applied history is never rewritten.
 
-#### What the preflight established
+#### What the preflight established *(the "before" state)*
 
-A hosted preflight has now been run, read-only. It replaces the uncertainty
-this section previously described:
+A read-only hosted preflight was run first. It replaced the uncertainty this
+section previously described, and every finding in it was subsequently
+**confirmed fixed** by the post-application verification:
 
 | Question | Answer |
 |---|---|
@@ -147,17 +163,19 @@ precaution.** `service_role` genuinely holds EXECUTE on all twelve, because a
 Supabase project's default privileges grant it directly and 0006 revoked only
 from `public, anon, authenticated`. Do not narrow 0008's revoke list.
 
-#### Applying it
+#### Applying it — the procedure that was followed, and the one to reuse
 
-**The mechanism is named, not left to judgement.** 0008 will be applied through
+**The mechanism is named, not left to judgement.** 0008 **was** applied through
 the connected Supabase **MCP `apply_migration`** operation, with exactly these
-inputs:
+inputs. The same shape applies to the next migration; substitute its name and
+file.
 
-| Input | Value |
+| Input | Value used for 0008 |
 |---|---|
 | Project | `qkpptajglstgucadhfwq` |
 | Migration name | `0008_staff_migration_hardening` |
-| Query | the exact UTF-8 contents of `supabase/migrations/0008_staff_migration_hardening.sql`, **from the approved commit** |
+| Query | the exact UTF-8 contents of `supabase/migrations/0008_staff_migration_hardening.sql`, **from the approved commit** — blob `f992a3a85c40abf429d7d346de09fb0ad9102f19`, commit `6939887` |
+| Recorded as | ledger version **`20260809173146`** |
 
 That single operation applies the DDL **and** records the migration in
 `supabase_migrations.schema_migrations`. Both halves happen together, which is
@@ -204,9 +222,12 @@ select has_function_privilege('service_role',
 -- expect true — that IS the defect, and the preflight observed it
 ```
 
-**Then apply `0008_staff_migration_hardening.sql`.**
+**Then apply `0008_staff_migration_hardening.sql`.** *(Done — ledger version
+`20260809173146`.)*
 
-**Verify. Every one of these is a catalog fact, not an opinion.**
+**Verify. Every one of these is a catalog fact, not an opinion.** All of them
+were run immediately after the application and all passed; the expected results
+below are what was observed.
 
 ```sql
 -- it is recorded, not merely applied
@@ -214,6 +235,7 @@ select version, name from supabase_migrations.schema_migrations order by version
 -- expect a row for 0008 after the two the preflight found:
 --   20260808200326 / 0006_service_mix_review
 --   20260808201535 / 0007_staff_identity_resolution
+--   20260809173146 / 0008_staff_migration_hardening   ← observed
 ```
 
 ```sql
@@ -255,14 +277,45 @@ select proname from pg_proc
 -- expect zero rows
 ```
 
-**A behavioural check, because a grant is not a guarantee.** Ingest
-one Growth submission through `ingest_assessment` and confirm it succeeds.
-0008 revoked `identity_proposal_conflict`, `identity_value_acceptable` and
+**What was observed, in full.** Every check above passed:
+
+| Check | Result |
+|---|---|
+| Ledger | records through 0008 at `20260809173146` |
+| F3 | `bir_supersession_scope` is an **enabled, row-level `BEFORE INSERT OR UPDATE`** trigger |
+| F6 | all 16 internal functions exist; none exposes unexpected EXECUTE to `PUBLIC`, `anon`, `authenticated` or `service_role` |
+| F7 | both helpers carry pinned search paths |
+| Security advisor | the two mutable-search-path warnings are **gone** |
+| Performance advisor | **unchanged** — 0008 adds no index, column or plan-visible object |
+| Data | 12 Business Records, 16 submissions, 16 BIRs, 3 cases, 3 supersession chains — all intact |
+| Integrity | zero broken predecessors, zero cross-business violations, zero cross-review-type violations |
+
+**Behavioural checks, because a catalog entry is not a behaviour.** Run inside
+a transaction and rolled back, so the database takes **zero persistent test
+writes**:
+
+| Case | Result |
+|---|---|
+| A valid update to a chained report | **allowed** |
+| Moving a chained report to another business | **rejected** |
+| Changing a chained report's review type | **rejected** |
+| An invalid predecessor | **rejected** |
+| An unknown predecessor | **rejected** |
+
+**Still worth doing when a credential exists.** Ingest one Growth submission
+through `ingest_assessment` and confirm it succeeds. 0008 revoked
+`identity_proposal_conflict`, `identity_value_acceptable` and
 `identity_evidence_fault` from every role, and ingestion calls all three from
-inside a SECURITY DEFINER function. If that revoke were wrong, this is where it
-shows.
+inside a SECURITY DEFINER function — so this is where a wrong revoke would
+show. It has **not** been run against the hosted project, because no elevated
+credential is configured on any Vercel environment; the local suite covers the
+same path against PGlite.
 
 #### If something goes wrong
+
+*(Not exercised for 0008 — the application and verification both passed. This
+is the standing procedure for the next migration, and for 0008 itself should a
+later problem surface.)*
 
 **There is no rollback step, and the blanket one this section used to carry was
 unsafe.** It said to "`grant execute` the sixteen internal functions back to
@@ -331,11 +384,17 @@ Two constraints on what 0009 may contain:
   evidence, and the four 0007 functions above are the standing example of
   grants that were correctly absent all along.
 
-**What 0008 has not had.** It has never been applied to any database. It is
-tested against a disposable PostgreSQL 18.3 through PGlite by
-`tests/migration/0008-migration-hardening.test.mjs`, which observes all three
-defects present before applying it and gone afterwards. It has not run on
-PostgreSQL 17, on hosted Supabase, or through PostgREST.
+**What 0008 has now had.** It is applied and recorded on the hosted
+development project (PostgreSQL 17.6.1.155), verified against the catalog, the
+security advisor and the data, and exercised behaviourally inside a rolled-back
+transaction. It is also tested against a disposable PostgreSQL 18.3 through
+PGlite by `tests/migration/0008-migration-hardening.test.mjs`, which observes
+all three defects present before applying it and gone afterwards.
+
+**What it still has not had.** Nothing in this repository has been
+successfully *called* through PostgREST, so the schema 0008 hardened has never
+been reached by application code. That needs an elevated credential on a Vercel
+environment, which is a separate phase.
 
 ### Verify
 
@@ -368,13 +427,14 @@ PostgREST call will be ambiguous.
 *Historical, superseded:* this section once read "the SQL has never been
 executed", which was true when it was written and is not now.
 
-**Current status.** Migrations **0001–0007** are applied and recorded on the
-hosted development project (Supabase PostgreSQL 17.6.1.155), and 0006 and 0007
-have additionally been executed against a disposable local PostgreSQL 18.3
-through PGlite. **0008 has been applied nowhere.** `GET /auth-config` is hosted
-and answers HTTP 200; no privileged RPC has been called, because no elevated
-credential is configured on any Vercel environment. See
-[REAL_POSTGRES_VALIDATION.md](REAL_POSTGRES_VALIDATION.md) runs 14 and 15,
+**Current status.** Migrations **0001–0008** are applied and recorded on the
+hosted development project (Supabase PostgreSQL 17.6.1.155), 0008 at ledger
+version `20260809173146` with its post-application verification passed. 0006,
+0007 and 0008 have additionally been executed against a disposable local
+PostgreSQL 18.3 through PGlite. `GET /auth-config` is hosted and answers HTTP
+200; no privileged RPC has been called, because no elevated credential is
+configured on any Vercel environment. See
+[REAL_POSTGRES_VALIDATION.md](REAL_POSTGRES_VALIDATION.md) runs 14, 15 and 16,
 which are the one place this is stated.
 
 Executing the SQL is still not the same as smoke-testing this project. Do not

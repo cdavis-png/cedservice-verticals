@@ -172,7 +172,8 @@ against its committed file, and nothing has been *executed* there. Nothing has
 been successfully *called* over PostgREST — the probes were permission
 refusals — so section M of the integration suite still has not run there, and
 neither have the staff route's five RPCs or its two direct table reads.
-Migration **0008 exists, is tested, and has been applied nowhere**; it is
+Migration **0008 is applied and verified** on that project — ledger version
+`20260809173146`, so the hosted ledger records **0001 through 0008**. It is
 forward-only and repairs three defects in 0006 (see section 14). Beyond the
 database: the application is not deployed for public traffic; no challenge
 provider has been chosen; and nothing yet reports how many visitors open or
@@ -629,9 +630,9 @@ local PostgreSQL 18.3 through PGlite. What remains unverified is what the
 hosted definitions actually *are*, and no analytics function has ever been
 successfully **called** through PostgREST — the probes distinguished
 "permission denied" from "not found" and nothing more. Migration 0008 is
-written and tested and has been applied nowhere. The single record of what has
-and has not executed is
-[docs/REAL_POSTGRES_VALIDATION.md](docs/REAL_POSTGRES_VALIDATION.md), run 14.
+applied and verified there, at ledger version `20260809173146`. The single
+record of what has and has not executed is
+[docs/REAL_POSTGRES_VALIDATION.md](docs/REAL_POSTGRES_VALIDATION.md), run 16.
 
 The analytics consent policy is **pending professional review** and no
 compliance claim is made anywhere. There is no signed session token, so the
@@ -892,9 +893,13 @@ Stated precisely, because everything below is still owed:
   direct table reads. Local mode reaches them as the database owner, so the
   `service_role` grants they depend on have not been exercised as
   `service_role`.
-- **Migration 0008.** Forward-only, repairs F3, F6 and F7 in 0006, tested
-  against 18.3 through PGlite with every defect observed before and after —
-  and **applied nowhere**. Section 14 states what applying it will require.
+- **Migration 0008 is no longer on this list.** It is applied, recorded at
+  ledger version `20260809173146`, and verified — trigger coverage, all 16
+  internal functions' privileges, both pinned search paths, the two
+  security-advisor warnings gone, data intact, and the rule exercised
+  behaviourally inside a rolled-back transaction. Run 16. What that does *not*
+  establish is that any application code has reached the hardened schema; see
+  the PostgREST entry above.
 - **True multi-connection concurrency.** PGlite is a single connection. The
   *mechanism* that decides a race is proven — a unique index, a `for update`
   on the case, a ledger recheck after the lock — but the race itself has never
@@ -1091,9 +1096,11 @@ already hosted stays:
 
 ### Applying a migration must also RECORD it
 
-`supabase_migrations.schema_migrations` records 0001–0007. A migration applied
-without a history row leaves the two disagreeing, and nothing downstream can
-then tell an unrecorded migration from an unapplied one.
+`supabase_migrations.schema_migrations` records **0001–0008**, 0008 at version
+`20260809173146`. A migration applied without a history row leaves the two
+disagreeing, and nothing downstream can then tell an unrecorded migration from
+an unapplied one. 0008 is the worked example of doing it right: one
+`apply_migration` call wrote the DDL and the ledger row together.
 
 - **Do not paste a migration into the SQL editor.** It applies the DDL and
   records nothing. Earlier guidance in this repository said to do exactly
@@ -1130,7 +1137,9 @@ repository actually carried:
   including four from 0007 that were correctly blocked *before* 0008 ran —
   leaving the database less safe than before the attempt.
 
-0008 is committed, tested, and **applied nowhere**.
+**0008 is applied, recorded and verified** on the hosted development project —
+ledger version `20260809173146`, run 16. The recovery procedure above was not
+needed and is retained for the next migration.
 
 ### One elevated key, one selector
 

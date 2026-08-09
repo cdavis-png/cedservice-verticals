@@ -402,7 +402,11 @@ they carry no offering names and no prices.
 - Nothing has been successfully **called** over PostgREST, so signature
   resolution by argument name over HTTP remains unproven.
 - Migration **0008** repairs three defects in 0006 — forward-only, editing
-  nothing here — and has been applied nowhere.
+  nothing here — and **is applied, recorded and verified** on the hosted
+  development project at ledger version `20260809173146`. The supersession
+  scope rule 0006 introduced is now enforced on UPDATE as well as INSERT, and
+  that was exercised against real data on PostgreSQL 17. See
+  [REAL_POSTGRES_VALIDATION.md](REAL_POSTGRES_VALIDATION.md) run 16.
 
 1. `review_type text not null default 'growth_review'` on
    `assessment_submissions`, `assessment_sessions`,

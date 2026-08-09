@@ -25,6 +25,14 @@ closed. Everything below was observed, not predicted.
 > all three of 0008's findings are confirmed against the real database. What
 > is still open: nothing has been *executed* there, and only the one function
 > has been diffed.
+>
+> **Run 16 then applied 0008** through the tracked `apply_migration` operation
+> — ledger version `20260809173146` — and verified it: the trigger now covers
+> UPDATE, no internal function is reachable by `service_role`, both helpers are
+> pinned, the two security-advisor warnings are gone, all data is intact, and
+> the rule was exercised behaviourally inside a rolled-back transaction. **The
+> hosted ledger records through 0008.** Runs 14 and 15 are the before; run 16
+> is the current state.
 
 ## Runs
 
@@ -606,7 +614,8 @@ omission somebody rediscovers.
   one path and a shrug on another, and that inconsistency is the kind that
   gets resolved in the wrong direction later.
 
-Neither was touched by 0008 or by the source reconciliation that followed it.
+Neither was touched by 0008, by the source reconciliation that followed it, or
+by its application in run 16. **Both remain deferred**, on the same reasoning.
 
 ### Verification
 
@@ -619,13 +628,127 @@ privileges a real Supabase project carries, so the pre-existing assertion in
 these" was passing **against an absence**. The new test grants the privilege
 explicitly first, so the revoke has something real to remove.
 
-**0008 has not been applied anywhere.** It is committed, tested against
-PostgreSQL 18.3 through PGlite, and unapplied — on the hosted development
-project and everywhere else.
+**0008 has since been applied and verified — see
+[run 16](#run-16--0008-applied-and-verified-on-the-hosted-project).** The
+sentence that stood here, "0008 has not been applied anywhere", was true when
+run 14 was written and is not now.
 
 ---
 
-## Run 15 — the hosted preflight for 0008
+## Run 16 — 0008 applied and verified on the hosted project
+
+**The migration is applied, recorded, and verified.** This is the first time
+any migration in this repository has been applied to a hosted database by this
+project's own tracked procedure, with the verification run immediately
+afterwards rather than promised.
+
+| | Run 16 |
+|---|---|
+| Date | 2026-08-09 |
+| Project | `qkpptajglstgucadhfwq` — the persistent hosted **development** project |
+| Postgres | 17.6.1.155 |
+| Migration | `0008_staff_migration_hardening` |
+| Source blob | `f992a3a85c40abf429d7d346de09fb0ad9102f19`, from commit `6939887836aaa2aa3e18cfdcacb5b3319f5bd98b` |
+| Mechanism | The tracked `apply_migration` operation — DDL and history row in one call |
+| Ledger version | **`20260809173146`** |
+| Authorization | Explicit, immediately before the operation, naming the project ref, migration name and source commit |
+| Result | **Applied, recorded, and verified. No rollback, no repair, no manual history row.** |
+
+The hosted ledger now records migrations **through 0008**.
+
+### What the post-application verification found
+
+Every item below was checked after the migration ran.
+
+**Migration ledger.** `supabase_migrations.schema_migrations` records the chain
+through 0008 at version `20260809173146`. The row was written by
+`apply_migration` itself; nothing was inserted by hand.
+
+**F3 — trigger coverage.** `bir_supersession_scope` is an **enabled,
+row-level `BEFORE INSERT OR UPDATE`** trigger. The `BEFORE INSERT`-only
+definition run 15 observed is gone.
+
+**F6 — internal function privileges.** All **16** internal functions exist, and
+none exposes unexpected EXECUTE to `PUBLIC`, `anon`, `authenticated` or
+`service_role`. The twelve that genuinely held a `service_role` grant from
+Supabase's default privileges no longer do; the four from 0007 that were
+already correctly blocked are unchanged, which is the outcome the retracted
+blanket-rollback paragraph would have destroyed.
+
+**F7 — pinned search paths.** Both helper functions —
+`identity_value_acceptable` and `identity_evidence_fault` — carry pinned search
+paths, and **the two mutable-search-path warnings from Supabase's security
+advisor are gone.** An independent instrument agreeing that the finding is
+closed is worth more than reading the catalog back.
+
+**Performance advisor.** Results **unchanged**. 0008 adds no index, no column
+and no plan-visible object, so an unchanged performance profile is the expected
+result and is recorded because "we did not check" and "nothing changed" look
+identical in a report that omits it.
+
+**Data integrity — nothing moved.**
+
+| | Before (run 15) | After |
+|---|---|---|
+| Business Records | 12 | **12** |
+| Submissions | 16 | **16** |
+| BIRs | 16 | **16** |
+| Identity-resolution cases | 3 | **3** |
+| Supersession chains | 3 | **3** |
+
+Zero broken predecessors, zero cross-business violations, zero
+cross-review-type violations — the same three zeros run 15 recorded, now
+re-confirmed with the stricter trigger in force.
+
+### Behavioural testing, inside a transaction, with nothing left behind
+
+The catalog says what the trigger *is*. This says what it *does*. Every case
+ran inside a transaction that was rolled back, so the hosted database took
+**zero persistent test writes** — the counts above are unchanged precisely
+because of that.
+
+| Case | Result |
+|---|---|
+| A valid update to a chained report | **allowed** |
+| Moving a chained report to another business | **rejected** |
+| Changing a chained report's review type | **rejected** |
+| Pointing at an invalid predecessor | **rejected** |
+| Pointing at an unknown predecessor | **rejected** |
+
+This is the first time F3's rule has been exercised against real data on
+PostgreSQL 17. Until now it had only ever run on PGlite 18.3 against fixtures.
+
+### What run 16 still does NOT establish
+
+- **PostgREST execution.** Still nothing. No RPC has been called through it,
+  and the staff route's five functions and two direct table reads remain
+  unexercised as `service_role`. The verification above is catalog and SQL, not
+  the transport the application uses.
+- **The rest of the deployed definitions.** Run 15 compared
+  `enforce_bir_supersession_scope()` against its committed source, and 0008 has
+  now replaced that one. Every other function in 0006 and 0007 is still
+  undiffed against the repository.
+- **True multi-connection concurrency.** Unchanged from run 6. The mechanism
+  that decides a race is proven; the race has still never been run.
+- **Real Supabase Auth, TOTP, invitations and recovery.** Unchanged from runs
+  6, 10, 11 and 12 — all still fixtures.
+- **Vercel.** Unchanged from run 13. No elevated credential is configured on
+  any environment, so no application code has yet reached this schema. Preview
+  configuration and hosted end-to-end testing are a separate, separately
+  authorized phase.
+
+---
+
+## Run 15 — the hosted preflight for 0008 *(superseded by run 16 — retained as the evidence that justified applying it)*
+
+> **Superseded by [run 16](#run-16--0008-applied-and-verified-on-the-hosted-project).**
+> Everything below was true of the database *before* 0008 was applied, and it
+> is retained deliberately: it is the record of the three defects being
+> confirmed present on the real database, which is what made applying 0008 a
+> repair rather than a guess. Read it as the "before" half of a before-and-after
+> pair, not as current state. In particular the `BEFORE INSERT`-only trigger,
+> the twelve `service_role` grants and the two mutable-`search_path` warnings
+> described below are all **now fixed**.
 
 Run 14 found that 0006 and 0007 were present and said, repeatedly, that
 *present is not known*. This run reads what run 14 only probed for.
@@ -650,6 +773,8 @@ including:
 
 **0008 is not recorded and has not been applied.** The "the history rows have
 never been read" caveat in runs 6 and 14 is closed.
+*(As of run 16, 0008 **is** applied and recorded at version `20260809173146`.
+The sentence above describes the state this preflight found.)*
 
 ### The definition comparison — done, and it matched
 
@@ -712,6 +837,7 @@ repairing before 0008 is applied.
   executed through PostgREST, because no elevated credential is configured on
   any Vercel environment.
 - **0008 remains unapplied**, on this project and everywhere else.
+  *(No longer true — run 16 applied and verified it.)*
 
 ---
 

@@ -25,11 +25,16 @@ nowhere else in a form that can drift:
 - Migrations 0006 and 0007 have additionally been executed against a
   **disposable local PostgreSQL 18.3** through PGlite, clean-install and
   upgrade.
-- Migration **0008 has been applied nowhere.** It is forward-only, repairs
-  three defects in 0006, and is tested only against 18.3 through PGlite.
+- Migration **0008 is applied, recorded and verified** on the hosted
+  development project — ledger version `20260809173146`, so the hosted ledger
+  records **0001–0008**. Trigger coverage, all 16 internal functions'
+  privileges, both pinned search paths, the two security-advisor warnings
+  cleared, data intact, and the rule exercised behaviourally inside a
+  rolled-back transaction. Run 16.
 - Nothing has ever been successfully **called** through PostgREST. The run 14
-  probes resolved object names and collected permission refusals; no function
-  has executed there.
+  probes resolved object names and collected permission refusals; run 16's
+  verification was catalog and SQL. No function has executed over the
+  transport the application uses.
 
 Nothing here changes pricing, scoring, the visible assessment design,
 deterministic BIR generation, append-only guarantees, idempotency semantics,
