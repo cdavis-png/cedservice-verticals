@@ -465,14 +465,21 @@ test('the staff GET auth-config settles, and does not hang', async () => {
   assert.ok(elapsed < 5000, `settled in ${elapsed}ms, far inside the 15s platform budget`);
 
   /* NOTHING IS INJECTED HERE, deliberately — the platform injects nothing
-     either — so this request carries no caller identifier and the limiter
-     fails closed. That is the correct answer on the deployed path, and it is
-     an ANSWER, which is the whole point: this exact request used to hang to
-     the 15-second limit and return 504 FUNCTION_INVOCATION_TIMEOUT. The
-     deeper chain is covered by the suites that can inject a database. */
+     either — and this test process has no SUPABASE_URL, so the endpoint
+     refuses on its own configuration check. That is the correct answer on the
+     deployed path, and it is an ANSWER, which is the whole point: this exact
+     request used to hang to the 15-second limit and return 504
+     FUNCTION_INVOCATION_TIMEOUT.
+
+     THIS ASSERTED rate_limit_unavailable UNTIL THE ENDPOINT WAS DECOUPLED
+     from the database-backed limiter. It reaches its own validation now, and
+     no `Retry-After` accompanies a configuration refusal — there is nothing
+     to wait for. The deeper chain is covered by the suites that can inject a
+     database; the exemption itself by
+     tests/staff-auth-config-public.test.mjs. */
   assert.equal(res.status, 503);
-  assert.equal((await res.json()).code, 'rate_limit_unavailable');
-  assert.equal(res.headers.get('Retry-After'), '5');
+  assert.equal((await res.json()).code, 'auth_unavailable');
+  assert.equal(res.headers.get('Retry-After'), null);
   assert.equal(res.headers.get('cache-control'), 'no-store');
 });
 

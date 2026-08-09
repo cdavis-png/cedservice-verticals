@@ -48,15 +48,19 @@ const { GENERATED_FILES, CSP_SOURCE_LINE, cspLineFor, resolveSupabaseOrigin } = 
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
-/* Rate limiting fails closed, so /auth-config now needs a caller identifier
-   and a limiter round trip. This answers that one call. */
+/* A caller identifier is still supplied on every request, because this file
+   is about the CSP origin rather than about the limiter and a fail-closed
+   refusal here would be a confusing way to learn that.
+
+   THE DATABASE, HOWEVER, THROWS. `GET /auth-config` returns public
+   configuration and is exempt from the database-backed pre-authentication
+   limiter, so any call at all is a defect — and this file would notice,
+   because these assertions read the 200 body. Owned by
+   tests/staff-auth-config-public.test.mjs. */
 const CALLER_IP = '203.0.113.9';
 const limiterDb = {
-  async rpc(name) {
-    if (name === 'check_rate_limit') return { data: { allowed: true }, error: null };
-    return { data: null, error: null };
-  },
-  from() { return { select() { return this; }, eq() { return { data: [] }; } }; }
+  async rpc(name) { throw new Error(`the database was reached: rpc(${String(name)})`); },
+  from(table) { throw new Error(`the database was reached: from(${String(table)})`); }
 };
 
 /* Two real project origins, deliberately different, standing in for Preview

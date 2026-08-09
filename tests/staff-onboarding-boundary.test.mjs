@@ -572,14 +572,21 @@ test('auth-config still proves provenance before it answers', async () => {
   assert.equal(real.status, 200);
 });
 
-test('auth-config reaches the rate limiter and nothing else, and builds no Auth client', async () => {
+test('auth-config reaches no database at all, and builds no Auth client', async () => {
   /* The db throws on every call except `check_rate_limit`, and the Auth
-     client factory throws when called at all. A 200 is the proof that the
-     limiter was the only thing touched. */
+     client factory throws when called at all. A 200 is the proof that neither
+     was touched.
+
+     THIS ASSERTED ONE LIMITER PASS UNTIL THE ENDPOINT WAS DECOUPLED. It is
+     zero now, and the change is deliberate: this endpoint returns the project
+     origin and the publishable key, authenticates nothing and reads no table,
+     so metering it only made the console's own configuration depend on the
+     elevated client. tests/staff-auth-config-public.test.mjs owns that claim
+     in full, including the proof that no other route was widened. */
   limiterCalls.length = 0;
   const response = await get('/auth-config');
   assert.equal(response.status, 200);
-  assert.equal(limiterCalls.length, 1, 'exactly one limiter pass, and no other query');
+  assert.equal(limiterCalls.length, 0, 'no limiter pass, and no other query');
 });
 
 /* ============================================================

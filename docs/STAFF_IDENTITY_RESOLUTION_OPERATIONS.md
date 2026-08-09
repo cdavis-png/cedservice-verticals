@@ -129,7 +129,7 @@ pass through a CED endpoint (CLAUDE.md §9). The route's only involvement is:
 
 | Endpoint | What the route does |
 |---|---|
-| `GET …/auth-config` | returns `{ supabaseUrl, publishableKey }` — no body accepted, no credential returned |
+| `GET …/auth-config` | returns `{ supabaseUrl, publishableKey }` — no body accepted, no credential returned, no database touched |
 
 `publishableKey` is read through the same `lowPrivilegeKey` check the Auth
 path uses, so a **secret key pasted into the publishable variable is refused**
@@ -709,8 +709,8 @@ Everything the console needs, and nothing else. Full descriptions in
 |---|---|---|
 | `SUPABASE_URL` | yes | both clients |
 | `SUPABASE_PUBLISHABLE_KEY` (or `SUPABASE_ANON_KEY`) | yes | server-side sign-in, **and served to the onboarding page** via `GET …/auth-config` |
-| `SUPABASE_SECRET_KEY` (or `SUPABASE_SERVICE_ROLE_KEY`) | yes | the RPC and the two table reads |
-| `CED_RATE_LIMIT_SECRET` | **yes** | all four rate-limit passes — the route fails closed without it |
+| `SUPABASE_SECRET_KEY` (**preferred**; `SUPABASE_SERVICE_ROLE_KEY` is the legacy name) | yes | every protected staff operation — the RPC, the two table reads, and the rate-limit passes. Not needed by `GET …/auth-config` |
+| `CED_RATE_LIMIT_SECRET` | **yes** | all four rate-limit passes — every staff route subject to database-backed pre-authentication limiting fails closed without it. `GET …/auth-config` does not use it |
 | `CED_RATE_LIMIT_TIMEOUT_MS` | no | default 2000, clamped 250–4000 |
 | `CED_STAFF_ALLOWED_ORIGINS` | no | defaults to the request's own origin |
 | `CED_STAFF_RATE_LIMIT_WINDOW_SECONDS` / `_MAX_REQUESTS` | no | defaults 900 / 240 |
@@ -852,6 +852,26 @@ Recorded rather than implied away.
   upstream error body are never logged. This reverses an earlier note saying
   a missing secret simply disabled limiting: it did, and that was an
   unmetered authentication path created by forgetting one variable.
+- **`GET …/auth-config` is excluded from that limiter, deliberately.** It
+  returns only public client configuration — the project origin and the
+  publishable key Supabase publishes for browser clients — and performs no
+  authentication and no privileged database operation: no token, no body, no
+  table, no RPC. It therefore needs neither `CED_RATE_LIMIT_SECRET` nor an
+  elevated Supabase credential.
+
+  **This is not a development or Preview bypass.** It is one method on one
+  path, decided identically in every environment, with no variable that
+  widens or narrows it. HTTPS, the origin and Fetch Metadata gate, the
+  no-body rule and the method table (`405` with `Allow: GET`) all still apply,
+  and a misconfigured project URL or publishable key still gives the
+  established sanitized `503 auth_unavailable`.
+
+  The exclusion exists because of an observed failure, not a preference: while
+  the endpoint was metered, a deployment holding a project URL and a
+  publishable key and nothing else answered `503 database_unavailable` to the
+  one request whose job is to tell the browser which Supabase project to talk
+  to. Every other staff route is unchanged and still fails closed on all five
+  conditions, the missing elevated credential included.
 - **The queue is the only surface.** There is still no path to dismiss a case,
   create a record, request more information, or merge. Cases outside
   link-to-existing stay open, visibly, and say so.

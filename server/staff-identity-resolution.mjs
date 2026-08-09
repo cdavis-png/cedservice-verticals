@@ -767,9 +767,17 @@ const assertOrigin = (request, env, url) => {
 
    This adds no accepted operation. Every path serves exactly the one method
    it served before; the table only makes the refusal deterministic. */
+/* One spelling of the public-configuration path, shared by the method table,
+   the rate-limit exemption and the branch that answers it. Three copies of one
+   regex is three chances for the exemption to stop matching the route it is
+   supposed to describe — which would not fail loudly, it would quietly start
+   metering a read that must not be metered. No `g` flag, so `test` keeps no
+   position between callers. */
+const AUTH_CONFIG_PATH = /\/auth-config$/;
+
 const ROUTE_METHODS = Object.freeze([
   [/\/session(?:\/(?:refresh|signout))?$/, 'POST'],
-  [/\/auth-config$/, 'GET'],
+  [AUTH_CONFIG_PATH, 'GET'],
   [/\/cases\/[^/]+\/link$/, 'POST'],
   [/\/cases\/[^/]+$/, 'GET'],
   [/\/cases$/, 'GET']
@@ -1044,6 +1052,34 @@ export async function handleRequest(request, deps = {}) {
     const wrongMethod = methodRefusal(request, path, correlationId);
     if (wrongMethod) return wrongMethod;
 
+    /* ---------- 2b. the one read that is not rationed ----------
+       `GET /auth-config` returns two values that are public by construction —
+       the project origin and the publishable key, which Supabase publishes for
+       browser clients. It authenticates nothing, reads no body, consults no
+       token and touches no table.
+
+       IT IS THEREFORE NOT SUBJECT TO THE DATABASE-BACKED PRE-AUTHENTICATION
+       LIMITER, and the reason is not convenience. Metering it made the
+       console's ability to load its own configuration depend on the elevated
+       Supabase client and a `check_rate_limit` round trip: a deployment with
+       no elevated credential answered `503 database_unavailable`, and a
+       database wobble would stop the sign-in page rendering rather than stop
+       an attack. A limiter whose failure mode is "nobody can sign in" is not
+       protecting this endpoint — the endpoint has nothing to protect.
+
+       THIS IS NOT A BYPASS AND IS NOT CONDITIONAL ON ANYTHING. It is one
+       method on one path, decided identically in every environment; there is
+       no variable that widens it and none that narrows it.
+
+       Everything ahead of this point still applies in full: HTTPS, the origin
+       and Fetch Metadata gate, the no-body rule, and the method table that
+       answers `405` with `Allow: GET`. Everything behind it is untouched —
+       /session, its refresh and signout, every case read and every link still
+       fail closed on a missing secret, an unusable caller identifier, a
+       limiter timeout, an RPC failure and a missing elevated credential. */
+    const publicConfigRead =
+      String(request.method || '').toUpperCase() === 'GET' && AUTH_CONFIG_PATH.test(path);
+
     /* The elevated client, built at most once per request and only when
        something actually needs it. */
     let dbPromise = null;
@@ -1163,14 +1199,20 @@ export async function handleRequest(request, deps = {}) {
     /* ---------- 3. pre-authentication, by address alone ----------
        BEFORE token verification, because verification is an outbound HTTPS
        call to Supabase Auth. Charged to its own namespace so a legitimate
-       request is not also charged to the authenticated bucket below. */
-    const preAuthRefusal = await limitPass({
-      namespace: NAMESPACES.staffPreAuth,
-      policy: staffPolicy,
-      includeSession: false,
-      event: 'staff_rate_limited_preauth'
-    });
-    if (preAuthRefusal) return preAuthRefusal;
+       request is not also charged to the authenticated bucket below.
+
+       Skipped for the public configuration read, and skipped HERE rather than
+       inside limitPass, so the exemption is visible at the call site and
+       limitPass keeps exactly one behaviour: fail closed. */
+    if (!publicConfigRead) {
+      const preAuthRefusal = await limitPass({
+        namespace: NAMESPACES.staffPreAuth,
+        policy: staffPolicy,
+        includeSession: false,
+        event: 'staff_rate_limited_preauth'
+      });
+      if (preAuthRefusal) return preAuthRefusal;
+    }
 
     /* ---------- 4. the session endpoints ----------
        No bearer token, no operator, no database read.
@@ -1231,8 +1273,11 @@ export async function handleRequest(request, deps = {}) {
        No body, no token, no password, no session, no secret. It is a GET, so
        a same-origin call carries no Origin and is judged on Fetch Metadata by
        the same gate as every other read. */
-    if (/\/auth-config$/.test(path)) {
-      /* Second line, as above. */
+    if (AUTH_CONFIG_PATH.test(path)) {
+      /* Second line, as above. Matched on the PATH rather than on
+         `publicConfigRead`, so a wrong method still lands in this branch and
+         is answered here if the table above ever stops covering it, instead of
+         falling through to the bearer-token check and returning 401. */
       if (request.method !== 'GET') {
         return json(405, { ok: false, code: 'method_not_allowed', message: 'GET is required.' },
           correlationId, { Allow: 'GET' });
