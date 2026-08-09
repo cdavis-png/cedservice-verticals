@@ -371,6 +371,63 @@ test('the request hash covers the decision, so a reused id with a new target is 
     'a different operator is a different request, not a replay');
 });
 
+test('the note is part of the decision, because the note is what justifies it', async () => {
+  /* It was not. A second call on one request id with a rewritten note matched
+     the replay rule, returned the first outcome with a 200, and dropped the
+     new note — and a replay writes nothing, so the correction existed
+     nowhere. For an other_verified_evidence override the note is the only
+     record of why a contradiction was overridden. */
+  const base = { caseId: CASE_ID, targetBusinessId: BUSINESS, operatorUserId: OPERATOR,
+                 overrideConflict: false, overrideReason: null,
+                 note: 'Confirmed by phone with the owner.' };
+  const a = __testing.requestHash(base);
+
+  assert.equal(a, __testing.requestHash({ ...base }), 'the same note hashes the same');
+  assert.notEqual(a, __testing.requestHash({ ...base, note: 'Confirmed by email with the owner.' }),
+    'a materially different justification is a different request');
+  assert.notEqual(a, __testing.requestHash({ ...base, note: '' }),
+    'and so is no justification at all');
+});
+
+test('whitespace in the note is not a different decision', async () => {
+  /* The distinction the original comment drew and the code did not: a
+     trailing newline from a textarea must still replay. */
+  const base = { caseId: CASE_ID, targetBusinessId: BUSINESS, operatorUserId: OPERATOR,
+                 overrideConflict: false, overrideReason: null,
+                 note: 'Confirmed by phone with the owner.' };
+  const a = __testing.requestHash(base);
+
+  for (const variant of ['  Confirmed by phone with the owner.  ',
+                         'Confirmed by phone with the owner.\n',
+                         'Confirmed  by   phone with the owner.',
+                         'Confirmed by phone\twith the owner.']) {
+    assert.equal(__testing.requestHash({ ...base, note: variant }), a,
+      `whitespace-only difference must still replay: ${JSON.stringify(variant)}`);
+  }
+});
+
+test('a reworded note on the same request id reaches the database as a different hash', async () => {
+  /* End to end through the route, because the hash the DATABASE sees is the
+     one that decides replay-versus-conflict. */
+  const hashFor = async note => {
+    const db = makeDb({ rpc: async () => ({ data: { ok: true }, error: null }) });
+    await call({ method: 'POST', path: `/cases/${CASE_ID}/link`, db,
+      body: linkBody({ resolutionRequestId: CASE_ID, note }) });
+    return db.calls.find(c => c.name === 'resolve_identity_case_link_existing').args;
+  };
+
+  const first = await hashFor('Confirmed by phone with the owner.');
+  const second = await hashFor('Confirmed by phone with the owner, who also sent the lease.');
+  const retry = await hashFor('Confirmed by phone with the owner.');
+
+  assert.equal(first.p_resolution_request_id, second.p_resolution_request_id,
+    'the same request id, deliberately');
+  assert.notEqual(first.p_request_hash, second.p_request_hash,
+    'the database will refuse the rewritten note rather than silently discard it');
+  assert.equal(first.p_request_hash, retry.p_request_hash,
+    'but an identical resubmission is still a replay');
+});
+
 test('a second operator reusing a request id sends a different hash', async () => {
   const other = '99999999-9999-4999-8999-999999999999';
   const hashFor = async operator => {
@@ -1096,5 +1153,6 @@ test('the request hash is what the route sends, not something the browser chose'
   const rpc = db.calls.find(c => c.name === 'resolve_identity_case_link_existing');
   assert.notEqual(rpc.args.p_request_hash, 'f'.repeat(64));
   assert.equal(rpc.args.p_request_hash, createHash('sha256').update(JSON.stringify([
-    'link_existing', CASE_ID, BUSINESS, OPERATOR, false, null])).digest('hex'));
+    'link_existing', CASE_ID, BUSINESS, OPERATOR, false, null,
+    'Confirmed by phone with the owner.'])).digest('hex'));
 });

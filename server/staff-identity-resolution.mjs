@@ -406,11 +406,41 @@ const getServiceClient = async env => {
    person, so a second operator reusing the first one's request id must be
    refused rather than handed the first one's outcome and told they resolved
    it. The database enforces the same thing independently, against the ledger
-   row's own operator column. */
-const requestHash = ({ caseId, targetBusinessId, operatorUserId, overrideConflict, overrideReason }) =>
+   row's own operator column.
+
+   THE NOTE IS PART OF THE DECISION TOO, and it was left out. "Not the note's
+   whitespace" is right; "not the note" was not, and the difference is what
+   the note is FOR. `resolve_identity_case_link_existing` writes it to
+   `identity_resolution_cases.resolution_notes`, and for an
+   `other_verified_evidence` override the note IS the justification — it is
+   the only record of why a contradiction was overridden to make a permanent,
+   unerasable attachment, and the mutation requires forty characters of it.
+
+   Left out of the hash, a second call on the same request id with a
+   materially different note matched `identity_resolution_replay`, returned
+   the FIRST outcome with `replayed: true` and a 200, and discarded the new
+   note without saying so. An operator correcting or completing their
+   justification was told it had been recorded. It had not, and a replay
+   writes nothing, so there was no second row to find it in either.
+
+   So the note is hashed, normalised for whitespace only: trimmed, and runs of
+   whitespace collapsed to one space. A genuine network retry re-sends the
+   same body and still replays. A reworded justification is a different
+   request and is refused as one — which is the answer the operator can act
+   on, rather than a success they cannot verify.
+
+   Note this changes the hash for a given decision. The ledger is keyed on the
+   request id and holds no rows anywhere yet, so there is nothing in flight to
+   strand; a deploy made after real resolutions exist would need to consider
+   the retry in the window, and the failure mode would be a 409 telling an
+   operator to reissue, never a wrong attachment. */
+const normalizeNote = note => String(note ?? '').trim().replace(/\s+/g, ' ');
+
+const requestHash = ({ caseId, targetBusinessId, operatorUserId, overrideConflict,
+                       overrideReason, note }) =>
   createHash('sha256').update(JSON.stringify([
     'link_existing', caseId, targetBusinessId, operatorUserId || null,
-    overrideConflict === true, overrideReason || null
+    overrideConflict === true, overrideReason || null, normalizeNote(note)
   ])).digest('hex');
 
 /* ---------- the postgrest error surface ----------
@@ -1518,7 +1548,7 @@ export async function handleRequest(request, deps = {}) {
         p_target_business_id: targetBusinessId,
         p_resolution_request_id: resolutionRequestId,
         p_request_hash: requestHash({
-          caseId, targetBusinessId, operatorUserId, overrideConflict, overrideReason
+          caseId, targetBusinessId, operatorUserId, overrideConflict, overrideReason, note
         }),
         p_note: note,
         p_signals: signals,
