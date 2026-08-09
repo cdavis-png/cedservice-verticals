@@ -1099,11 +1099,36 @@ then tell an unrecorded migration from an unapplied one.
   records nothing. Earlier guidance in this repository said to do exactly
   that; it was wrong.
 - **Do not use `supabase db push`.**
-- Use a tracked mechanism that applies the file and writes its history row in
-  one operation.
+- **Do not write a history row by hand**, before or after. The apply operation
+  writes it; a hand-written row is a record nothing verified.
+- **Do not use `supabase migration repair`.** It rewrites history to match an
+  assumption, and this project's history has been read and is correct.
+- The mechanism is the connected Supabase **MCP `apply_migration`** operation,
+  which applies the file and records it in one call, and it requires explicit
+  human authorization immediately beforehand.
 
-The full procedure, including the verification queries, is
+The full procedure — the exact project ref, migration name and query, the
+verification queries, and what to do when something fails — is
 [docs/SUPABASE_SETUP.md §2](docs/SUPABASE_SETUP.md).
+
+### Correct forward, and only as far as the defect
+
+A migration that has been applied and recorded is history even when it is
+wrong. If 0008 is recorded and its verification fails, the answer is a
+forward-only 0009 carrying **only** the corrective change — not deleting a
+history row, not marking it reverted, not rerunning it blindly, and not
+manually reversing everything it did.
+
+Two limits on any such correction, both learned from a rollback paragraph this
+repository actually carried:
+
+- **Independent repairs are not unpicked together.** 0008 fixes three separate
+  things; a fault in one is not a reason to reverse the other two.
+- **Never restore `service_role` execute on an internal function** unless a
+  named caller and a named failure prove that exact grant is needed. The
+  retracted rollback would have granted all sixteen internal functions back,
+  including four from 0007 that were correctly blocked *before* 0008 ran —
+  leaving the database less safe than before the attempt.
 
 0008 is committed, tested, and **applied nowhere**.
 

@@ -81,14 +81,25 @@ supabase/migrations/0008_staff_migration_hardening.sql
 strong-identifier unique index to verified rows only. See
 [PRODUCTION_HARDENING.md §2](PRODUCTION_HARDENING.md#2-migration-order).
 
-**With the Supabase CLI:**
+**Apply them through the tracked workflow, one file per operation, in order** —
+the same mechanism §2b specifies for 0008: the connected Supabase
+**MCP `apply_migration`** operation, with the migration name taken from the
+file name (`0001_business_record_foundation`, and so on) and the query set to
+that file's exact UTF-8 contents. Each call applies the DDL **and** records the
+migration in `supabase_migrations.schema_migrations`.
 
-```bash
-supabase link --project-ref <ref>
-supabase db push
-```
+Confirm after each one that the expected history row appeared before moving to
+the next. A chain that is half-applied and half-recorded is worse to untangle
+than one that stopped cleanly.
 
-**Or by hand:** paste each file into the SQL editor and run them in order.
+> **The SQL Editor is not an option here either.** An earlier revision of this
+> document offered it as a "by hand" alternative. It applies the DDL and
+> records nothing, so a project set up that way starts life with an empty
+> migration history and a fully migrated schema — the exact state that made
+> the development project's history unknowable until a preflight went and read
+> it. **`supabase db push` is also prohibited**, for this project and for a new
+> one. Both prohibitions are listed in full in §2b and apply to every project,
+> not only the existing one.
 
 ### 2b. The existing development project — applying 0008
 
@@ -138,20 +149,50 @@ from `public, anon, authenticated`. Do not narrow 0008's revoke list.
 
 #### Applying it
 
-**Use a tracked migration mechanism.** 0008 must end up as a row in
-`supabase_migrations.schema_migrations` alongside 0001–0007. A migration that
-runs without being recorded leaves the history lying about the schema, and the
-next person to reconcile the two has no way to tell an unrecorded migration
-from an unapplied one.
+**The mechanism is named, not left to judgement.** 0008 will be applied through
+the connected Supabase **MCP `apply_migration`** operation, with exactly these
+inputs:
 
-- **Do not paste it into the SQL editor.** An earlier revision of this document
-  said to; that was wrong. The SQL editor applies the DDL and records nothing.
-- **Do not use `supabase db push`.** It is out of scope for this project by
-  standing instruction, and the history rows have not been reconciled against
-  the CLI's expectations.
-- Use the project's tracked mechanism — a migration runner or CI step that
-  applies the file **and** writes its history row in the same operation, with
-  a version stamp continuing the `202608…` sequence.
+| Input | Value |
+|---|---|
+| Project | `qkpptajglstgucadhfwq` |
+| Migration name | `0008_staff_migration_hardening` |
+| Query | the exact UTF-8 contents of `supabase/migrations/0008_staff_migration_hardening.sql`, **from the approved commit** |
+
+That single operation applies the DDL **and** records the migration in
+`supabase_migrations.schema_migrations`. Both halves happen together, which is
+the entire reason this mechanism was chosen: a migration that runs without
+being recorded leaves the history lying about the schema, and the next person
+to reconcile the two has no way to tell an unrecorded migration from an
+unapplied one.
+
+**The query is the file, byte for byte.** Do not retype it, do not reflow it,
+do not apply a subset "to start with", and do not edit it in transit to fix
+something noticed at the last moment. If the file needs to change, it changes
+in the repository, is reviewed, and is committed — and the commit that is
+applied is the one that was approved. The verification queries below assume
+the whole file ran.
+
+**Explicit human authorization is required immediately before the operation**,
+in the same sitting, against this project reference. Standing approval of the
+plan is not approval to run it: this is a privileged, schema-altering write to
+a database holding 12 Business Records, and the authorization must be given
+with the project ref and migration name in view. An authorization given
+earlier, or for a different project, or before a change to the file, does not
+carry over.
+
+Prohibited, without exception:
+
+- **No SQL Editor.** It applies the DDL and records nothing.
+- **No `supabase db push`.**
+- **No separate manual insertion of a history row.** `apply_migration` writes
+  it. Writing one by hand — before, after, or instead — creates a record whose
+  truthfulness nothing checked, which is the failure this whole procedure
+  exists to prevent.
+- **No migration repair.** `supabase migration repair` rewrites history to
+  match an assumption. The history here has been read and is correct; there is
+  nothing to repair, and a repair command run against a correct history can
+  only make it wrong.
 
 **Before applying, confirm the F6 precondition is still true.** It depends on
 default privileges rather than on anything in a migration file, so it is the
@@ -221,11 +262,74 @@ one Growth submission through `ingest_assessment` and confirm it succeeds.
 inside a SECURITY DEFINER function. If that revoke were wrong, this is where it
 shows.
 
-**Rollback.** 0008 adds no table, column, index or policy and changes no data,
-so reverting it is: restore 0006's `enforce_bir_supersession_scope` body and
-its `before insert` trigger, `grant execute` the sixteen internal functions
-back to `service_role`, and `alter function … reset search_path` on the two
-helpers. There is nothing to migrate back.
+#### If something goes wrong
+
+**There is no rollback step, and the blanket one this section used to carry was
+unsafe.** It said to "`grant execute` the sixteen internal functions back to
+`service_role`". Four of those sixteen —
+`identity_case_eligible_targets`, `mask_contact_value`,
+`identity_resolution_replay` and `reject_case_evidence_change` — originate in
+0007, which revoked them from `service_role` correctly, and the preflight
+confirmed they were **already blocked before 0008 ran**. Restoring all sixteen
+would not undo 0008; it would grant the server credential execute on four
+functions it has never been allowed to call, and leave the database less safe
+than it was before anything was attempted. A rollback that overshoots its own
+migration is worse than the defect it is undoing.
+
+What to do instead depends on where the failure landed.
+
+**`apply_migration` reports failure.** Inspect the migration history and the
+affected catalog objects *before* retrying — do not retry on the assumption
+that nothing happened:
+
+```sql
+select version, name from supabase_migrations.schema_migrations order by version;
+
+select pg_get_functiondef('public.enforce_bir_supersession_scope()'::regprocedure);
+
+select tgname, pg_get_triggerdef(oid) as def
+  from pg_trigger
+ where tgrelid = 'public.business_intelligence_reports'::regclass
+   and not tgisinternal
+ order by tgname;
+
+select proname, proconfig from pg_proc
+ where pronamespace = 'public'::regnamespace
+   and proname in ('identity_value_acceptable','identity_evidence_fault');
+```
+
+**If 0008 is absent from the history and the database is still in its preflight
+state** — the supersession function matching 0006, the trigger `BEFORE INSERT`
+only, the two helpers unpinned — then nothing took effect and the operation may
+be retried **once the cause of the failure has been determined**. Retrying
+without knowing why it failed is how a transient-looking failure becomes a
+partial application nobody expected.
+
+**If 0008 IS recorded but the post-apply verification above fails**, the
+history is correct and the schema is not what was expected. Do **not**:
+
+- delete its history row,
+- mark it reverted,
+- rerun it blindly,
+- or manually reverse everything it did.
+
+Instead, **create a forward-only `0009` migration containing only the required
+corrective change**, and apply it through the same `apply_migration` operation.
+This is the rule from [CLAUDE.md §14](../CLAUDE.md), applied to 0008 itself:
+applied history is never rewritten, including 0008's.
+
+Two constraints on what 0009 may contain:
+
+- **Do not reverse F6 or F7 merely because F3 needs correcting.** The three
+  repairs are independent. A `search_path` that is now pinned and a grant that
+  is now revoked are both correct regardless of what the trigger is doing, and
+  unpicking them to "get back to a known state" discards two good fixes to
+  address a third.
+- **Never restore `service_role` access to an internal function** unless a
+  specific application dependency proves that exact grant is necessary — named
+  function, named caller, named failure. "Something might need it" is not
+  evidence, and the four 0007 functions above are the standing example of
+  grants that were correctly absent all along.
 
 **What 0008 has not had.** It has never been applied to any database. It is
 tested against a disposable PostgreSQL 18.3 through PGlite by
@@ -417,6 +521,12 @@ See [IMPLEMENTATION_MILESTONE_1.md §9](IMPLEMENTATION_MILESTONE_1.md#9-rollback
 for the `drop` statements. To disconnect the client without touching the
 database, set `submission.endpoint` back to `null` in the vertical config —
 assessments then log locally and nothing is sent.
+
+**This is teardown of the whole milestone, not recovery from a migration.** If
+a migration applied to a project that already holds data went wrong, the
+procedure is §2b, "If something goes wrong": inspect first, and correct
+forward with a new migration. Do not reach for `drop` statements to undo one
+migration.
 
 ---
 
