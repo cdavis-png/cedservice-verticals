@@ -151,18 +151,27 @@ has a rule that must not be quietly relaxed:
 See [docs/PRODUCTION_HARDENING.md](docs/PRODUCTION_HARDENING.md) and
 [docs/IMPLEMENTATION_MILESTONE_1.md](docs/IMPLEMENTATION_MILESTONE_1.md).
 
-**Known outstanding gaps:** no production database is connected; migrations
-0006 and 0007 have been validated against a disposable local PostgreSQL 18.3 —
-the whole chain, a clean install and an upgrade over populated pre-0006 data,
-with the full integration suite including sections O through X passing — but
-neither has **ever been applied to a hosted database and neither has run
-against PostgreSQL 17**, which is what the hosted development project runs;
-nothing has ever run over PostgREST; migrations 0001–0005 are validated against
-that hosted development Postgres, but section M of the integration suite has
-not run over PostgREST either; the application is not deployed for public
-traffic; no challenge provider has been chosen; and nothing yet reports how
-many visitors open or finish the fit review, so there is no evidence about
-whether the two-stage split reduced abandonment or merely moved it.
+**Known outstanding gaps:** no production database is connected. Migrations
+0006 and 0007 are validated against a disposable local PostgreSQL 18.3 — the
+whole chain, a clean install and an upgrade over populated pre-0006 data, with
+the full integration suite including sections O through X passing — **and both
+are also present on the hosted development project** `qkpptajglstgucadhfwq`,
+which runs PostgreSQL 17.6.1.155. That was established on 2026-08-09 by
+read-only PostgREST existence-versus-permission probes, and it corrected a
+claim this file carried for some time: that neither had ever been hosted.
+
+**Present is not "matches what is committed".** The deployed definitions have
+not been compared against these files, `supabase_migrations.schema_migrations`
+has not been read, and when and how they were applied is unknown. Nothing has
+been successfully *called* over PostgREST — the probes were permission
+refusals — so section M of the integration suite still has not run there, and
+neither have the staff route's five RPCs or its two direct table reads.
+Migration **0008 exists, is tested, and has been applied nowhere**; it is
+forward-only and repairs three defects in 0006 (see section 14). Beyond the
+database: the application is not deployed for public traffic; no challenge
+provider has been chosen; and nothing yet reports how many visitors open or
+finish the fit review, so there is no evidence about whether the two-stage
+split reduced abandonment or merely moved it.
 
 The identity-resolution queue now **has** a working surface — see section 12 —
 so ambiguous submissions can be resolved by a provisioned operator. What that
@@ -607,11 +616,16 @@ step and **makes no recommendation**.
 ### Known outstanding gaps
 
 Migration 0005 **has** been executed against the hosted development
-PostgreSQL 17 project; migrations 0006 and 0007 have been executed only against
-a disposable local PostgreSQL 18.3 through PGlite, and have never run against
-PostgreSQL 17, hosted Supabase, or PostgREST. Nothing has ever run through
-PostgREST at all. The single record of what has and has not executed is
-[docs/REAL_POSTGRES_VALIDATION.md](docs/REAL_POSTGRES_VALIDATION.md).
+PostgreSQL 17 project, and so, it turns out, have **0006 and 0007** — they are
+present on `qkpptajglstgucadhfwq`, confirmed on 2026-08-09 by read-only
+PostgREST probes. Both have additionally been executed against a disposable
+local PostgreSQL 18.3 through PGlite. What remains unverified is what the
+hosted definitions actually *are*, and no analytics function has ever been
+successfully **called** through PostgREST — the probes distinguished
+"permission denied" from "not found" and nothing more. Migration 0008 is
+written and tested and has been applied nowhere. The single record of what has
+and has not executed is
+[docs/REAL_POSTGRES_VALIDATION.md](docs/REAL_POSTGRES_VALIDATION.md), run 14.
 
 The analytics consent policy is **pending professional review** and no
 compliance claim is made anywhere. There is no signed session token, so the
@@ -858,12 +872,23 @@ session or continuation, and splices no supersession chain. RLS is enabled and
 
 Stated precisely, because everything below is still owed:
 
-- **PostgreSQL 17.** 0007 has run on 18.3 only, through PGlite.
-- **Hosted Supabase.** 0007 has never been applied to any hosted database.
-- **PostgREST.** The five functions the route calls have never been resolved
-  through it, and neither have the two direct table reads — local mode reaches
-  them as the database owner, so the `service_role` grants they depend on have
-  not been exercised as `service_role`.
+- **What the hosted definitions ARE.** 0007 **is** present on the hosted
+  development project `qkpptajglstgucadhfwq` (PostgreSQL 17.6.1.155), so the
+  two entries that used to head this list — "never run on 17", "never applied
+  to a hosted database" — were false and are gone. What replaces them is
+  narrower and still open: nobody has compared a single deployed definition
+  against this repository, read
+  `supabase_migrations.schema_migrations`, or established when or how 0007
+  was applied. Treat the hosted schema as *present and uncharacterised*.
+- **PostgREST.** Its objects have been RESOLVED through PostgREST — that is
+  what the run 14 probes did — but none of the five functions the route calls
+  has ever been successfully **called** through it, and neither have the two
+  direct table reads. Local mode reaches them as the database owner, so the
+  `service_role` grants they depend on have not been exercised as
+  `service_role`.
+- **Migration 0008.** Forward-only, repairs F3, F6 and F7 in 0006, tested
+  against 18.3 through PGlite with every defect observed before and after —
+  and **applied nowhere**. Section 14 states what applying it will require.
 - **True multi-connection concurrency.** PGlite is a single connection. The
   *mechanism* that decides a race is proven — a unique index, a `for update`
   on the case, a ledger recheck after the lock — but the race itself has never
@@ -1015,3 +1040,55 @@ runs the `buildCommand` and nothing after it. Whether the platform honours
 `outputDirectory`, still discovers `api/` functions alongside a build
 command, and still traces `server/` and `shared/` is documented behaviour
 that this repository models but has not observed.
+
+---
+
+## 14. Migrations against a hosted database
+
+The hosted development project `qkpptajglstgucadhfwq` already holds migrations
+**0001 through 0007**. That is the starting fact, and it was discovered rather
+than recorded: this file previously said 0006 and 0007 had never been hosted,
+which was false. See run 14 in
+[docs/REAL_POSTGRES_VALIDATION.md](docs/REAL_POSTGRES_VALIDATION.md).
+
+### Applied history is never rewritten
+
+A migration that has run against a hosted database is history. Fixing a defect
+in it means **a new forward-only migration**, never an edit to the old file.
+
+Editing 0006 to repair a defect would produce a repository whose 0006 has never
+run anywhere and a database whose 0006 is unrecoverable — and a `db push`
+against a project that already recorded 0006 would skip the edit entirely,
+leaving the fix in the file and out of the database. This is the failure mode
+that makes the edit worse than the defect.
+
+`supabase/migrations/0008_staff_migration_hardening.sql` is the worked example.
+It repairs three defects in 0006 — F3 supersession-scope trigger coverage, F6
+`service_role` on the internal helpers, F7 the two unpinned `search_path`s —
+and touches neither 0006 nor 0007.
+
+### Present is not the same as known
+
+The probes that found 0006 and 0007 distinguished *permission denied* from
+*not found*. They read no definition. So for anything already hosted:
+
+- **Do not assume a deployed object matches the committed file.** An earlier
+  draft, a hand-edit in the SQL editor, or a half-applied file all look
+  identical from outside.
+- **Prefer the narrowest instrument.** `alter function … set`, `revoke`,
+  `create index if not exists` change one thing and leave a body alone.
+  `create or replace function` **overwrites whatever is deployed**, so use it
+  only where the body must change, and compare the deployed definition first.
+- **Write every statement to be re-runnable**, because the current state is
+  partly unknown and a second attempt must be safe.
+
+### Before applying anything
+
+The procedure — including how to read the deployed definition, how to check
+the migration-history rows, and what to do when they disagree with the files —
+is [docs/SUPABASE_SETUP.md §2](docs/SUPABASE_SETUP.md). **Do not run
+`supabase db push` against this project** until the history rows have been
+read: the CLI's view of what is applied has never been reconciled with what is
+actually there.
+
+0008 is committed, tested, and **applied nowhere**.

@@ -792,8 +792,14 @@ and `NODE_ENV` that is not `production`.
 
 Recorded rather than implied away.
 
-- **Nothing here has run against hosted Supabase, PostgreSQL 17, PostgREST, or
-  real Supabase Auth.** See [REAL_POSTGRES_VALIDATION.md](REAL_POSTGRES_VALIDATION.md).
+- **Migration 0007 IS present on the hosted development project** (PostgreSQL
+  17.6.1.155), which corrects an earlier claim here that nothing had run
+  against hosted Supabase or PostgreSQL 17. What has *not* happened: no
+  deployed definition has been compared against the committed file, nothing
+  has been successfully **called** through PostgREST, and no part of this
+  console has run against **real Supabase Auth**. Migration 0008, which
+  hardens three things 0007 depends on, has been applied nowhere. See
+  [REAL_POSTGRES_VALIDATION.md](REAL_POSTGRES_VALIDATION.md) run 14.
   The `auth.users` foreign key and the confirmed-email check are both
   conditional on a schema that does not exist in the local test harness, so
   neither has ever executed. No real access token has ever been verified, and

@@ -88,7 +88,8 @@ verticals/beauty-wellness-fitness/nails/service-mix/
 
 supabase/migrations/
   0006_service_mix_review.sql  run against local PostgreSQL 18.3 (PGlite);
-                               NOT applied to any hosted database
+                               PRESENT on the hosted development project,
+                               deployed definition uncompared (see §9)
 ```
 
 Every shared file is a classic-script IIFE with the dual
@@ -390,12 +391,18 @@ they carry no offering names and no prices.
   populated pre-0006 data, with `npm run test:migration` and
   `npm run test:integration:local` passing. See
   [REAL_POSTGRES_VALIDATION.md](REAL_POSTGRES_VALIDATION.md).
-- It **has not** been executed against hosted Supabase, and it has not been
-  executed against PostgreSQL 17 — the hosted development project is
-  17.6.1.155, and a behaviour that differs between the two majors would not
-  have been caught here.
-- Nothing has run over PostgREST at all, so signature resolution by argument
-  name over HTTP remains unproven.
+- It **is present on the hosted development project** (17.6.1.155), confirmed
+  on 2026-08-09 by read-only PostgREST probes. This corrects an earlier
+  statement here that it had never been hosted. It has therefore run on
+  PostgreSQL 17.
+- **The deployed definition has not been compared against this file.** The
+  probes distinguished "permission denied" from "not found" and read nothing.
+  A behaviour difference between the two majors, or a hand-edit made outside
+  this repository, would still not have been caught.
+- Nothing has been successfully **called** over PostgREST, so signature
+  resolution by argument name over HTTP remains unproven.
+- Migration **0008** repairs three defects in 0006 — forward-only, editing
+  nothing here — and has been applied nowhere.
 
 1. `review_type text not null default 'growth_review'` on
    `assessment_submissions`, `assessment_sessions`,

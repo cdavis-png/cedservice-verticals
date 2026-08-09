@@ -6,6 +6,20 @@ Postgres, and the checklist for repeating it.
 **Status: executed and passed.** Blocker B7 — "the SQL has never run" — is
 closed. Everything below was observed, not predicted.
 
+> **Correction, 2026-08-09 — read [run 14](#run-14--0006-and-0007-are-already-on-the-hosted-project) first.**
+> Migrations **0006 and 0007 are present on the hosted development project**
+> `qkpptajglstgucadhfwq` (PostgreSQL 17.6.1.155). Every statement below that
+> says either has "never been applied to a hosted database", "never run on
+> PostgreSQL 17", or that nothing here has "ever run through PostgREST" was
+> written in good faith and is **false**. Those passages are left in place as
+> the record of what each run observed at the time, each marked with a
+> pointer here; run 14 is the current state.
+>
+> What run 14 did **not** establish is as important: the deployed definitions
+> have not been compared against this repository, the migration-history rows
+> have not been read, and the application time and method are unknown. Do not
+> read "present" as "matches what is committed".
+
 ## Runs
 
 | | Run 1 — Milestone 1.1 | Run 2 — migration 0004 |
@@ -171,6 +185,12 @@ Postgres and remains outstanding.
 **Migration 0006 is validated as SQL and as a migration. It has still never
 been applied to a hosted database, and the hosted run remains outstanding.**
 
+> **Superseded by run 14.** The second sentence is false: 0006 **is** present
+> on the hosted development project. What run 4 validated is unchanged — this
+> was a local run and it proved what it says it proved. What is wrong is only
+> its statement about the hosted database. The deployed definition has still
+> not been compared against this repository.
+
 ---
 
 ## Run 6 — migration 0007, staff identity resolution, against a disposable local PostgreSQL
@@ -232,13 +252,22 @@ Stated plainly, because every one of these is still owed:
 - **PostgreSQL 17.** This ran on **18.3**. The hosted development project runs
   **17.6.1.155**. A behaviour that differs between the two majors would not be
   caught here, and 0007 has never run on 17.
+  *(Superseded by run 14: 0007 is present on the hosted 17.6.1.155 project, so
+  it has run on 17. This run still did not observe that, and the deployed
+  definition is still uncompared.)*
 - **Hosted Supabase.** 0007 has **never been applied to any hosted database**.
+  *(**False** — superseded by run 14. 0007 is present on
+  `qkpptajglstgucadhfwq`. When and how it was applied is unknown.)*
 - **PostgREST.** Local mode speaks SQL directly. The staff route calls five
   functions over `db.rpc(...)` — `staff_operator_guard`,
   `staff_identity_queue`, `staff_identity_case`,
   `resolve_identity_case_link_existing`, `check_rate_limit` — and **none of
   them has ever been resolved through PostgREST**. Nothing in this repository
   ever has.
+  *(Partly superseded by run 14. PostgREST has now RESOLVED these objects —
+  that is what the existence-versus-permission probes did. None has been
+  successfully **called** through it, which is what this bullet was really
+  about, and that part still stands.)*
 - **The two direct table reads.** The route reads
   `identity_resolution_cases` and `assessment_submissions` through PostgREST
   with the elevated key. Local mode reaches them as the database owner
@@ -307,6 +336,13 @@ Stated plainly, because every one of these is still owed:
 over a direct SQL connection. It has never been applied to a hosted database,
 never run on PostgreSQL 17, never been reached through PostgREST, and never
 been raced. All four remain deployment blockers.**
+
+> **Superseded by run 14 on three of the four.** 0007 **is** present on the
+> hosted development project, which runs PostgreSQL 17.6.1.155, and PostgREST
+> has resolved its objects. It has still **never been raced**, no staff
+> function has been successfully called through PostgREST, and the deployed
+> definitions have not been compared against this repository. What run 6
+> itself validated is unaffected.
 
 ---
 
@@ -446,6 +482,108 @@ decided it — the root was published by omission.
 **Until a real preview deployment exists, the static boundary is configured and
 tested but not observed.** Do not describe it as verified on the strength of
 this run.
+
+---
+
+## Run 14 — 0006 and 0007 are already on the hosted project
+
+**This run corrects a factual error that had propagated through eight
+documents.** Every statement in this repository of the form "0006 and 0007
+have never been applied to a hosted database" was **false**, and had been for
+some time before it was noticed.
+
+| | Run 14 |
+|---|---|
+| Date | 2026-08-09 |
+| Project | `qkpptajglstgucadhfwq` — the persistent hosted **development** project |
+| Postgres | 17.6.1.155 |
+| Transport | **PostgREST**, read-only |
+| Method | Existence-versus-permission probes: ask for an object and distinguish "permission denied" from "not found" |
+| Result | **0006 and 0007 are present.** No migration was applied, and nothing was written. |
+
+### What run 14 establishes
+
+- **Migrations 0006 and 0007 are present in the hosted development project.**
+  The objects they create resolve through PostgREST and answer *permission
+  denied* rather than *not found*, which "not applied" cannot produce.
+- **They have therefore run on PostgreSQL 17**, on hosted Supabase. Two of the
+  four blockers run 6 closed its section with are not blockers; they were
+  already cleared, unrecorded.
+- **PostgREST has resolved these objects.** "Nothing in this repository has
+  ever run through PostgREST" is no longer true as written.
+
+### What run 14 does NOT establish — and this is the more important half
+
+Presence is not equivalence. A probe that distinguishes *denied* from *absent*
+learns that a name exists. It learns nothing about what is behind the name.
+
+- **The deployed definitions are unverified.** Whether the hosted
+  `ingest_review`, `enforce_bir_supersession_scope`, `staff_operator_guard` or
+  any other object is byte-for-byte what this repository holds is **unknown**.
+  An earlier draft, a hand-edit in the SQL editor, or a partially applied file
+  would all probe identically.
+- **The migration-history records are unverified.** Whether
+  `supabase_migrations.schema_migrations` contains rows for 0006 and 0007 —
+  and therefore whether `supabase db push` would consider them applied — is
+  unknown.
+- **When and how they were applied is unknown.** No date, no method, no actor.
+- **Execution is still unproven.** The probes were permission refusals. No
+  staff function has been *called* through PostgREST, no ingestion has run
+  there, and the two direct table reads the route depends on have still never
+  been exercised as `service_role`.
+- **Nothing else changed.** Real Supabase Auth, real TOTP, real invitations,
+  true multi-connection concurrency and the Vercel platform gaps are all
+  exactly where runs 6 and 13 left them.
+
+### What this changes about how the next migration is written
+
+Migration **0008** exists because of three defects found in the audit that
+followed this discovery (see below), and it is written for a database whose
+current definitions cannot be assumed:
+
+- It is **forward-only**. 0006 and 0007 are not edited. A hosted migration is
+  history, and history is not rewritten to fix a defect found after it ran.
+- It prefers the **narrowest instrument**: `alter function … set search_path`
+  and `revoke` change a setting and an ACL without touching a body. Only F3
+  requires `create or replace`, and that statement overwrites whatever is
+  deployed — which is why comparing the deployed definition first is a
+  **required** step in the procedure, not a nicety.
+- It is **idempotent**, so applying it to a database whose state is partly
+  unknown cannot make things worse on a second attempt.
+
+### The three defects 0008 repairs
+
+| | Defect | Instrument |
+|---|---|---|
+| **F3** | `bir_supersession_scope` fires on INSERT only, so the invariant 0006 states as absolute is not enforced against any UPDATE | `create or replace` + recreate the trigger for `insert or update` |
+| **F6** | 0006's internal functions are revoked from `public, anon, authenticated` but **not** `service_role`, which a Supabase project grants directly through default privileges | `revoke … from … service_role` |
+| **F7** | `identity_value_acceptable` and `identity_evidence_fault` are the only two functions in the chain with no pinned `search_path` | `alter function … set search_path` |
+
+F3 is **defence in depth, not a live escape** — stated that way deliberately.
+The one UPDATE in the chain that touches a field the rule reads
+(`resolve_identity_case_link_existing`) cannot currently violate it, because a
+queued report has a null supersession chain. Nothing enforces that coincidence
+and nothing tested it.
+
+A fourth defect, **F8**, was application code and needed no migration: the
+staff route's `requestHash` omitted the resolution note, so a second call on
+one request id with a rewritten justification replayed the first outcome and
+discarded the new note. Repaired in `server/staff-identity-resolution.mjs`.
+
+### Verification
+
+`tests/migration/0008-migration-hardening.test.mjs` applies the chain to 0007,
+**observes all three defects present**, applies 0008, and asks the same
+questions again. F6 needs a deliberate extra step to be honest: the local
+fixture creates `anon`, `authenticated` and `service_role` without the default
+privileges a real Supabase project carries, so the pre-existing assertion in
+`tests/migration/0006-rpc-roles.test.mjs` that "service_role cannot execute
+these" was passing **against an absence**. The new test grants the privilege
+explicitly first, so the revoke has something real to remove.
+
+**0008 has not been applied anywhere.** It is committed, tested against
+PostgreSQL 18.3 through PGlite, and unapplied — on the hosted development
+project and everywhere else.
 
 ---
 
