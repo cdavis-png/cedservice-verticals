@@ -279,9 +279,10 @@ Stated plainly, because every one of these is still owed:
   routing for `api/staff/identity-resolution/[...path].mjs`, the header rules,
   the runtime, and the fact that exactly one function now deploys rather than
   two — is asserted by `tests/staff-deployment-contract.test.mjs` against a
-  model of Vercel's documented routing. **No `vercel build` has been run**,
-  because the CLI is not a dependency of this repository and installing one
-  was out of bounds. The model is a check on the configuration, not on the
+  model of Vercel's documented routing. **No local `vercel build` has been
+  run**, because the CLI is not a dependency of this repository and
+  installing one was out of bounds. A platform build has since run and failed
+  closed before reaching routing; see run 13. The model is a check on the configuration, not on the
   platform. In particular, that the file tracer bundles `server/` alongside
   `api/` is expected — the imports are static, which is what
   `api/assessments.mjs` and `api/analytics.mjs` already rely on — but it has
@@ -426,10 +427,11 @@ decided it — the root was published by omission.
 
 ### What run 8 did NOT validate
 
-- **No `vercel build` and no preview deployment.** The Vercel CLI is not a
-  dependency of this repository and installing or authenticating one was out of
-  bounds. Everything above is a check on the *configuration and the generated
-  tree*, not on the platform.
+- **No local `vercel build`.** The Vercel CLI is not a dependency of this
+  repository and installing or authenticating one was out of bounds.
+  Everything above is a check on the *configuration and the generated tree*,
+  not on the platform. **A platform build has since run — see run 13**, and
+  it confirms only that Vercel executes the configured `buildCommand`.
 - **Whether Vercel honours `outputDirectory`** as documented.
 - **Whether `api/` functions are still discovered** when a `buildCommand` is
   present. This is documented behaviour for the "Other" preset; it has not been
@@ -444,6 +446,47 @@ decided it — the root was published by omission.
 **Until a real preview deployment exists, the static boundary is configured and
 tested but not observed.** Do not describe it as verified on the strength of
 this run.
+
+---
+
+## Run 13 — the first platform build
+
+**A preview deployment HAS now been attempted, and it failed by design.**
+The repository is connected to Vercel through Chris's other Vercel account.
+Pushing `agent/staff-secure-onboarding` triggered Preview deployment
+`dpl_Ew4VxQhkPHdeErYomKcJgKuTzJzu`. Its Build Logs — inspected manually in
+that account — show the build stopped with `SUPABASE_URL is not set.`:
+`tools/build-static.mjs` failed closed exactly as designed. **No Preview was
+published.** The failed Preview was not retried or modified. `main` @
+`8ac657f` had previously deployed successfully.
+
+That observes two things and no more: **Vercel runs the configured
+`buildCommand`**, and **the fail-closed guard fires on the real platform**.
+Everything downstream of the build — `outputDirectory`, `api/` discovery,
+file tracing, the header rules — is still unobserved, because the build
+aborted before reaching any of it.
+
+### What run 13 DID validate
+
+- **Vercel executes `buildCommand`.** The build log shows
+  `tools/build-static.mjs` running and producing its own refusal message,
+  which is only possible if the platform invoked it.
+- **The fail-closed guard is real, not just local.** With no `SUPABASE_URL`
+  the build refuses rather than publishing a page whose `connect-src` names
+  nothing. That is the designed behaviour and it is now observed on the
+  platform rather than modelled.
+- **A failed build publishes nothing.** No Preview URL was produced.
+
+### What run 13 did NOT validate
+
+- **Everything downstream of the build.** `outputDirectory`, `api/` function
+  discovery alongside a `buildCommand`, file tracing from `api/` into
+  `server/` and `shared/`, and whether the header rules are applied to the
+  generated paths — the build aborted before any of it.
+- **A successful Preview.** None has been produced, because
+  `SUPABASE_URL` has not been set on any environment.
+- Nothing about Supabase, PostgREST, PostgreSQL 17, real Auth, real
+  invitations or real recovery emails changed. Runs 6, 10, 11 and 12 stand.
 
 ---
 
@@ -599,7 +642,9 @@ this run repeats them.
 
 ### What run 10 DID validate
 
-- **No credential reaches CED, observed on the wire.** The browser suite runs
+- **No ONBOARDING credential reaches CED, observed on the wire.** Scoped
+  deliberately: the console's own `/session` endpoints still exchange a
+  password and a TOTP code server-side and are unchanged. The browser suite runs
   two servers on two origins and records the raw body of every request to
   both. Across the full flow and the recovery flow, CED receives exactly one
   request — `GET …/auth-config` — with an empty body, an empty query string,
@@ -721,8 +766,8 @@ as the page.
 - **No authenticator app has read a real secret.** Manual key entry is
   documented app behaviour, not a thing observed here.
 - **Vercel.** The two new static files are in the manifest and the build
-  copies 29 rather than 27, but no `vercel build` and no preview deployment
-  has run — unchanged from run 8.
+  copies 29 rather than 27, but no local `vercel build` has run — unchanged
+  from run 8. A platform build has since run and failed closed; see run 13.
 
 ---
 

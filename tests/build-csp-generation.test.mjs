@@ -40,6 +40,7 @@ import { dirname, join, resolve, sep } from 'node:path';
 import { __testing as buildTesting } from '../tools/build-static.mjs';
 import supabaseOrigin from '../shared/security/supabase-origin.js';
 import { handleRequest } from '../server/staff-identity-resolution.mjs';
+import { PUBLISHABLE_FIXTURE, SECRET_FIXTURE } from './helpers/supabase-keys.mjs';
 
 const { validateSupabaseOrigin, validateLocalSupabaseOrigin, describeOriginFailure } =
   supabaseOrigin;
@@ -147,7 +148,7 @@ test('the loopback exception exists for local development and only there', () =>
 
 test('the loopback exception needs the switch, a loopback host and non-production', async () => {
   const local = 'http://127.0.0.1:5555';
-  const key = 'sb_publishable_x';
+  const key = PUBLISHABLE_FIXTURE;
 
   const call = (env, host = 'localhost') => handleRequest(
     new Request(`http://${host}/api/staff/identity-resolution/auth-config`, {
@@ -201,7 +202,7 @@ test('auth-config refuses exactly what the build refuses', async () => {
       new Request('https://staff.example.com/api/staff/identity-resolution/auth-config', {
         method: 'GET', headers: { 'sec-fetch-site': 'same-origin' }
       }), {
-        env: { SUPABASE_URL: value, SUPABASE_PUBLISHABLE_KEY: 'sb_publishable_x',
+        env: { SUPABASE_URL: value, SUPABASE_PUBLISHABLE_KEY: PUBLISHABLE_FIXTURE,
                CED_LOG_LEVEL: 'error' },
         correlationId: 'csp-test'
       });
@@ -220,8 +221,8 @@ test('auth-config returns only the origin and a publishable key, and is never ca
     }), {
       env: {
         SUPABASE_URL: `${DEVELOPMENT}/`,
-        SUPABASE_PUBLISHABLE_KEY: 'sb_publishable_only-this',
-        SUPABASE_SECRET_KEY: 'sb_secret_never-this',
+        SUPABASE_PUBLISHABLE_KEY: PUBLISHABLE_FIXTURE,
+        SUPABASE_SECRET_KEY: SECRET_FIXTURE,
         CED_RATE_LIMIT_SECRET: 'never-this-either',
         CED_CONTINUATION_SECRET: 'nor-this',
         CED_LOG_LEVEL: 'error'
@@ -236,10 +237,10 @@ test('auth-config returns only the origin and a publishable key, and is never ca
   assert.deepEqual(Object.keys(body).sort(), ['ok', 'publishableKey', 'supabaseUrl'],
     'no unrelated configuration travels with it');
   assert.equal(body.supabaseUrl, DEVELOPMENT, 'normalised, so it matches the CSP exactly');
-  assert.equal(body.publishableKey, 'sb_publishable_only-this');
+  assert.equal(body.publishableKey, PUBLISHABLE_FIXTURE);
 
   const text = JSON.stringify(body);
-  for (const secret of ['sb_secret_never-this', 'never-this-either', 'nor-this']) {
+  for (const secret of [SECRET_FIXTURE, 'never-this-either', 'nor-this']) {
     assert.equal(text.includes(secret), false);
   }
 });

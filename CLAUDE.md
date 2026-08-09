@@ -689,11 +689,19 @@ by routing private credentials through a CED function traded a non-problem for
 a real one. Do not reintroduce it — a test names those endpoints and fails if
 they come back.
 
-- **No credential touches CED.** The password, both session tokens, the TOTP
-  secret, the `otpauth://` URI and the six-digit code go from the browser to
-  Supabase Auth directly. The page's only CED call is
-  `GET …/auth-config`, which returns the project URL and the publishable key
-  and takes no body.
+- **No ONBOARDING OR RECOVERY credential touches CED.** The invitation token,
+  the recovery token, the password, both session tokens, the TOTP secret, the
+  `otpauth://` URI and the six-digit code go from the browser to Supabase Auth
+  directly. Those pages' only CED call is `GET …/auth-config`, which returns
+  the project origin and the publishable key and takes no body.
+
+  **This is a claim about onboarding and recovery, not about the whole
+  route.** The pre-existing console sign-in — `/session`,
+  `/session/refresh`, `/session/signout` — is deliberately server-mediated
+  and still handles the operator's password, TOTP code, access token and
+  refresh token, for the reasons in "Why the two pages differ" above. Those
+  endpoints are unchanged here and are out of scope for this rule. Anything
+  that reads as "no endpoint in this file accepts a credential" is wrong.
 - **The publishable key grants nothing, and that is a catalog fact.**
   `tests/migration/0007-anon-grants.test.mjs` proves in real PostgreSQL that
   `anon` and `authenticated` are refused SELECT, INSERT, UPDATE and DELETE on
@@ -880,9 +888,13 @@ Stated precisely, because everything below is still owed:
   deployment has set `SUPABASE_URL`, so no browser has been permitted to
   reach a real `*.supabase.co` origin from a staff page. Whether Vercel
   serves the header policy on the generated paths is still the run 8 gap.
-- **Vercel.** No `vercel build` and no preview deployment. Routing, header
-  rules, function count and file tracing are asserted against a *model* of
-  documented behaviour. That is a check on the configuration, not on the
+- **Vercel.** A Preview build has run on the platform and **failed closed**
+  with `SUPABASE_URL is not set.` — see run 13 in
+  [docs/REAL_POSTGRES_VALIDATION.md](docs/REAL_POSTGRES_VALIDATION.md). That
+  observes that Vercel executes `buildCommand` and that the guard works
+  there; it observes nothing downstream, because the build aborted. Routing,
+  header rules, function count and file tracing are still asserted against a
+  *model* of documented behaviour. That is a check on the configuration, not on the
   platform. What is no longer open is *what would be published*: the
   deployment now has an explicit output directory built from an allowlist
   (section 13). Whether Vercel honours that configuration is still platform
@@ -997,7 +1009,9 @@ under `shared/security/`, audit it first and record the audit.
 proves the build is deterministic, that the output is exactly the manifest,
 that every referenced asset resolves, and that no forbidden path appears.
 
-**Still unvalidated:** no `vercel build` and no preview deployment has been
-run. Whether the platform honours `outputDirectory`, still discovers `api/`
-functions alongside a build command, and still traces `server/` and `shared/`
-is documented behaviour that this repository models but has not observed.
+**Still unvalidated:** the only platform build so far failed closed at
+`tools/build-static.mjs` with `SUPABASE_URL is not set.`, which proves Vercel
+runs the `buildCommand` and nothing after it. Whether the platform honours
+`outputDirectory`, still discovers `api/` functions alongside a build
+command, and still traces `server/` and `shared/` is documented behaviour
+that this repository models but has not observed.

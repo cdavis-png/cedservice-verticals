@@ -6,7 +6,14 @@
    for the person who was interrupted after the invitation was
    already spent.
 
-   NO CREDENTIAL EVER REACHES A CED ENDPOINT.
+   NO ONBOARDING CREDENTIAL EVER REACHES A CED ENDPOINT.
+
+   Scoped, and the scope matters: this is a statement about THIS
+   page. The console's own sign-in (/session, /session/refresh,
+   /session/signout) is deliberately server-mediated and still
+   handles the operator's password and TOTP code — see
+   docs/STAFF_IDENTITY_RESOLUTION_OPERATIONS.md §1a for why the
+   two differ. Nothing here changes that.
 
    THE PASSWORD, THE SESSION TOKENS, THE TOTP SECRET, THE otpauth
    URI AND THE TOTP CODE GO STRAIGHT TO SUPABASE AUTH, from this

@@ -16,7 +16,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 
 import { STATIC_MANIFEST } from '../tools/static-manifest.mjs';
 
@@ -45,20 +45,62 @@ test('the vendored copy is byte-identical to the installed package', {
     'the vendored client differs from the installed package — re-copy it, do not edit it');
 });
 
-test('the vendored version matches the version this project depends on', () => {
-  const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
-  const declared = String(pkg.dependencies['@supabase/supabase-js'] || '').replace(/^[^0-9]*/, '');
-  const major = declared.split('.')[0];
+test('every statement of the version is the same exact version', () => {
+  /* THE DEFECT THIS PINS. The vendored README said 2.112.0 was "the exact
+     version in package.json / package-lock.json" while package.json said
+     `^2.45.0`. A caret range and a byte-identical vendored copy are a
+     contradiction waiting to happen: `npm install` on a clean checkout could
+     resolve 2.113.0, and the file a browser runs would silently no longer be
+     the library the project depends on.
+
+     FIVE PLACES STATE THIS VERSION. They are checked against each other here
+     so none can drift alone:
+
+       1. package.json                  the dependency spec
+       2. package-lock.json (root)      the declared range
+       3. package-lock.json (resolved)  what an install actually produces
+       4. the vendored filename         what a browser downloads
+       5. staff/vendor/README.md        what a reviewer is told
+
+     Plus, when node_modules is present, the installed copy itself. */
   const vendoredVersion = VENDORED.match(/supabase-js-([0-9.]+)\.umd\.js$/)[1];
 
-  assert.equal(vendoredVersion.split('.')[0], major,
-    'the vendored major version and the dependency must agree');
+  const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
+  const spec = String(pkg.dependencies['@supabase/supabase-js'] || '');
+  assert.equal(spec, vendoredVersion,
+    'package.json must pin the exact vendored version — a range may resolve to '
+    + 'something the vendored copy is not');
+  assert.equal(/^[\^~><=*]/.test(spec), false,
+    `the dependency must carry no range operator, found: ${spec}`);
+
+  const lock = JSON.parse(readFileSync(join(ROOT, 'package-lock.json'), 'utf8'));
+  assert.equal(lock.packages['']?.dependencies?.['@supabase/supabase-js'], vendoredVersion,
+    'the lockfile root declaration must match package.json exactly');
+  assert.equal(lock.packages['node_modules/@supabase/supabase-js']?.version, vendoredVersion,
+    'and the resolved entry must be that version');
+
+  const readme = readFileSync(README, 'utf8');
+  assert.ok(readme.includes(vendoredVersion), 'the README states the version');
+  assert.ok(readme.includes(basename(VENDORED)), 'and names the file exactly');
 
   if (existsSync(join(ROOT, INSTALLED))) {
     const installedPkg = JSON.parse(readFileSync(
       join(ROOT, 'node_modules/@supabase/supabase-js/package.json'), 'utf8'));
-    assert.equal(vendoredVersion, installedPkg.version,
-      'the filename must state the version that was actually copied');
+    assert.equal(installedPkg.version, vendoredVersion,
+      'the installed copy is the version the filename claims');
+  }
+});
+
+test('the README claim about pinning is true of the files it describes', () => {
+  /* The README is where a reviewer looks first. If it says "exact", the
+     manifest and the lockfile have to agree, or the document is the least
+     trustworthy thing in the directory. */
+  const readme = readFileSync(README, 'utf8');
+  const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
+  if (/exact version in `package\.json`/i.test(readme)) {
+    assert.equal(pkg.dependencies['@supabase/supabase-js'],
+      VENDORED.match(/supabase-js-([0-9.]+)\.umd\.js$/)[1],
+      'the README claims an exact pin; package.json must actually carry one');
   }
 });
 

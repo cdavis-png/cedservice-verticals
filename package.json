@@ -18,7 +18,7 @@
     "serve": "node tests/browser/serve.mjs"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.45.0"
+    "@supabase/supabase-js": "2.112.0"
   },
   "comments": {
     "moduleFormat": "Deliberately no \"type\": \"module\". The shared/ schema files are dual CommonJS/browser scripts loaded directly by static pages with no build step; declaring the package as ESM would break both. Server code uses .mjs, which Node and Vercel treat as ESM regardless.",

@@ -176,23 +176,96 @@ const decodeClaims = token => {
   } catch { return {}; }
 };
 
-/* Supabase issues two recognisable shapes for each privilege level: the
-   current `sb_secret_` / `sb_publishable_` prefixes, and legacy JWTs whose
-   payload carries `role`. Both are checked, and anything unrecognised is
-   left alone — a key we cannot classify is not evidence of anything. */
-const looksElevated = value => {
-  const v = String(value || '');
-  if (!v) return false;
-  if (v.startsWith('sb_secret_')) return true;
-  return decodeClaims(v).role === 'service_role';
+/* ---------- key classification ----------
+   POSITIVE, NOT RESIDUAL. THIS IS THE FIX FOR A REAL DEFECT.
+
+   These used to be "does it LOOK elevated / LOOK browser-safe", and
+   `lowPrivilegeKey` returned anything that did not look elevated. An
+   unrecognisable value — a truncated key, a typo, a whole `.env` line, a
+   password pasted into the wrong box — was therefore treated as a
+   publishable key and served to a browser by `/auth-config`. The check said
+   "not obviously the wrong one" and was read as "the right one".
+
+   A key we cannot classify is not evidence of anything, which is exactly why
+   it must be REFUSED rather than passed along. Both functions below answer
+   "is this positively one of the four types Supabase actually issues", and
+   everything else is unusable.
+
+   THE FOUR SUPPORTED TYPES, and nothing invented:
+
+     browser-safe   sb_publishable_<suffix>
+                    legacy JWT whose decoded `role` is exactly "anon"
+     elevated       sb_secret_<suffix>
+                    legacy JWT whose decoded `role` is exactly "service_role"
+
+   THE OPAQUE KEYS ARE MATCHED AGAINST THEIR DOCUMENTED FORMAT, WHOLE.
+
+   Supabase publishes the platform format as a prefix, a 22-character random
+   section, an underscore, and an 8-character checksum:
+
+     sb_publishable_<22 random>_<8 checksum>
+     sb_secret_<22 random>_<8 checksum>
+
+   A previous version required only "a non-empty URL-safe suffix", which
+   accepted `sb_publishable_x` and `sb_secret_abc` — values Supabase does not
+   issue and never will. Anchoring the whole string to the documented shape
+   costs nothing and turns a truncated or hand-typed key into a refusal at
+   configuration time rather than a 401 from Supabase later.
+
+   The character class is URL-safe base64: anything with whitespace, a quote,
+   a semicolon or other punctuation is a paste accident rather than a key.
+
+   ONE HONEST LIMIT. `_` is inside the class, so the 8-character checksum may
+   itself contain an underscore; a value with an extra separator is refused
+   only when that changes the total length. The anchored length is what does
+   the work here, and it is the documented format rather than an invented
+   stricter one. */
+const PUBLISHABLE_KEY_FORMAT = /^sb_publishable_[A-Za-z0-9_-]{22}_[A-Za-z0-9_-]{8}$/;
+const SECRET_KEY_FORMAT = /^sb_secret_[A-Za-z0-9_-]{22}_[A-Za-z0-9_-]{8}$/;
+
+/* A JWT this server never verifies — it only reads `role` to classify the
+   key's privilege. Requiring three non-empty parts and a decodable payload
+   means a truncated or hand-mangled token is refused rather than silently
+   decoding to `{}` and comparing against nothing. */
+const legacyKeyRole = value => {
+  const parts = String(value).split('.');
+  if (parts.length !== 3 || parts.some(p => p.length === 0)) return null;
+  let claims;
+  try {
+    claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+  } catch { return null; }
+  if (!claims || typeof claims !== 'object') return null;
+  return typeof claims.role === 'string' ? claims.role : null;
 };
 
-const looksBrowserSafe = value => {
-  const v = String(value || '');
-  if (!v) return false;
-  if (v.startsWith('sb_publishable_')) return true;
-  return decodeClaims(v).role === 'anon';
+const classifyKey = value => {
+  if (typeof value !== 'string') return null;
+  /* NOT trimmed. A key with surrounding whitespace is a value somebody pasted
+     badly, and quietly repairing it hides the mistake in the one place a
+     mistake is most expensive. */
+  if (value.length === 0) return null;
+
+  /* The prefix decides WHICH format applies, and the format then decides
+     whether the value is a key at all. Checking the prefix first means a
+     malformed publishable key is refused as a publishable key rather than
+     falling through to be tried as a JWT. */
+  if (value.startsWith('sb_publishable_')) {
+    return PUBLISHABLE_KEY_FORMAT.test(value) ? 'browser' : null;
+  }
+  if (value.startsWith('sb_secret_')) {
+    return SECRET_KEY_FORMAT.test(value) ? 'elevated' : null;
+  }
+
+  const role = legacyKeyRole(value);
+  if (role === 'anon') return 'browser';
+  if (role === 'service_role') return 'elevated';
+
+  /* Unrecognised. Not "probably fine". */
+  return null;
 };
+
+const looksElevated = value => classifyKey(value) === 'elevated';
+const looksBrowserSafe = value => classifyKey(value) === 'browser';
 
 /* ---------- environment keys ----------
    Supabase renamed its keys: `publishable` for the low-privilege key and
@@ -206,16 +279,36 @@ const looksBrowserSafe = value => {
    in the publishable variable is not returned, so the route answers
    `auth_unavailable` instead of quietly performing token verification with
    an elevated credential; a publishable key put in the secret variable is
-   not returned either. Neither mistake becomes a silent privilege change. */
-const lowPrivilegeKey = env => {
-  const chosen = env.SUPABASE_PUBLISHABLE_KEY || env.SUPABASE_ANON_KEY || '';
-  return looksElevated(chosen) ? '' : chosen;
+   not returned either. Neither mistake becomes a silent privilege change.
+
+   EACH RETURNS A VALUE ONLY WHEN THE KEY IS POSITIVELY OF ITS OWN TYPE. The
+   old rule — "return it unless it looks like the other one" — meant an
+   unclassifiable value was served as a publishable key. It is now refused.
+
+   AN INVALID PREFERRED VARIABLE DOES NOT FALL THROUGH TO THE LEGACY ONE.
+   `A || B` would have done exactly that: set `SUPABASE_PUBLISHABLE_KEY` to a
+   typo and the route would silently use `SUPABASE_ANON_KEY` instead, so the
+   deployment runs on a key nobody thinks is in use and the typo is invisible
+   until the day the legacy variable is removed. If the preferred variable is
+   SET AT ALL it is the one that decides, and a bad value there is a
+   misconfiguration to fix rather than a fallback to take.
+
+   Nothing here logs, returns or echoes a rejected value. The caller learns
+   only that no usable key exists. */
+const selectKey = (preferred, legacy, wanted) => {
+  /* "Set at all" is presence, not validity — an empty string is unset. */
+  const chosen = (typeof preferred === 'string' && preferred.length > 0)
+    ? preferred
+    : ((typeof legacy === 'string' && legacy.length > 0) ? legacy : '');
+  if (!chosen) return '';
+  return classifyKey(chosen) === wanted ? chosen : '';
 };
 
-const elevatedKey = env => {
-  const chosen = env.SUPABASE_SECRET_KEY || env.SUPABASE_SERVICE_ROLE_KEY || '';
-  return looksBrowserSafe(chosen) ? '' : chosen;
-};
+const lowPrivilegeKey = env =>
+  selectKey(env.SUPABASE_PUBLISHABLE_KEY, env.SUPABASE_ANON_KEY, 'browser');
+
+const elevatedKey = env =>
+  selectKey(env.SUPABASE_SECRET_KEY, env.SUPABASE_SERVICE_ROLE_KEY, 'elevated');
 
 /* Structured, identifiers-only, same rule as the public route: no contact
    detail, no token, no identifier value, and no credential the sign-in
@@ -396,6 +489,42 @@ const caseIdFrom = segment => {
     fail(400, 'invalid_case_id', 'A case id must be a UUID.');
   }
   return decoded;
+};
+
+/* ---------- a body where none is permitted ----------
+   THIS EXISTS BECAUSE THE CLAIM WAS UNTESTABLE AS WRITTEN. "auth-config
+   accepts no body" was only ever exercised with POST/PUT/PATCH/DELETE, which
+   are refused for their METHOD long before any body is considered. A GET
+   carrying a body was never checked, and whether the runtime hands one over
+   is the platform's business, not ours to assume.
+
+   THREE SIGNALS, NONE OF WHICH READS THE BODY. Reading it would mean
+   buffering something we have already decided is not allowed, and a value we
+   never read is a value we cannot accidentally log:
+
+     · Content-Length, when it declares a non-zero length;
+     · Transfer-Encoding, in any form — a chunked body declares no length at
+       all, so length alone would miss it;
+     · request.body being present, which is what a Web-standard runtime
+       exposes when a body was actually attached.
+
+   The stream is left untouched and un-cancelled. The answer is a stable 400
+   with a fixed code and no detail: the caller learns the shape was wrong and
+   nothing about what arrived. */
+const assertNoBody = request => {
+  const declared = request.headers.get('content-length');
+  if (declared !== null && declared.trim() !== '' && Number(declared) > 0) {
+    fail(400, 'unexpected_body', 'This endpoint accepts no request body.');
+  }
+  const encoding = request.headers.get('transfer-encoding');
+  if (encoding !== null && encoding.trim() !== '') {
+    fail(400, 'unexpected_body', 'This endpoint accepts no request body.');
+  }
+  /* Truthy only when a body was genuinely attached; a bodyless Request has
+     `null` here in every runtime this repository targets. */
+  if (request.body) {
+    fail(400, 'unexpected_body', 'This endpoint accepts no request body.');
+  }
 };
 
 const readBody = async request => {
@@ -763,7 +892,21 @@ export async function handleRequest(request, deps = {}) {
        a same-origin read that a browser sends no Origin for. Both refusals
        happen here, so neither costs a bucket. */
     assertOrigin(request, env, url);
-    if (request.body) assertJsonContentType(request);
+
+    /* A SAFE METHOD CARRYING A BODY IS REFUSED AS A BODY PROBLEM, before the
+       content-type gate below can call it a content-type problem.
+
+       No endpoint this route serves over GET or HEAD reads a body, so one is
+       always a mistake or a probe. Answering `415 unsupported_media_type`
+       would be misleading — the media type is not the issue — and it would
+       invite the caller to retry with `application/json`, which would then be
+       ignored. `400 unexpected_body` is the honest answer, and it is reached
+       without reading a byte. */
+    if (SAFE_METHODS.has(String(request.method || '').toUpperCase())) {
+      assertNoBody(request);
+    } else if (request.body) {
+      assertJsonContentType(request);
+    }
 
     /* The elevated client, built at most once per request and only when
        something actually needs it. */
@@ -887,6 +1030,11 @@ export async function handleRequest(request, deps = {}) {
         return json(405, { ok: false, code: 'method_not_allowed', message: 'GET is required.' },
           correlationId, { Allow: 'GET' });
       }
+      /* Before the key is read and before anything is built. A GET with a
+         body is not a request this endpoint serves, and refusing it without
+         reading it is what makes "accepts no body" true rather than
+         incidental. */
+      assertNoBody(request);
       /* THE SAME VALIDATOR THE BUILD USES, on the same variable, so the
          origin this hands the browser and the origin the browser is
          PERMITTED to reach by the generated connect-src cannot disagree.
@@ -1172,5 +1320,7 @@ export const __testing = {
   insecureAllowed, LOCAL_HOSTS, verifiedTotpFactor,
   defaultAuthClient, SIGN_OUT_LOCAL, staffOrigins, decodeSegment,
   assertOrigin, SAFE_METHODS, SAFE_FETCH_SITES,
-  MAX_BODY_BYTES, MAX_NOTE, MIN_NOTE, MIN_SUBSTANTIVE_NOTE
+  MAX_BODY_BYTES, MAX_NOTE, MIN_NOTE, MIN_SUBSTANTIVE_NOTE,
+  classifyKey, legacyKeyRole, selectKey, assertNoBody,
+  PUBLISHABLE_KEY_FORMAT, SECRET_KEY_FORMAT
 };

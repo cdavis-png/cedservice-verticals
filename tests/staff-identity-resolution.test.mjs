@@ -23,6 +23,7 @@ import assert from 'node:assert/strict';
 import { randomUUID, createHash } from 'node:crypto';
 
 import { handleRequest, __testing } from '../server/staff-identity-resolution.mjs';
+import { PUBLISHABLE_FIXTURE, SECRET_FIXTURE } from './helpers/supabase-keys.mjs';
 
 const OPERATOR = '11111111-1111-4111-8111-111111111111';
 const CASE_ID = '22222222-2222-4222-8222-222222222222';
@@ -607,25 +608,53 @@ test('the request body limit counts bytes, not UTF-16 code units', async () => {
 test('the current Supabase key names are preferred and the old ones still work', () => {
   const { lowPrivilegeKey, elevatedKey } = __testing;
 
-  assert.equal(lowPrivilegeKey({ SUPABASE_PUBLISHABLE_KEY: 'new' }), 'new');
-  assert.equal(lowPrivilegeKey({ SUPABASE_ANON_KEY: 'legacy' }), 'legacy',
+  /* REAL-SHAPED VALUES, because classification is now POSITIVE: a key is
+     usable only if it is one of the four types Supabase issues. Bare
+     placeholders like 'new' and 'legacy' are exactly what used to be served
+     to a browser as a publishable key, and are now refused. */
+  const b64 = v => Buffer.from(JSON.stringify(v)).toString('base64url');
+  const legacyJwt = role => `${b64({ alg: 'HS256' })}.${b64({ role })}.sig`;
+  const NEW_PUB = PUBLISHABLE_FIXTURE;
+  const OLD_PUB = legacyJwt('anon');
+  const NEW_SECRET = SECRET_FIXTURE;
+  const OLD_SECRET = legacyJwt('service_role');
+
+  assert.equal(lowPrivilegeKey({ SUPABASE_PUBLISHABLE_KEY: NEW_PUB }), NEW_PUB);
+  assert.equal(lowPrivilegeKey({ SUPABASE_ANON_KEY: OLD_PUB }), OLD_PUB,
     'an existing project keeps working');
-  assert.equal(lowPrivilegeKey({ SUPABASE_PUBLISHABLE_KEY: 'new', SUPABASE_ANON_KEY: 'legacy' }),
-    'new', 'the current name wins');
+  assert.equal(
+    lowPrivilegeKey({ SUPABASE_PUBLISHABLE_KEY: NEW_PUB, SUPABASE_ANON_KEY: OLD_PUB }),
+    NEW_PUB, 'the current name wins');
   assert.equal(lowPrivilegeKey({}), '');
 
-  assert.equal(elevatedKey({ SUPABASE_SECRET_KEY: 'new' }), 'new');
-  assert.equal(elevatedKey({ SUPABASE_SERVICE_ROLE_KEY: 'legacy' }), 'legacy');
-  assert.equal(elevatedKey({ SUPABASE_SECRET_KEY: 'new', SUPABASE_SERVICE_ROLE_KEY: 'legacy' }),
-    'new');
+  assert.equal(elevatedKey({ SUPABASE_SECRET_KEY: NEW_SECRET }), NEW_SECRET);
+  assert.equal(elevatedKey({ SUPABASE_SERVICE_ROLE_KEY: OLD_SECRET }), OLD_SECRET);
+  assert.equal(
+    elevatedKey({ SUPABASE_SECRET_KEY: NEW_SECRET, SUPABASE_SERVICE_ROLE_KEY: OLD_SECRET }),
+    NEW_SECRET);
   assert.equal(elevatedKey({}), '');
 
   /* The two must never be read from each other's variable: the low-privilege
      key is used to verify a token, the elevated one to call RPC, and a
      deployment that crosses them must fail rather than quietly change
      privilege. */
-  assert.equal(lowPrivilegeKey({ SUPABASE_SECRET_KEY: 'secret' }), '');
-  assert.equal(elevatedKey({ SUPABASE_PUBLISHABLE_KEY: 'publishable' }), '');
+  assert.equal(lowPrivilegeKey({ SUPABASE_SECRET_KEY: NEW_SECRET }), '');
+  assert.equal(elevatedKey({ SUPABASE_PUBLISHABLE_KEY: NEW_PUB }), '');
+  assert.equal(lowPrivilegeKey({ SUPABASE_PUBLISHABLE_KEY: NEW_SECRET }), '',
+    'a secret key in the publishable variable is refused, not returned');
+  assert.equal(elevatedKey({ SUPABASE_SECRET_KEY: NEW_PUB }), '');
+
+  /* AND THE DEFECT THIS REPLACED: an unclassifiable value is no longer
+     treated as a publishable key just because it is not a secret one. */
+  for (const junk of ['new', 'legacy', 'hunter2', 'sb_publishable_', 'not.a.jwt']) {
+    assert.equal(lowPrivilegeKey({ SUPABASE_PUBLISHABLE_KEY: junk }), '', junk);
+    assert.equal(elevatedKey({ SUPABASE_SECRET_KEY: junk }), '', junk);
+  }
+
+  /* An INVALID preferred variable does not fall through to the legacy one. */
+  assert.equal(
+    lowPrivilegeKey({ SUPABASE_PUBLISHABLE_KEY: 'typo', SUPABASE_ANON_KEY: OLD_PUB }), '',
+    'a typo must surface as a misconfiguration, not silently use the legacy key');
 });
 
 test('an unconfigured deployment says so rather than failing obscurely', async () => {

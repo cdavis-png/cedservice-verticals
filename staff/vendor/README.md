@@ -7,7 +7,7 @@ serves to a browser.
 |---|---|
 | File | `supabase-js-2.112.0.umd.js` |
 | Package | `@supabase/supabase-js` |
-| Version | 2.112.0 — the exact version in `package.json` / `package-lock.json` |
+| Version | 2.112.0 — pinned exactly (no range) in `package.json`, the `package-lock.json` root declaration, and the resolved lock entry |
 | Source | `node_modules/@supabase/supabase-js/dist/umd/supabase.js` |
 | Bytes | 210770 |
 | SHA-256 | `eb7564b09d311fd7b0375a7c0dc687a4c7c8ca9eda22c7823285fe86cfb21601` |
@@ -55,6 +55,12 @@ something tried.
 3. Update the manifest entry in `tools/static-manifest.mjs`, this file's
    table, and the checksum.
 4. Run `npm test`. `tests/staff-vendor-integrity.test.mjs` fails if the
-   vendored copy and the installed package differ by a single byte.
+   vendored copy and the installed package differ by a single byte, and if
+   any of the five statements of the version disagree: `package.json`, the
+   `package-lock.json` root declaration, the resolved lock entry, the
+   filename above, and this table. The dependency must carry **no range
+   operator** — a caret and a byte-identical vendored copy contradict each
+   other, because a clean install could resolve a version the vendored file
+   is not.
 
 Never edit this file by hand. It is not source; it is a copy.

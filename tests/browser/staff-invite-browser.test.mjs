@@ -42,6 +42,7 @@ import { dirname, resolve, extname, normalize, sep, join } from 'node:path';
 
 import { handleRequest } from '../../server/staff-identity-resolution.mjs';
 import { __testing as buildTesting } from '../../tools/build-static.mjs';
+import { PUBLISHABLE_FIXTURE, SECRET_FIXTURE } from '../helpers/supabase-keys.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const PAGE = '/staff/identity-resolution/accept-invite.html';
@@ -78,8 +79,8 @@ const TOKEN_HASH = 'pkce_9d3f2a1b8c7e6d5f4a3b2c1d0e9f8a7b6c5d4e3f';
 const PASSWORD = 'a-long-enough-passphrase';
 const SECRET = 'JBSWY3DPEHPK3PXP';
 const URI = `otpauth://totp/CED:${EMAIL}?secret=${SECRET}&issuer=CED`;
-const PUBLISHABLE = 'sb_publishable_browser-fixture-not-real';
-const SECRET_KEY = 'sb_secret_must-never-reach-a-browser';
+const PUBLISHABLE = PUBLISHABLE_FIXTURE;
+const SECRET_KEY = SECRET_FIXTURE;
 
 const b64 = v => Buffer.from(JSON.stringify(v)).toString('base64url');
 const jwt = c => `${b64({ alg: 'HS256', typ: 'JWT' })}.${b64(c)}.sig`;

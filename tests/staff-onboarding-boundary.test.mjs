@@ -19,11 +19,23 @@
 
      · the credential endpoints are GONE, and cannot come back
        without failing a test that names them;
-     · no CED endpoint accepts or returns any of the seven values;
+     · no ONBOARDING OR RECOVERY path accepts or returns any of
+       the seven values — a scoped claim, see below;
      · `GET …/auth-config` returns the project URL and the
        publishable key and nothing else, and refuses to serve an
        elevated key that was pasted into the wrong variable;
      · the console's own sign-in and authorization are unchanged.
+
+   WHAT THIS FILE DOES NOT CLAIM, because it would be false. The
+   console's own sign-in endpoints — /session, /session/refresh,
+   /session/signout — are PRE-EXISTING, deliberately
+   server-mediated, and still handle the operator's password, TOTP
+   code, access token and refresh token. They are unchanged by
+   this work and are out of scope here. Every assertion below is
+   about the ONBOARDING AND RECOVERY surface: the endpoints that
+   were removed, and the one configuration endpoint that replaced
+   them. A test that fired credentials at /session and expected a
+   refusal would be testing that sign-in is broken.
 
    The browser half is tests/browser/staff-invite-browser.test.mjs.
    The grant half — that the publishable key can reach nothing —
@@ -37,6 +49,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 
 import { handleRequest, __testing } from '../server/staff-identity-resolution.mjs';
+import { PUBLISHABLE_FIXTURE, SECRET_FIXTURE } from './helpers/supabase-keys.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const SERVER_SRC = readFileSync(join(ROOT, 'server/staff-identity-resolution.mjs'), 'utf8');
@@ -49,8 +62,8 @@ const ENV = {
   /* A real-shaped project host: the origin is validated as an exact
      <ref>.supabase.co, so a placeholder-looking one is refused. */
   SUPABASE_URL: 'https://qkpptajglstgucadhfwq.supabase.co',
-  SUPABASE_PUBLISHABLE_KEY: 'sb_publishable_demo-not-real',
-  SUPABASE_SECRET_KEY: 'sb_secret_demo-not-real',
+  SUPABASE_PUBLISHABLE_KEY: PUBLISHABLE_FIXTURE,
+  SUPABASE_SECRET_KEY: SECRET_FIXTURE,
   CED_LOG_LEVEL: 'debug'
 };
 
@@ -200,6 +213,319 @@ test('auth-config accepts no body and only GET', async () => {
   }
 });
 
+/* ============================================================
+   2a. Key classification is POSITIVE, and fails closed
+   ------------------------------------------------------------
+   THE DEFECT THIS PINS. `lowPrivilegeKey` used to return anything
+   that did not LOOK elevated. An unrecognisable value — a
+   truncated key, a typo, a whole `.env` line, a password pasted
+   into the wrong box — was therefore served to a browser by
+   /auth-config as though it were a publishable key. "Not
+   obviously wrong" was being read as "right".
+
+   Supabase issues exactly four key shapes. Anything else is now
+   refused, in both directions.
+   ============================================================ */
+
+const ANON_JWT = jwt({ role: 'anon', iss: 'supabase' });
+const SERVICE_JWT = jwt({ role: 'service_role', iss: 'supabase' });
+const PUBLISHABLE = PUBLISHABLE_FIXTURE;
+const SECRET = SECRET_FIXTURE;
+
+/* Everything that is NOT one of the four supported types. */
+const UNCLASSIFIABLE = [
+  ['', 'empty'],
+  ['   ', 'whitespace only'],
+  ['hunter2', 'an arbitrary string'],
+  ['SUPABASE_PUBLISHABLE_KEY=sb_publishable_x', 'a whole .env line'],
+  ['sb_publishable_', 'an empty suffix'],
+  ['sb_secret_', 'an empty secret suffix'],
+  ['sb_publishable', 'a truncated prefix'],
+  ['sb_publishable_ abc', 'a suffix with a space'],
+  ['sb_publishable_abc def', 'a suffix with an inner space'],
+  ['sb_publishable_abc\n', 'a trailing newline'],
+  [' sb_publishable_abc', 'a leading space'],
+  ['sb_publishable_abc"', 'a suffix with a quote'],
+  ['sb_publishable_abc;drop', 'a suffix with a semicolon'],
+  ['sb_publishable_abc.def', 'a suffix with a dot'],
+  ['eyJhbGciOiJIUzI1NiJ9', 'a one-part JWT'],
+  ['eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoiYW5vbiJ9', 'a two-part JWT'],
+  ['a..c', 'a three-part JWT with an empty payload'],
+  ['aaa.!!!not-base64!!!.ccc', 'an undecodable payload'],
+  [`${jwt({ iss: 'supabase' })}`, 'a JWT with no role'],
+  [`${jwt({ role: 'authenticated' })}`, 'a JWT with an unsupported role'],
+  [`${jwt({ role: 'ANON' })}`, 'a JWT whose role is the wrong case'],
+  [`${jwt({ role: ['anon'] })}`, 'a JWT whose role is not a string'],
+  ['sb_service_role_abc', 'an invented prefix'],
+  ['pk_live_abcdef', 'another vendor\'s key shape']
+];
+
+/* The documented platform format: prefix, 22-character random section, an
+   underscore, an 8-character checksum. Built from parts so every rejection
+   below differs from a valid key in exactly one stated way. */
+const R22 = 'AbCdEfGhIjKlMnOpQrStUv';        /* 22 */
+const C8 = 'Wx01Yz23';                       /* 8  */
+
+test('the opaque key format is the documented one, exactly', () => {
+  assert.equal(R22.length, 22, 'the fixture random section is the documented length');
+  assert.equal(C8.length, 8, 'and so is the checksum');
+  assert.equal(__testing.classifyKey(`sb_publishable_${R22}_${C8}`), 'browser');
+  assert.equal(__testing.classifyKey(`sb_secret_${R22}_${C8}`), 'elevated');
+
+  /* The regexes are anchored, whole-string, and shared with the tests. */
+  assert.match(`sb_publishable_${R22}_${C8}`, __testing.PUBLISHABLE_KEY_FORMAT);
+  assert.match(`sb_secret_${R22}_${C8}`, __testing.SECRET_KEY_FORMAT);
+});
+
+test('a key of the wrong shape is refused, one deviation at a time', () => {
+  /* THE DEFECT THIS PINS. The rule used to be "any non-empty URL-safe
+     suffix", which accepted `sb_publishable_x` and `sb_secret_abc` — values
+     Supabase does not issue. Each case below is a valid key with exactly one
+     thing wrong with it. */
+  const cases = [
+    [`sb_publishable_${R22.slice(0, 21)}_${C8}`, 'a 21-character random section'],
+    [`sb_publishable_${R22}x_${C8}`, 'a 23-character random section'],
+    [`sb_publishable_${R22}_${C8.slice(0, 7)}`, 'a 7-character checksum'],
+    [`sb_publishable_${R22}_${C8}x`, 'a 9-character checksum'],
+    [`sb_publishable_${'A'.repeat(31)}`, 'no separator at all, correct total length'],
+    [`sb_publishable_${R22}__${C8}`, 'an extra separator'],
+    [`sb_publishable__${C8}`, 'an empty random section'],
+    [`sb_publishable_${R22}_`, 'an empty checksum'],
+    [`sb_publishable_${R22}`, 'no checksum section'],
+    [`sb_publishable_${R22.slice(0, 21)}.${'_'}${C8}`, 'a dot in the random section'],
+    [`sb_publishable_${R22}_${C8.slice(0, 7)}!`, 'a bang in the checksum'],
+    [`sb_publishable_${R22.slice(0, 21)} _${C8}`, 'a space in the random section'],
+    [`sb_publishable_${R22}_${C8}\n`, 'a trailing newline'],
+    [` sb_publishable_${R22}_${C8}`, 'a leading space'],
+    [`sb_publishable_${R22}_${C8} `, 'a trailing space'],
+    /* Correct length and correct shape, wrong prefix. */
+    [`sb_publishble_${R22}_${C8}`, 'a misspelled prefix'],
+    [`sb_public_${R22}_${C8}`, 'a truncated prefix word'],
+    [`sb_publishablex_${R22}_${C8}`, 'a prefix with no separator'],
+    [`sbpublishable_${R22}_${C8}`, 'a prefix missing its underscore'],
+    [`SB_PUBLISHABLE_${R22}_${C8}`, 'an upper-case prefix'],
+    [`pk_live_${R22}_${C8}`, 'another vendour\'s prefix']
+  ];
+
+  for (const [value, label] of cases) {
+    assert.equal(__testing.classifyKey(value), null, `${label} must not classify`);
+    assert.equal(__testing.lowPrivilegeKey({ SUPABASE_PUBLISHABLE_KEY: value }), '', label);
+    /* And the same deviations on the secret side. */
+    const asSecret = value.replace('sb_publishable_', 'sb_secret_');
+    assert.equal(__testing.elevatedKey({ SUPABASE_SECRET_KEY: asSecret }), '',
+      `${label} (secret)`);
+  }
+});
+
+test('the one ambiguity the documented format carries is stated, not hidden', () => {
+  /* `_` is inside the character class, so an "extra separator" that keeps the
+     total length correct is indistinguishable from a checksum containing an
+     underscore. This is a property of the format Supabase documents, not a
+     gap invented here — recorded so the rejection list above is not read as
+     stronger than it is. A separator that CHANGES the length is refused, and
+     that case is covered above. */
+  const sneaky = `sb_publishable_${R22.slice(0, 10)}_${R22.slice(11)}_${C8}`;
+  assert.equal(sneaky.length, `sb_publishable_${R22}_${C8}`.length,
+    'same total length as a valid key');
+  assert.equal(__testing.classifyKey(sneaky), 'browser',
+    'accepted, because the documented format cannot tell it apart — and it is '
+    + 'still the right prefix, the right length and the right alphabet');
+});
+
+test('classifyKey recognises exactly the four supported types', () => {
+  assert.equal(__testing.classifyKey(PUBLISHABLE), 'browser');
+  assert.equal(__testing.classifyKey(ANON_JWT), 'browser');
+  assert.equal(__testing.classifyKey(SECRET), 'elevated');
+  assert.equal(__testing.classifyKey(SERVICE_JWT), 'elevated');
+
+  for (const [value, label] of UNCLASSIFIABLE) {
+    assert.equal(__testing.classifyKey(value), null, `${label} must not classify`);
+  }
+  for (const bad of [null, undefined, 42, {}, [], true]) {
+    assert.equal(__testing.classifyKey(bad), null, String(bad));
+  }
+});
+
+test('auth-config returns 503 for every value that is not a publishable key', async () => {
+  /* THE POINT: a browser must never be handed something that merely was not
+     recognised as a secret. */
+  const rejected = [
+    ...UNCLASSIFIABLE.map(([v, l]) => [v, l]),
+    [SECRET, 'a secret key'],
+    [SERVICE_JWT, 'a service_role JWT']
+  ];
+
+  for (const [value, label] of rejected) {
+    const { value: response, lines } = await capture(() => get('/auth-config', {
+      env: { ...ENV, SUPABASE_PUBLISHABLE_KEY: value, SUPABASE_ANON_KEY: '' }
+    }));
+    assert.equal(response.status, 503, label);
+    const text = await response.text();
+    assert.equal(JSON.parse(text).code, 'auth_unavailable', label);
+    /* And the rejected value is never echoed or logged. */
+    if (value.trim().length > 3) {
+      assert.equal(text.includes(value), false, `${label} was echoed`);
+      assert.equal(lines.join('\n').includes(value), false, `${label} was logged`);
+    }
+  }
+});
+
+test('auth-config serves a positively classified publishable key, either spelling', async () => {
+  for (const [preferred, legacy, expected] of [
+    [PUBLISHABLE, '', PUBLISHABLE],
+    ['', ANON_JWT, ANON_JWT]
+  ]) {
+    const response = await get('/auth-config', {
+      env: { ...ENV, SUPABASE_PUBLISHABLE_KEY: preferred, SUPABASE_ANON_KEY: legacy }
+    });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).publishableKey, expected);
+  }
+});
+
+test('an invalid preferred variable does NOT fall back to the legacy one', async () => {
+  /* `A || B` would have done exactly that: a typo in the preferred variable
+     would silently run the deployment on the legacy key, so the typo stays
+     invisible until the legacy variable is removed. */
+  const response = await get('/auth-config', {
+    env: { ...ENV, SUPABASE_PUBLISHABLE_KEY: 'typo-not-a-key', SUPABASE_ANON_KEY: ANON_JWT }
+  });
+  assert.equal(response.status, 503);
+  assert.equal((await response.json()).code, 'auth_unavailable');
+
+  /* Same rule on the elevated pair. */
+  assert.equal(__testing.selectKey('typo', SERVICE_JWT, 'elevated'), '');
+  /* An ABSENT preferred variable still uses the legacy one — the rule is
+     about invalid, not about missing. */
+  assert.equal(__testing.selectKey(undefined, SERVICE_JWT, 'elevated'), SERVICE_JWT);
+  assert.equal(__testing.selectKey('', ANON_JWT, 'browser'), ANON_JWT);
+});
+
+test('the elevated key fails closed on exactly the same terms', async () => {
+  /* The reverse boundary. An unclassifiable value in the secret variable must
+     not be used for the privileged RPC either. */
+  assert.equal(__testing.elevatedKey({ SUPABASE_SECRET_KEY: SECRET }), SECRET);
+  assert.equal(__testing.elevatedKey({ SUPABASE_SERVICE_ROLE_KEY: SERVICE_JWT }), SERVICE_JWT);
+
+  for (const [value, label] of [...UNCLASSIFIABLE, [PUBLISHABLE, 'a publishable key'],
+                                [ANON_JWT, 'an anon JWT']]) {
+    assert.equal(__testing.elevatedKey({ SUPABASE_SECRET_KEY: value }), '',
+      `${label} must not be usable as the elevated key`);
+  }
+
+  /* And with no usable elevated key the privileged path is unavailable
+     rather than attempted. */
+  const request = new Request(`${PREFIX}/cases`, {
+    method: 'GET',
+    headers: { authorization: `Bearer ${AAL2}`, 'sec-fetch-site': 'same-origin' }
+  });
+  const response = await handleRequest(request, {
+    env: { ...ENV, SUPABASE_SECRET_KEY: 'not-a-key', SUPABASE_SERVICE_ROLE_KEY: '' },
+    verifyAccessToken: async () => ({ userId: USER, aal: 'aal2', emailConfirmed: true }),
+    correlationId: 'boundary-test'
+  });
+  assert.equal(response.status, 503);
+  assert.equal((await response.json()).code, 'database_unavailable');
+});
+
+/* ============================================================
+   2b. GET /auth-config accepts no body — actually
+   ------------------------------------------------------------
+   THE DEFECT THIS PINS. The old test only sent bodies with
+   POST/PUT/PATCH/DELETE, which are refused for their METHOD long
+   before a body is considered. A GET carrying a body was never
+   exercised at all.
+
+   The standard Request constructor forbids a GET body, so the
+   boundary is driven with a Request-like fixture that reports
+   exactly what a runtime would: the headers, and a body stream.
+   ============================================================ */
+
+/* Minimal and honest: only the surface handleRequest actually touches. The
+   body stream is deliberately readable, so a handler that DID read it would
+   succeed — the test would then fail on the 200, not on a throw. */
+const getWithBody = ({ headers = {}, body = null } = {}) => ({
+  method: 'GET',
+  url: `${PREFIX}/auth-config`,
+  headers: new Headers({ 'sec-fetch-site': 'same-origin', ...headers }),
+  body
+});
+
+const streamOf = text => new ReadableStream({
+  start(controller) { controller.enqueue(new TextEncoder().encode(text)); controller.close(); }
+});
+
+test('a GET with a declared Content-Length is refused without being read', async () => {
+  /* The probe is in `pull` with highWaterMark 0, and both details matter.
+     `start` runs when the stream is CONSTRUCTED, so a flag set there is true
+     before handleRequest ever sees the request. And with the DEFAULT queuing
+     strategy the stream pulls once immediately to fill its queue, which is
+     equally not a read by our code. highWaterMark 0 means `pull` fires only
+     when a consumer actually asks for a chunk. */
+  let read = false;
+  const stream = new ReadableStream({
+    pull(controller) {
+      read = true;
+      controller.enqueue(new TextEncoder().encode('{"password":"leaked"}'));
+      controller.close();
+    }
+  }, { highWaterMark: 0 });
+
+  const { value: response, lines } = await capture(() => handleRequest(
+    getWithBody({ headers: { 'content-length': '21' }, body: stream }),
+    { env: ENV, db: noDatabase, authClient: noAuthClient, correlationId: 'boundary-test' }));
+
+  assert.equal(response.status, 400);
+  const body = await response.json();
+  assert.equal(body.code, 'unexpected_body');
+  assert.equal(read, false, 'the body stream was never pulled');
+  assert.equal(JSON.stringify(body).includes('leaked'), false);
+  assert.equal(lines.join('\n').includes('leaked'), false);
+});
+
+test('a GET with a chunked body is refused, which length alone would miss', async () => {
+  const { value: response } = await capture(() => handleRequest(
+    getWithBody({
+      headers: { 'transfer-encoding': 'chunked' },
+      body: streamOf('{"password":"leaked"}')
+    }),
+    { env: ENV, db: noDatabase, authClient: noAuthClient, correlationId: 'boundary-test' }));
+
+  assert.equal(response.status, 400);
+  assert.equal((await response.json()).code, 'unexpected_body');
+});
+
+test('a GET with a body and no framing headers is refused on the stream alone', async () => {
+  const { value: response } = await capture(() => handleRequest(
+    getWithBody({ body: streamOf('{"password":"leaked"}') }),
+    { env: ENV, db: noDatabase, authClient: noAuthClient, correlationId: 'boundary-test' }));
+
+  assert.equal(response.status, 400);
+  assert.equal((await response.json()).code, 'unexpected_body');
+});
+
+test('a body-bearing GET builds no Auth client and reads no privileged data', async () => {
+  /* `noDatabase` throws on any property access and `noAuthClient` throws when
+     called; a 400 rather than a 500 is the proof neither was touched. */
+  const { value: response } = await capture(() => handleRequest(
+    getWithBody({ headers: { 'content-length': '21' }, body: streamOf('{"a":1}') }),
+    { env: ENV, db: noDatabase, authClient: noAuthClient, correlationId: 'boundary-test' }));
+  assert.equal(response.status, 400);
+});
+
+test('a Content-Length of zero is not a body, and an ordinary GET still works', async () => {
+  for (const headers of [{}, { 'content-length': '0' }]) {
+    const response = await handleRequest(
+      getWithBody({ headers }),
+      { env: ENV, db: noDatabase, authClient: noAuthClient, correlationId: 'boundary-test' });
+    assert.equal(response.status, 200, JSON.stringify(headers));
+  }
+
+  /* And the real, standard Request the console actually sends is unaffected. */
+  const real = await get('/auth-config');
+  assert.equal(real.status, 200);
+});
+
 test('auth-config still proves provenance before it answers', async () => {
   /* It is a safe method, so the Fetch Metadata rule applies rather than the
      Origin one — the same gate as every other read on this route. */
@@ -225,12 +551,19 @@ test('auth-config touches no database and builds no Auth client', async () => {
 });
 
 /* ============================================================
-   3. No CED endpoint accepts a credential
+   3. No ONBOARDING OR RECOVERY path accepts a credential
+   ------------------------------------------------------------
+   Scoped, and the title says so. The console's /session endpoints
+   are excluded BY NAME below rather than by omission, because
+   omitting them silently is how the earlier over-broad claim —
+   "no CED endpoint accepts a credential" — came to be believed.
    ============================================================ */
 
-test('no CED endpoint accepts a password, token, TOTP code, secret or URI', async () => {
-  /* Fired at every path this route serves. Nothing may answer `ok: true`, and
-     nothing may echo a submitted value back. */
+test('no onboarding or recovery path accepts a password, token, TOTP code, secret or URI', async () => {
+  /* Fired at every removed onboarding path, the configuration endpoint, the
+     queue, and some plausible names an onboarding route might be given later.
+     Nothing may answer `ok: true`, and nothing may echo a submitted value
+     back. */
   const CREDENTIALS = {
     password: 'a-long-enough-passphrase',
     tokenHash: 'pkce_deadbeefdeadbeefdeadbeefdeadbeef',
@@ -244,6 +577,14 @@ test('no CED endpoint accepts a password, token, TOTP code, secret or URI', asyn
   const paths = ['/auth-config', '/onboarding/invite', '/onboarding/verify',
                  '/cases', '/enroll', '/register', '/signup'];
 
+  /* NOT in the list, deliberately: /session, /session/refresh and
+     /session/signout. They accept a password and a TOTP code on purpose, and
+     asserting they refuse one would assert that sign-in does not work. */
+  for (const excluded of ['/session', '/session/refresh', '/session/signout']) {
+    assert.equal(paths.includes(excluded), false,
+      `${excluded} is server-mediated by design and is out of scope for this test`);
+  }
+
   for (const path of paths) {
     const { value: response, lines } = await capture(() => post(path, CREDENTIALS));
     const text = await response.text();
@@ -256,13 +597,25 @@ test('no CED endpoint accepts a password, token, TOTP code, secret or URI', asyn
   }
 });
 
-test('the console sign-in endpoints are the only ones that see a password, unchanged', () => {
-  /* This is not a regression in disguise: `/session` has always exchanged a
-     password for a token and still does. What changed is that onboarding no
-     longer does, and the file must still contain exactly one such path. */
+test('the console sign-in endpoints DO still handle credentials, and that is intended', () => {
+  /* THE HONEST OTHER HALF. `/session` has always exchanged a password and a
+     TOTP code for a token, and still does — it is not a defect and it is not
+     in scope for this change. Asserting its presence keeps the scoped claims
+     above truthful: exactly one password-exchange path exists, it is the
+     console sign-in, and it is reachable. */
   const signInCalls = SERVER_SRC.match(/signInWithPassword/g) || [];
   assert.equal(signInCalls.length, 1, 'exactly one password exchange remains');
   assert.ok(SERVER_SRC.includes('const handleSignIn'), 'and it is the console sign-in');
+  assert.ok(SERVER_SRC.includes('challengeAndVerify'),
+    'the console still verifies a TOTP code server-side');
+  /* The routing line itself, as a literal — a regex over the whole source
+     would have to anchor, and anchoring against a whole file is how a test
+     silently matches nothing. */
+  assert.ok(SERVER_SRC.includes("path.match(/\\/session(?:\\/(refresh|signout))?$/)"),
+    'and the three session endpoints are still routed');
+  for (const handler of ['handleSignIn', 'handleRefresh', 'handleSignOut']) {
+    assert.ok(SERVER_SRC.includes(`const ${handler}`), `${handler} is still present`);
+  }
 });
 
 /* ============================================================

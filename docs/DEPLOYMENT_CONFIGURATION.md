@@ -30,8 +30,9 @@ the config now contains only supported properties.
 asserts that every top-level key in `vercel.json` is one the schema defines, so
 a future pseudo-comment fails a test rather than a deployment.
 
-**This is a check on the configuration, not on the platform.** No `vercel build`
-and no preview deployment has been run — see "What is still unvalidated" below.
+**This is a check on the configuration, not on the platform.** One platform
+build has run and failed closed before reaching any of this — see "What is
+still unvalidated" below.
 
 ---
 
@@ -213,7 +214,18 @@ The routing, header and output-directory behaviour asserted by
 [tests/static-output-contract.test.mjs](../tests/static-output-contract.test.mjs)
 and [tests/staff-deployment-contract.test.mjs](../tests/staff-deployment-contract.test.mjs)
 is a model of Vercel's **documented** behaviour, not an observation of the
-platform. **No `vercel build` and no preview deployment has been run.**
+platform.
+
+**One platform build has run.** The repository is connected to Vercel through
+Chris's other Vercel account; pushing `agent/staff-secure-onboarding`
+triggered Preview deployment `dpl_Ew4VxQhkPHdeErYomKcJgKuTzJzu`, whose Build
+Logs show it failed with `SUPABASE_URL is not set.` — `tools/build-static.mjs`
+failing closed as designed. No Preview was published, and the failed Preview
+was not retried or modified. `main` @ `8ac657f` had previously deployed
+successfully.
+
+That confirms Vercel executes `buildCommand` and that the guard fires on the
+platform. It confirms nothing below, because the build aborted first.
 
 Specifically still unobserved:
 

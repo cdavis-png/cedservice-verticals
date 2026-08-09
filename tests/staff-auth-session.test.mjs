@@ -29,8 +29,17 @@ const FACTOR = 'f0000000-0000-4000-8000-000000000001';
 
 const ENV = {
   SUPABASE_URL: 'https://example.supabase.co',
-  SUPABASE_ANON_KEY: 'anon-never-real',
-  SUPABASE_SERVICE_ROLE_KEY: 'service-never-real',
+  /* Real-SHAPED, never real. Key classification is POSITIVE now: a bare
+     placeholder is refused, so a fixture must be one of the four types
+     Supabase issues or the route answers 503 before the test starts. Written
+     as literals rather than built with the b64 helper below, which is
+     declared after this object. The payloads decode to {"role":"anon"} and
+     {"role":"service_role"}; the signature segment is nonsense on purpose and
+     is never verified — only the role is read, to classify privilege. */
+  SUPABASE_ANON_KEY:
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiJ9.anon-never-real',
+  SUPABASE_SERVICE_ROLE_KEY:
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoic2VydmljZV9yb2xlIn0.service-never-real',
   CED_LOG_LEVEL: 'error'
 };
 

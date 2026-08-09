@@ -30,6 +30,7 @@ import { randomUUID, createHmac } from 'node:crypto';
 
 import { handleRequest, __testing } from '../server/staff-identity-resolution.mjs';
 import rateLimit from '../shared/security/rate-limit.js';
+import { PUBLISHABLE_FIXTURE, SECRET_FIXTURE } from './helpers/supabase-keys.mjs';
 
 const OPERATOR = '11111111-1111-4111-8111-111111111111';
 const CASE_ID = '22222222-2222-4222-8222-222222222222';
@@ -870,26 +871,44 @@ test('an elevated key in a browser-key variable is refused, not used', () => {
   const serviceJwt = jwt({ role: 'service_role', iss: 'supabase' });
   const anonJwt = jwt({ role: 'anon', iss: 'supabase' });
 
-  assert.equal(looksElevated('sb_secret_abc123'), true);
+  assert.equal(looksElevated(SECRET_FIXTURE), true);
   assert.equal(looksElevated(serviceJwt), true);
-  assert.equal(looksElevated('sb_publishable_abc123'), false);
-  assert.equal(looksBrowserSafe('sb_publishable_abc123'), true);
+  assert.equal(looksElevated(PUBLISHABLE_FIXTURE), false);
+  assert.equal(looksBrowserSafe(PUBLISHABLE_FIXTURE), true);
   assert.equal(looksBrowserSafe(anonJwt), true);
 
   /* THE MISTAKE THIS CATCHES: a secret key pasted into the publishable
      variable. Token verification would otherwise have run with an elevated
      credential and nothing would have said so. */
-  assert.equal(lowPrivilegeKey({ SUPABASE_PUBLISHABLE_KEY: 'sb_secret_oops' }), '');
+  assert.equal(lowPrivilegeKey({ SUPABASE_PUBLISHABLE_KEY: SECRET_FIXTURE }), '');
   assert.equal(lowPrivilegeKey({ SUPABASE_ANON_KEY: serviceJwt }), '');
-  assert.equal(elevatedKey({ SUPABASE_SECRET_KEY: 'sb_publishable_oops' }), '');
+  assert.equal(elevatedKey({ SUPABASE_SECRET_KEY: PUBLISHABLE_FIXTURE }), '');
   assert.equal(elevatedKey({ SUPABASE_SERVICE_ROLE_KEY: anonJwt }), '');
 
-  /* The right keys in the right places still work, and an unrecognised string
-     is left alone rather than guessed about. */
-  assert.equal(lowPrivilegeKey({ SUPABASE_PUBLISHABLE_KEY: 'sb_publishable_ok' }),
-    'sb_publishable_ok');
-  assert.equal(elevatedKey({ SUPABASE_SECRET_KEY: 'sb_secret_ok' }), 'sb_secret_ok');
-  assert.equal(lowPrivilegeKey({ SUPABASE_ANON_KEY: 'opaque-local-value' }), 'opaque-local-value');
+  /* The right keys in the right places still work. */
+  assert.equal(lowPrivilegeKey({ SUPABASE_PUBLISHABLE_KEY: PUBLISHABLE_FIXTURE }),
+    PUBLISHABLE_FIXTURE);
+  assert.equal(elevatedKey({ SUPABASE_SECRET_KEY: SECRET_FIXTURE }), SECRET_FIXTURE);
+
+  /* AND AN UNRECOGNISED STRING IS REFUSED, NOT "LEFT ALONE".
+
+     This assertion used to read
+       lowPrivilegeKey({ SUPABASE_ANON_KEY: 'opaque-local-value' })
+         === 'opaque-local-value'
+     and it was the defect written down as a guarantee. Classification was
+     residual — "return it unless it looks elevated" — so a truncated key, a
+     typo, a whole .env line or a password pasted into the wrong box was
+     handed to a browser by /auth-config as a publishable key.
+
+     A key we cannot classify is not evidence of anything, which is exactly
+     why it must fail closed. `looksBrowserSafe` and `looksElevated` are now
+     positive tests for the four types Supabase actually issues. */
+  assert.equal(lowPrivilegeKey({ SUPABASE_ANON_KEY: 'opaque-local-value' }), '',
+    'an unclassifiable value must never be served as a publishable key');
+  assert.equal(looksBrowserSafe('opaque-local-value'), false);
+  assert.equal(looksElevated('opaque-local-value'), false);
+  assert.equal(looksBrowserSafe('sb_publishable_'), false, 'an empty suffix is not a key');
+  assert.equal(looksElevated('sb_secret_'), false);
 });
 
 test('a misconfigured browser key makes sign-in unavailable rather than elevated', async () => {

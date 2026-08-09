@@ -43,6 +43,7 @@ import { dirname, resolve, extname, normalize, sep, join } from 'node:path';
 
 import { handleRequest } from '../../server/staff-identity-resolution.mjs';
 import { __testing as buildTesting } from '../../tools/build-static.mjs';
+import { PUBLISHABLE_FIXTURE, SECRET_FIXTURE } from '../helpers/supabase-keys.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const INVITE_PAGE = '/staff/identity-resolution/accept-invite.html';
@@ -82,7 +83,7 @@ const RECOVERY_TOKEN = 'pkce_ffffeeeeddddccccbbbbaaaa99998888777766665';
 const OLD_PASSWORD = 'a-long-enough-passphrase';
 const NEW_PASSWORD = 'a-different-long-passphrase';
 const SECRET = 'JBSWY3DPEHPK3PXP';
-const PUBLISHABLE = 'sb_publishable_recovery-fixture-not-real';
+const PUBLISHABLE = PUBLISHABLE_FIXTURE;
 
 const b64 = v => Buffer.from(JSON.stringify(v)).toString('base64url');
 const jwt = c => `${b64({ alg: 'HS256', typ: 'JWT' })}.${b64(c)}.sig`;
@@ -320,7 +321,7 @@ const startCedServer = auth => new Promise(res => {
   const env = {
     CED_ALLOW_INSECURE_STAFF: 'true', CED_LOG_LEVEL: 'debug',
     SUPABASE_URL: auth.origin, SUPABASE_PUBLISHABLE_KEY: PUBLISHABLE,
-    SUPABASE_SECRET_KEY: 'sb_secret_must-never-reach-a-browser'
+    SUPABASE_SECRET_KEY: SECRET_FIXTURE
   };
   const db = new Proxy({}, {
     get(_t, prop) { throw new Error(`the database was reached: ${String(prop)}`); }

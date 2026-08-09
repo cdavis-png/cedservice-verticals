@@ -22,7 +22,10 @@
    — in every case the account exists, and in every case this sets
    a password the resume flow can then use.
 
-   NO CREDENTIAL REACHES CED. The email, the recovery token, the
+   NO RECOVERY CREDENTIAL REACHES CED — a statement about this
+   page, not about the whole route: the console's own /session
+   endpoints remain server-mediated and still handle a password
+   and a TOTP code. The email, the recovery token, the
    new password and every Supabase session go straight to Supabase
    Auth from this page, with the publishable key. The only CED
    request is a GET for the project URL and that key.
