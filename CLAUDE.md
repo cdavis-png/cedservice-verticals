@@ -160,9 +160,15 @@ which runs PostgreSQL 17.6.1.155. That was established on 2026-08-09 by
 read-only PostgREST existence-versus-permission probes, and it corrected a
 claim this file carried for some time: that neither had ever been hosted.
 
-**Present is not "matches what is committed".** The deployed definitions have
-not been compared against these files, `supabase_migrations.schema_migrations`
-has not been read, and when and how they were applied is unknown. Nothing has
+A read-only hosted preflight has since read
+`supabase_migrations.schema_migrations` — **0001–0007 are recorded**, 0008 is
+not — and compared the deployed `enforce_bir_supersession_scope()` against
+migration 0006, which **matches exactly**. All three of 0008's findings are
+confirmed against the real database, including that `service_role` really does
+hold EXECUTE on the twelve internal functions from 0001/0004/0006.
+
+What is still open is narrower: no OTHER deployed definition has been diffed
+against its committed file, and nothing has been *executed* there. Nothing has
 been successfully *called* over PostgREST — the probes were permission
 refusals — so section M of the integration suite still has not run there, and
 neither have the staff route's five RPCs or its two direct table reads.
@@ -872,14 +878,14 @@ session or continuation, and splices no supersession chain. RLS is enabled and
 
 Stated precisely, because everything below is still owed:
 
-- **What the hosted definitions ARE.** 0007 **is** present on the hosted
-  development project `qkpptajglstgucadhfwq` (PostgreSQL 17.6.1.155), so the
-  two entries that used to head this list — "never run on 17", "never applied
-  to a hosted database" — were false and are gone. What replaces them is
-  narrower and still open: nobody has compared a single deployed definition
-  against this repository, read
-  `supabase_migrations.schema_migrations`, or established when or how 0007
-  was applied. Treat the hosted schema as *present and uncharacterised*.
+- **What most of the hosted definitions ARE.** 0007 is present on the hosted
+  development project `qkpptajglstgucadhfwq` (PostgreSQL 17.6.1.155) and
+  recorded as `20260808201535`, so the two entries that used to head this
+  list — "never run on 17", "never applied to a hosted database" — were false
+  and are gone. The migration history has been read and **one** deployed
+  definition, `enforce_bir_supersession_scope()`, has been compared and
+  matches. Every other function in 0006 and 0007 is still undiffed against its
+  committed source.
 - **PostgREST.** Its objects have been RESOLVED through PostgREST — that is
   what the run 14 probes did — but none of the five functions the route calls
   has ever been successfully **called** through it, and neither have the two
@@ -1069,26 +1075,57 @@ and touches neither 0006 nor 0007.
 
 ### Present is not the same as known
 
-The probes that found 0006 and 0007 distinguished *permission denied* from
-*not found*. They read no definition. So for anything already hosted:
+Run 15's preflight read the history and compared the one function 0008 must
+replace. It did not diff the rest, so the working assumption for anything
+already hosted stays:
 
-- **Do not assume a deployed object matches the committed file.** An earlier
-  draft, a hand-edit in the SQL editor, or a half-applied file all look
-  identical from outside.
+- **Do not assume a deployed object matches the committed file** until it has
+  been read. An earlier draft, a hand-edit in the SQL editor, or a
+  half-applied file all look identical from outside.
 - **Prefer the narrowest instrument.** `alter function … set`, `revoke`,
   `create index if not exists` change one thing and leave a body alone.
   `create or replace function` **overwrites whatever is deployed**, so use it
   only where the body must change, and compare the deployed definition first.
-- **Write every statement to be re-runnable**, because the current state is
-  partly unknown and a second attempt must be safe.
+  0008 does this once, and that comparison has been done.
+- **Write every statement to be re-runnable.**
 
-### Before applying anything
+### Applying a migration must also RECORD it
 
-The procedure — including how to read the deployed definition, how to check
-the migration-history rows, and what to do when they disagree with the files —
-is [docs/SUPABASE_SETUP.md §2](docs/SUPABASE_SETUP.md). **Do not run
-`supabase db push` against this project** until the history rows have been
-read: the CLI's view of what is applied has never been reconciled with what is
-actually there.
+`supabase_migrations.schema_migrations` records 0001–0007. A migration applied
+without a history row leaves the two disagreeing, and nothing downstream can
+then tell an unrecorded migration from an unapplied one.
+
+- **Do not paste a migration into the SQL editor.** It applies the DDL and
+  records nothing. Earlier guidance in this repository said to do exactly
+  that; it was wrong.
+- **Do not use `supabase db push`.**
+- Use a tracked mechanism that applies the file and writes its history row in
+  one operation.
+
+The full procedure, including the verification queries, is
+[docs/SUPABASE_SETUP.md §2](docs/SUPABASE_SETUP.md).
 
 0008 is committed, tested, and **applied nowhere**.
+
+### One elevated key, one selector
+
+`SUPABASE_SECRET_KEY` is preferred everywhere;
+`SUPABASE_SERVICE_ROLE_KEY` is the legacy name and a fallback only when the
+preferred variable is **unset**. All three server surfaces —
+`api/assessments.mjs`, `api/analytics.mjs` and
+`server/staff-identity-resolution.mjs` — resolve it through
+[shared/security/supabase-keys.js](shared/security/supabase-keys.js) and none
+reads either variable directly. A test asserts that last part by reading the
+sources.
+
+They used to disagree: the staff route preferred the modern name and the two
+public endpoints read only the legacy one, so a deployment following current
+Supabase documentation brought up the authenticated console while assessment
+capture answered `503 not_configured`. **A split credential configuration
+fails in the direction that leaves the privileged surface working and the
+public one dark**, which is the direction nobody notices. Do not reintroduce a
+second place that reads an elevated key variable.
+
+A preferred variable that is set but malformed **fails closed and does not
+fall back** — a typo must be a refusal to fix rather than a silent demotion to
+the legacy key.

@@ -68,9 +68,10 @@ steps in [SUPABASE_SETUP.md](SUPABASE_SETUP.md) connect it to a live database.
 Ordering in the function is deliberate: everything that can refuse a request
 cheaply runs before anything that costs a network call or a transaction.
 
-The browser never sees a credential. `SUPABASE_SERVICE_ROLE_KEY` is read only
-inside the function, and the Supabase client is imported lazily so the module
-loads (and the tests run) without it.
+The browser never sees a credential. The elevated key — `SUPABASE_SECRET_KEY`,
+or the legacy `SUPABASE_SERVICE_ROLE_KEY` — is selected by
+`shared/security/supabase-keys.js` and read only inside the function, and the
+Supabase client is imported lazily so the module loads without it.
 
 **Why the BIR is generated before the transaction.** The BIR is a pure function
 of the payload — nothing about it depends on which business it belongs to except

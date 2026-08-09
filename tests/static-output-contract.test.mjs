@@ -676,6 +676,7 @@ test('a direct URL for a private path resolves to nothing', () => {
     '/api/assessments.mjs',
     '/shared/security/rate-limit.js',
     '/shared/security/origin.js',
+    '/shared/security/supabase-keys.js',
     '/shared/security/read-body.js',
     '/shared/security/staff-note.js',
     '/shared/security/verify-challenge.js',

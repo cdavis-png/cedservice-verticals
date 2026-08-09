@@ -199,10 +199,19 @@ export const STATIC_MANIFEST = Object.freeze([
          file on the server cannot be influenced by browser state.
 
      Readable source is not a credential. Every other file in this directory
-     is server-only and MUST NOT be added: origin.js, rate-limit.js,
-     read-body.js, staff-note.js, verify-challenge.js and limits.js are
-     enforcement code that no page loads. A test asserts this directory's
-     output contents are exactly the one line below. */
+     is server-only and MUST NOT be added: origin.js, supabase-origin.js,
+     supabase-keys.js, rate-limit.js, read-body.js, staff-note.js,
+     verify-challenge.js and limits.js are enforcement code that no page
+     loads. A test asserts this directory's output contents are exactly the
+     one line below.
+
+     supabase-keys.js deserves a specific note, because its name invites the
+     wrong assumption twice over. It holds NO key — it classifies one, and
+     decides which environment variable to read — so nothing in it is a
+     credential. That is not why it is withheld. It is withheld because it is
+     server-side credential-selection logic that no page has any use for, and
+     because `Buffer` makes it Node-only anyway. Publishing it would leak no
+     secret and would still be wrong. */
   'shared/security/continuation.js'
 ]);
 
@@ -233,6 +242,7 @@ export const PUBLIC_SECURITY_MODULES = Object.freeze([
 export const SERVER_ONLY_SECURITY_MODULES = Object.freeze([
   'shared/security/origin.js',
   'shared/security/supabase-origin.js',
+  'shared/security/supabase-keys.js',
   'shared/security/rate-limit.js',
   'shared/security/read-body.js',
   'shared/security/staff-note.js',

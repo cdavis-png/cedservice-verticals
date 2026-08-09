@@ -6,8 +6,10 @@
    This file performs no partial writes of its own: every durable
    effect happens inside ingest_assessment().
 
-   SUPABASE_SERVICE_ROLE_KEY is read here and never leaves the
-   server. Nothing in this file is reachable from browser code.
+   The elevated Supabase key — SUPABASE_SECRET_KEY, or the legacy
+   SUPABASE_SERVICE_ROLE_KEY — is selected by
+   shared/security/supabase-keys.js, read here, and never leaves
+   the server. Nothing in this file is reachable from browser code.
 
    ------------------------------------------------------------
    Threat position (Milestone 1.1)
@@ -44,6 +46,7 @@ import bodyReader from '../shared/security/read-body.js';
 import challenge from '../shared/security/verify-challenge.js';
 import continuation from '../shared/security/continuation.js';
 import rateLimit from '../shared/security/rate-limit.js';
+import supabaseKeys from '../shared/security/supabase-keys.js';
 
 const { stableStringify } = bie;
 const { REVIEW_TYPES, DEFAULT_REVIEW_TYPE, readReviewType, entryFor } = registry;
@@ -590,17 +593,39 @@ const runWithTimeout = async (factory, timeoutMs, label) => {
 
 /* ---------- database ---------- */
 
+/* The elevated key is selected by `shared/security/supabase-keys.js`, which is
+   the single definition of "prefer SUPABASE_SECRET_KEY, accept the legacy
+   SUPABASE_SERVICE_ROLE_KEY, and refuse anything that is not positively an
+   elevated key". This file used to read the legacy variable directly, so a
+   deployment configured the way Supabase currently documents — secret key
+   only — left the staff console working and THIS endpoint answering
+   `not_configured`, with no logged cause.
+
+   A malformed value in the preferred variable does NOT fall through to the
+   legacy one; it returns '' and this endpoint refuses to run. That is the
+   intended direction: capture stopping loudly is recoverable, and capture
+   silently running on a key nobody believes is in use is not.
+
+   The cache is keyed on (url, key), the way server/staff-identity-resolution.mjs
+   already keys its own. A bare `if (cachedClient) return cachedClient` outlived
+   any change to either value, so a rotated key inside a warm instance kept the
+   client built from the old one. */
 let cachedClient = null;
 const getClient = async env => {
-  if (cachedClient) return cachedClient;
-  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
+  const url = env.SUPABASE_URL || '';
+  const key = supabaseKeys.elevatedKey(env);
+  if (!url || !key) {
     fail(503, 'not_configured', 'Assessment capture is not configured.', undefined, RETRY_AFTER.database);
   }
+  if (cachedClient && cachedClient.url === url && cachedClient.key === key) {
+    return cachedClient.client;
+  }
   const { createClient } = await import('@supabase/supabase-js');
-  cachedClient = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
+  const client = createClient(url, key, {
     auth: { persistSession: false, autoRefreshToken: false }
   });
-  return cachedClient;
+  cachedClient = { url, key, client };
+  return client;
 };
 
 /* supabase-js returns a thenable builder that accepts an abort signal;
@@ -1145,3 +1170,12 @@ export const TIMEOUTS = {
   DEFAULT_DB_TIMEOUT_MS,
   CHALLENGE_MAX_SUBMISSION_AGE_MS
 };
+
+/* Exported so the suite can exercise the PRODUCTION client factory — the same
+   function handleRequest uses when `deps.db` is absent, which is always in a
+   deployment. It is what proves this endpoint reads SUPABASE_SECRET_KEY and
+   accepts the legacy SUPABASE_SERVICE_ROLE_KEY only as a fallback; before the
+   shared selector it read the legacy name and nothing else. Nothing reads an
+   environment variable to decide whether to use it, so there is no
+   production-controllable path into the injection seam. */
+export const __testing = { getClient };

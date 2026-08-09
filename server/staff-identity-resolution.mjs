@@ -96,6 +96,7 @@ import rateLimit from '../shared/security/rate-limit.js';
 import bodyReader from '../shared/security/read-body.js';
 import originPolicy from '../shared/security/origin.js';
 import supabaseOriginPolicy from '../shared/security/supabase-origin.js';
+import supabaseKeys from '../shared/security/supabase-keys.js';
 
 const { screenResolutionNote } = staffNote;
 const {
@@ -198,117 +199,23 @@ const decodeClaims = token => {
      elevated       sb_secret_<suffix>
                     legacy JWT whose decoded `role` is exactly "service_role"
 
-   THE OPAQUE KEYS ARE MATCHED AGAINST THEIR DOCUMENTED FORMAT, WHOLE.
+   The classifier, the two documented key formats, the legacy-JWT role read
+   and the preferred-then-legacy variable rule all now live in
+   `shared/security/supabase-keys.js`. They moved there unchanged, because
+   `api/assessments.mjs` and `api/analytics.mjs` read only
+   `SUPABASE_SERVICE_ROLE_KEY` and a deployment configured with just
+   `SUPABASE_SECRET_KEY` therefore brought THIS route up while leaving
+   assessment ingestion and analytics answering `not_configured`. That module
+   states the whole rule and why each half of it fails closed; this route
+   holds the names it already used so nothing below had to change.
 
-   Supabase publishes the platform format as a prefix, a 22-character random
-   section, an underscore, and an 8-character checksum:
-
-     sb_publishable_<22 random>_<8 checksum>
-     sb_secret_<22 random>_<8 checksum>
-
-   A previous version required only "a non-empty URL-safe suffix", which
-   accepted `sb_publishable_x` and `sb_secret_abc` — values Supabase does not
-   issue and never will. Anchoring the whole string to the documented shape
-   costs nothing and turns a truncated or hand-typed key into a refusal at
-   configuration time rather than a 401 from Supabase later.
-
-   The character class is URL-safe base64: anything with whitespace, a quote,
-   a semicolon or other punctuation is a paste accident rather than a key.
-
-   ONE HONEST LIMIT. `_` is inside the class, so the 8-character checksum may
-   itself contain an underscore; a value with an extra separator is refused
-   only when that changes the total length. The anchored length is what does
-   the work here, and it is the documented format rather than an invented
-   stricter one. */
-const PUBLISHABLE_KEY_FORMAT = /^sb_publishable_[A-Za-z0-9_-]{22}_[A-Za-z0-9_-]{8}$/;
-const SECRET_KEY_FORMAT = /^sb_secret_[A-Za-z0-9_-]{22}_[A-Za-z0-9_-]{8}$/;
-
-/* A JWT this server never verifies — it only reads `role` to classify the
-   key's privilege. Requiring three non-empty parts and a decodable payload
-   means a truncated or hand-mangled token is refused rather than silently
-   decoding to `{}` and comparing against nothing. */
-const legacyKeyRole = value => {
-  const parts = String(value).split('.');
-  if (parts.length !== 3 || parts.some(p => p.length === 0)) return null;
-  let claims;
-  try {
-    claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
-  } catch { return null; }
-  if (!claims || typeof claims !== 'object') return null;
-  return typeof claims.role === 'string' ? claims.role : null;
-};
-
-const classifyKey = value => {
-  if (typeof value !== 'string') return null;
-  /* NOT trimmed. A key with surrounding whitespace is a value somebody pasted
-     badly, and quietly repairing it hides the mistake in the one place a
-     mistake is most expensive. */
-  if (value.length === 0) return null;
-
-  /* The prefix decides WHICH format applies, and the format then decides
-     whether the value is a key at all. Checking the prefix first means a
-     malformed publishable key is refused as a publishable key rather than
-     falling through to be tried as a JWT. */
-  if (value.startsWith('sb_publishable_')) {
-    return PUBLISHABLE_KEY_FORMAT.test(value) ? 'browser' : null;
-  }
-  if (value.startsWith('sb_secret_')) {
-    return SECRET_KEY_FORMAT.test(value) ? 'elevated' : null;
-  }
-
-  const role = legacyKeyRole(value);
-  if (role === 'anon') return 'browser';
-  if (role === 'service_role') return 'elevated';
-
-  /* Unrecognised. Not "probably fine". */
-  return null;
-};
-
-const looksElevated = value => classifyKey(value) === 'elevated';
-const looksBrowserSafe = value => classifyKey(value) === 'browser';
-
-/* ---------- environment keys ----------
-   Supabase renamed its keys: `publishable` for the low-privilege key and
-   `secret` for the elevated one. The old `anon` and `service_role` names
-   still work on existing projects, so both are accepted and the current
-   name is preferred. Which one was used is never logged — the NAME is not
-   sensitive but the habit of logging around key material is.
-
-   The two are kept strictly apart, and the separation FAILS CLOSED in both
-   directions rather than merely being separate variables. A secret key put
-   in the publishable variable is not returned, so the route answers
-   `auth_unavailable` instead of quietly performing token verification with
-   an elevated credential; a publishable key put in the secret variable is
-   not returned either. Neither mistake becomes a silent privilege change.
-
-   EACH RETURNS A VALUE ONLY WHEN THE KEY IS POSITIVELY OF ITS OWN TYPE. The
-   old rule — "return it unless it looks like the other one" — meant an
-   unclassifiable value was served as a publishable key. It is now refused.
-
-   AN INVALID PREFERRED VARIABLE DOES NOT FALL THROUGH TO THE LEGACY ONE.
-   `A || B` would have done exactly that: set `SUPABASE_PUBLISHABLE_KEY` to a
-   typo and the route would silently use `SUPABASE_ANON_KEY` instead, so the
-   deployment runs on a key nobody thinks is in use and the typo is invisible
-   until the day the legacy variable is removed. If the preferred variable is
-   SET AT ALL it is the one that decides, and a bad value there is a
-   misconfiguration to fix rather than a fallback to take.
-
-   Nothing here logs, returns or echoes a rejected value. The caller learns
-   only that no usable key exists. */
-const selectKey = (preferred, legacy, wanted) => {
-  /* "Set at all" is presence, not validity — an empty string is unset. */
-  const chosen = (typeof preferred === 'string' && preferred.length > 0)
-    ? preferred
-    : ((typeof legacy === 'string' && legacy.length > 0) ? legacy : '');
-  if (!chosen) return '';
-  return classifyKey(chosen) === wanted ? chosen : '';
-};
-
-const lowPrivilegeKey = env =>
-  selectKey(env.SUPABASE_PUBLISHABLE_KEY, env.SUPABASE_ANON_KEY, 'browser');
-
-const elevatedKey = env =>
-  selectKey(env.SUPABASE_SECRET_KEY, env.SUPABASE_SERVICE_ROLE_KEY, 'elevated');
+   `shared/security/supabase-keys.js` is SERVER-ONLY — absent from the static
+   manifest and asserted absent from the published output by name. */
+const {
+  PUBLISHABLE_KEY_FORMAT, SECRET_KEY_FORMAT,
+  legacyKeyRole, classifyKey, looksElevated, looksBrowserSafe,
+  selectKey, lowPrivilegeKey, elevatedKey
+} = supabaseKeys;
 
 /* Structured, identifiers-only, same rule as the public route: no contact
    detail, no token, no identifier value, and no credential the sign-in
@@ -1597,6 +1504,12 @@ export async function handleRequest(request, deps = {}) {
    the exact argument rather than restating the object and agreeing with
    itself. */
 export const __testing = {
+  /* The production elevated-client factory, exported for the same reason
+     `defaultAuthClient` is: tests/supabase-key-selection.test.mjs exercises all
+     three server surfaces through the factory each one really uses, so "every
+     consumer prefers SUPABASE_SECRET_KEY" is observed rather than asserted of
+     a shared helper called a second time. */
+  getServiceClient,
   requestHash, OVERRIDE_REASONS, classifyDbError, decodeClaims,
   lowPrivilegeKey, elevatedKey, looksElevated, looksBrowserSafe,
   insecureAllowed, LOCAL_HOSTS, verifiedTotpFactor,

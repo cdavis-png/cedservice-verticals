@@ -19,6 +19,12 @@ closed. Everything below was observed, not predicted.
 > have not been compared against this repository, the migration-history rows
 > have not been read, and the application time and method are unknown. Do not
 > read "present" as "matches what is committed".
+>
+> **Run 15 closes most of that.** The history rows are read (0001–0007
+> recorded, 0008 not), the supersession function is compared (it matches), and
+> all three of 0008's findings are confirmed against the real database. What
+> is still open: nothing has been *executed* there, and only the one function
+> has been diffed.
 
 ## Runs
 
@@ -570,6 +576,38 @@ staff route's `requestHash` omitted the resolution note, so a second call on
 one request id with a rewritten justification replayed the first outcome and
 discarded the new note. Repaired in `server/staff-identity-resolution.mjs`.
 
+### Deferred findings — recorded, deliberately not repaired
+
+Two audit findings are carried forward rather than fixed. Both are recorded
+here so that "not fixed" is a decision with a reason attached rather than an
+omission somebody rediscovers.
+
+- **`ingest_review` rule B4v is a dead branch.** 0006 lines 1204–1205 test
+  `v_proposal_vetoed or v_proposals_disagree` inside an `else` reachable only
+  when both are false, so B4v can never fire. The OUTCOME is unaffected — the
+  earlier branch already queues for review — but a vetoed submission skips
+  candidate discovery entirely, so its `identity_resolution_cases` row carries
+  an empty `candidate_business_ids` even where identifier candidates exist.
+
+  **Not a blocker for the staff resolution path**, and this is the reason it
+  can wait: 0007 derives the operator's eligible targets from the case's
+  persisted proposal evidence through
+  `identity_case_eligible_targets`, not from `candidate_business_ids`. An
+  operator working a proposal-vetoed case still sees targets. Repairing B4v is
+  a change to what a queued case RECORDS, which is worth doing on its own
+  terms and worth keeping out of a migration-hardening pass.
+
+- **Unacceptable identity values are handled two ways.**
+  `identity_proposal_conflict` REFUSES a value failing
+  `identity_value_acceptable`; the candidate-matching CTE and the
+  signal-writing loop silently FILTER one. Both directions are safe here —
+  filtering a value out of candidate matching cannot cause a wrong link, it
+  can only fail to find a right one — but the same input produces a refusal on
+  one path and a shrug on another, and that inconsistency is the kind that
+  gets resolved in the wrong direction later.
+
+Neither was touched by 0008 or by the source reconciliation that followed it.
+
 ### Verification
 
 `tests/migration/0008-migration-hardening.test.mjs` applies the chain to 0007,
@@ -584,6 +622,96 @@ explicitly first, so the revoke has something real to remove.
 **0008 has not been applied anywhere.** It is committed, tested against
 PostgreSQL 18.3 through PGlite, and unapplied — on the hosted development
 project and everywhere else.
+
+---
+
+## Run 15 — the hosted preflight for 0008
+
+Run 14 found that 0006 and 0007 were present and said, repeatedly, that
+*present is not known*. This run reads what run 14 only probed for.
+
+| | Run 15 |
+|---|---|
+| Date | 2026-08-09 |
+| Project | `qkpptajglstgucadhfwq` — the persistent hosted **development** project |
+| Postgres | 17.6.1.155 |
+| Method | Read-only preflight: catalog reads and migration-history reads |
+| Result | **Every one of 0008's three findings confirmed against the real database.** Nothing was applied and nothing was written. |
+
+### Migration history — now read, not unknown
+
+`supabase_migrations.schema_migrations` records **0001 through 0007**,
+including:
+
+| Version | Name |
+|---|---|
+| `20260808200326` | `0006_service_mix_review` |
+| `20260808201535` | `0007_staff_identity_resolution` |
+
+**0008 is not recorded and has not been applied.** The "the history rows have
+never been read" caveat in runs 6 and 14 is closed.
+
+### The definition comparison — done, and it matched
+
+The deployed `enforce_bir_supersession_scope()` body **matches repository
+migration 0006 exactly.** This was the one open risk in applying 0008: its F3
+repair is a `create or replace`, which overwrites whatever is deployed, and
+nobody had looked. There is nothing to lose.
+
+The deployed `bir_supersession_scope` trigger is **`BEFORE INSERT` only** —
+the F3 defect, observed on the real database rather than inferred from the
+migration file.
+
+### The two ACL findings, confirmed as real
+
+- **F6.** `service_role` holds EXECUTE on the **12** internal functions
+  originating in 0001, 0004 and 0006. The four from 0007 are already correctly
+  refused. This is the Supabase default-privilege defect exactly as described:
+  0006 revoked from `public, anon, authenticated` and the direct grant to
+  `service_role` survived. **0008's 16-function revoke stays at full scope** —
+  the hosted ACLs prove the broader set fixes something real, and narrowing it
+  to one function would leave eleven holes.
+- **F7.** `identity_value_acceptable` and `identity_evidence_fault` are the
+  only public functions with no pinned `search_path`, and **Supabase's own
+  security advisor reports exactly those two mutable-search-path warnings** —
+  an independent instrument reaching the same list.
+
+### Context that bounds the blast radius
+
+- `anon`, `authenticated` and `service_role` **cannot CREATE in schema
+  `public`**, which is what makes F7 a hygiene and consistency defect rather
+  than an exploitable one: there is no role able to plant a shadowing function
+  for an unpinned `search_path` to resolve to.
+- The function owner `postgres` has `BYPASSRLS` but is **not** `rolsuper`.
+
+### Existing data
+
+| | |
+|---|---|
+| Business Records | 12 |
+| Submissions | 16 |
+| BIRs | 16 |
+| Identity-resolution cases | 3 |
+| Supersession chains | 3 |
+| Cross-business supersession violations | **0** |
+| Cross-review-type supersession violations | **0** |
+
+Zero violations is the expected result and is worth stating: F3 is a coverage
+gap, not evidence that anything has already gone wrong. Nothing needs
+repairing before 0008 is applied.
+
+### What run 15 still did NOT establish
+
+- **Nothing was executed.** No RPC was called, no ingestion run, no staff
+  function invoked. This was catalog and history reads.
+- **Only one definition was compared.** `enforce_bir_supersession_scope()`
+  matches; the other functions in 0006 and 0007 have not been diffed against
+  their committed source.
+- **PostgREST execution.** `GET /auth-config` is hosted and answers HTTP 200,
+  which exercises no database call. No privileged RPC has been resolved or
+  executed through PostgREST, because no elevated credential is configured on
+  any Vercel environment.
+- **0008 remains unapplied**, on this project and everywhere else.
 
 ---
 

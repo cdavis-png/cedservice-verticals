@@ -49,6 +49,7 @@ import { createHash, createHmac, randomUUID } from 'node:crypto';
 import analyticsEvents from '../shared/analytics/events.js';
 import bodyReader from '../shared/security/read-body.js';
 import rateLimit from '../shared/security/rate-limit.js';
+import supabaseKeys from '../shared/security/supabase-keys.js';
 
 const {
   ANALYTICS_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS, LIMITS,
@@ -305,15 +306,33 @@ const toRow = (event, now) => {
 
 /* ---------- database ---------- */
 
+/* Selected by `shared/security/supabase-keys.js` — one definition of "prefer
+   SUPABASE_SECRET_KEY, accept the legacy SUPABASE_SERVICE_ROLE_KEY, refuse
+   anything that is not positively an elevated key". Reading the legacy
+   variable directly here meant a secret-key-only deployment lost analytics
+   while the staff console came up.
+
+   Returning null is the configured behaviour for this endpoint and stays
+   that way: analytics never affects the assessment, so a missing or
+   unusable key costs a measurement rather than a visitor's work.
+
+   The cache is keyed on (url, key), matching the other two server surfaces:
+   a bare `if (cachedClient)` outlived a key rotation inside a warm
+   instance. */
 let cachedClient = null;
 const getClient = async env => {
-  if (cachedClient) return cachedClient;
-  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) return null;
+  const url = env.SUPABASE_URL || '';
+  const key = supabaseKeys.elevatedKey(env);
+  if (!url || !key) return null;
+  if (cachedClient && cachedClient.url === url && cachedClient.key === key) {
+    return cachedClient.client;
+  }
   const { createClient } = await import('@supabase/supabase-js');
-  cachedClient = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
+  const client = createClient(url, key, {
     auth: { persistSession: false, autoRefreshToken: false }
   });
-  return cachedClient;
+  cachedClient = { url, key, client };
+  return client;
 };
 
 const callRpc = (db, name, args, signal) => {
@@ -614,3 +633,8 @@ export const ANALYTICS = {
   MAX_EVENT_AGE_MS,
   EVENT_NAMES: Object.keys(EVENTS)
 };
+
+/* Exported so the suite can exercise the PRODUCTION client factory, for the
+   reason api/assessments.mjs gives: it is what proves this endpoint prefers
+   SUPABASE_SECRET_KEY and treats SUPABASE_SERVICE_ROLE_KEY as legacy. */
+export const __testing = { getClient };
