@@ -244,6 +244,26 @@
     };
   };
 
+  /* One bound of the capacity-adjusted range.
+
+     The confidence spread must be applied to the COMPONENTS and the ceiling
+     re-applied afterwards, never to the already-clamped point. Widening the
+     clamped point re-inflates newly created demand back above the ceiling the
+     same report states a line earlier: a business with headroom for 4.33
+     appointments a month at a 50 USD ticket was told its ceiling was 216.50
+     and shown a range topping at 281.45. That is the report contradicting
+     itself, and it reads as the capacity answer having raised the estimate —
+     which CLAUDE.md section 4 forbids in either direction.
+
+     Backfill keeps its full spread: recovering a booked slot needs no
+     headroom, so no ceiling bounds it. */
+  const capacityAdjustedBound = (clamp, factor) => {
+    if (clamp.ceiling === null) return round2(clamp.point * factor);
+    const newDemand = Math.min((clamp.newDemandPortion || 0) * factor, clamp.ceiling);
+    const backfill = (clamp.backfillPortion || 0) * factor;
+    return round2(newDemand + backfill);
+  };
+
   /* ---------- confidence ---------- */
 
   const computeConfidence = (answers, capacity, stage = 2) => {
@@ -333,9 +353,9 @@
     const clamp = applyCapacityClamp({ point, answers, capacity });
 
     return {
-      low: round2(clamp.point * spread.low),
+      low: capacityAdjustedBound(clamp, spread.low),
       point: clamp.point,
-      high: round2(clamp.point * spread.high),
+      high: capacityAdjustedBound(clamp, spread.high),
       unconstrainedPoint: round2(point),
       capacityKnown: capacity.known && clamp.ceiling !== null,
       capacityBand: capacity.band,
@@ -599,8 +619,8 @@
     const high = round2(point * spread.high);
 
     const clamp = applyCapacityClamp({ point, answers, capacity });
-    const adjustedLow = round2(clamp.point * spread.low);
-    const adjustedHigh = round2(clamp.point * spread.high);
+    const adjustedLow = capacityAdjustedBound(clamp, spread.low);
+    const adjustedHigh = capacityAdjustedBound(clamp, spread.high);
 
     const closeReadiness = computeCloseReadiness({
       answers, confidence, packageRecommendation: pkg, dimensions: intelligence, capacity, stage

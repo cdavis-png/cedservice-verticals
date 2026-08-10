@@ -154,6 +154,47 @@ test('insufficient capacity clamps the range', () => {
   assert.match(none.capacityAdjusted.clampReason, /Capacity-limited/);
 });
 
+test('the capacity-adjusted range never tops out above the ceiling it states', () => {
+  /* The report used to state a ceiling and then print a range above it. With
+     headroom for 4.33 appointments a month at a 50 USD ticket the ceiling is
+     216.50, and the high bound was 281.45 — the same report contradicting
+     itself, and capacity appearing to RAISE an estimate it may only reduce.
+
+     Checked across every confidence band, because the defect was the spread
+     being applied to an already-clamped point. */
+  ['none', '1_5', '6_10', '11_20'].forEach(band => {
+    const fin = bir({ capacity90Day: band, averageTicket: '50' }).financialOpportunityProfile;
+    const adj = fin.capacityAdjusted;
+    if (adj.ceiling === null) return;
+
+    /* Recover the spread from the UNCONSTRAINED range, which the clamp never
+       touches, then subtract the backfill the ceiling does not bound. What is
+       left is newly created demand at the top of the range, and that is what
+       must sit under the ceiling. Derived independently of adj.high on
+       purpose: computing it from adj.high would assert a tautology. */
+    const spreadHigh = fin.unconstrained.high / fin.unconstrained.point;
+    const newDemandAtHigh = adj.high - (adj.backfillPortion * spreadHigh);
+    assert.ok(newDemandAtHigh <= adj.ceiling + 0.01,
+      `${band}: new demand at the high bound is ${newDemandAtHigh.toFixed(2)}, ` +
+      `above the stated ceiling ${adj.ceiling}`);
+    assert.ok(adj.low <= adj.point && adj.point <= adj.high,
+      `${band}: range is out of order`);
+    assert.ok(adj.high <= fin.unconstrained.high + 0.01,
+      `${band}: capacity raised the estimate above the unconstrained range`);
+  });
+});
+
+test('the reproduced contradiction stays fixed at its exact figures', () => {
+  const range = bie.visibleOpportunityRange({
+    point: 10000,
+    answers: { capacity90Day: '1_5', averageTicket: '50' }
+  });
+  assert.equal(range.point, 216.5);
+  assert.equal(range.clampApplied, true);
+  /* Was 281.45 — 30% above the stated ceiling. */
+  assert.ok(range.high <= 216.5, `high ${range.high} exceeds the 216.50 ceiling`);
+});
+
 test('a clamp never touches the unconstrained figure the visitor was shown', () => {
   const b = bir({ capacity90Day: 'none' });
   assert.equal(b.financialOpportunityProfile.unconstrained.point,
