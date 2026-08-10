@@ -122,10 +122,18 @@
     finish: 'See My Results'
   };
 
+  /* These describe what actually happened: the completed review was stored.
+     No copy here may say or imply the results were emailed. The platform
+     sends no email — there is no provider, no send call and no delivery
+     state anywhere in the repository — and the visitor has just ticked a
+     consent reading "Send my assessment results ... to the email address
+     above", so "Results sent." was read as confirmation of an email that
+     was never sent. Restore an email claim only alongside a real provider
+     and the four delivery states in the specification's section 13.4. */
   const STATUS_COPY = {
-    sending: 'Sending your results…',
-    sent: 'Results sent.',
-    queued: 'Saved on this device. Sending will retry automatically.',
+    sending: 'Saving your results…',
+    sent: 'Results saved.',
+    queued: 'Saved on this device. Saving will retry automatically.',
     ready: 'Results ready.'
   };
 
