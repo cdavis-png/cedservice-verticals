@@ -60,13 +60,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # package.json declares engines.node >= 20. 20 is the lowest
-      # supported version, which is the one worth testing: a suite
-      # that only passes on 22 does not honour the declaration.
-      - name: Set up Node 20
+      # NODE 22, NOT 20, AND THE REASON MATTERS.
+      #
+      # package.json declares engines.node >= 20, but the test scripts
+      # pass a QUOTED glob to node: node --test "tests/*.test.mjs".
+      # The quotes stop the shell expanding it, and node only learned to
+      # expand --test patterns itself after 20 - on Node 20 the run dies
+      # with "Could not find .../tests/*.test.mjs" before a single test
+      # executes. The first CI run found exactly that, which is the kind
+      # of thing CI exists to find.
+      #
+      # 22 is the lowest version on which the repository's own scripts
+      # work. The engines declaration is therefore inaccurate, and that
+      # is reported rather than silently corrected here: widening it is
+      # a package.json decision, and rewriting the scripts to avoid the
+      # glob would change which files each suite collects.
+      - name: Set up Node 22
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: npm
 
       # `npm ci` installs from package-lock.json exactly and fails
