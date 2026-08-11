@@ -832,10 +832,23 @@ repairing before 0008 is applied.
 - **Only one definition was compared.** `enforce_bir_supersession_scope()`
   matches; the other functions in 0006 and 0007 have not been diffed against
   their committed source.
-- **PostgREST execution.** `GET /auth-config` is hosted and answers HTTP 200,
-  which exercises no database call. No privileged RPC has been resolved or
-  executed through PostgREST, because no elevated credential is configured on
+- **PostgREST execution.** No privileged RPC has been resolved or executed
+  through PostgREST. As of run 15, no elevated credential was configured on
   any Vercel environment.
+
+  **Correction (2026-08-10).** An earlier version of this bullet also stated
+  that `GET /auth-config` "is hosted and answers HTTP 200". That assertion is
+  **withdrawn**. No reproducible hosted request to it has been identified: no
+  host, deployment id, timestamp, response body or header set was ever
+  recorded, and a later commit on this same branch (`42f3f7b`) states that
+  `/auth-config` was never called and no response header was observed. The
+  endpoint exists in this branch's implementation, and its response contract
+  is covered by the automated unit and browser suites against local servers —
+  which is a different claim from having observed it on a deployment. The
+  current Preview is protected by Vercel SSO, so the deployed endpoint's
+  response, headers and returned public configuration remain **unobserved**.
+  This does not assert that no manual call was ever made; only that no
+  sufficient evidence record of one exists.
 - **0008 remains unapplied**, on this project and everywhere else.
   *(No longer true — run 16 applied and verified it.)*
 
