@@ -27,11 +27,19 @@
 (() => {
   'use strict';
 
-  const req = name => (typeof module !== 'undefined' && module.exports) ? require(name) : null;
+  /* LITERAL require SPECIFIERS, DELIBERATELY. Routing these through a
+     helper that took the specifier as a VARIABLE made them invisible to
+     Vercel's file tracer: the modules below were never packaged, the require
+     threw at module scope, and /api/assessments answered
+     FUNCTION_INVOCATION_FAILED. The guard is unchanged — this file is also
+     loaded by a browser as a classic script, where `require` does not
+     exist — only the specifier moved from a variable to a literal.
+     See tests/function-bundle-contract.test.mjs. */
+  const isCjs = typeof module !== 'undefined' && !!module.exports;
 
-  const values = req('./value.schema.js') ||
+  const values = (isCjs ? require('./value.schema.js') : null) ||
     (typeof window !== 'undefined' ? window.CEDServiceMixValue : null);
-  const offerings = req('./offering.schema.js') ||
+  const offerings = (isCjs ? require('./offering.schema.js') : null) ||
     (typeof window !== 'undefined' ? window.CEDServiceMixOffering : null);
 
   const CLASSIFIER_VERSION = 'service-mix-health-v1';

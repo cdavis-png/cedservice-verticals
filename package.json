@@ -24,10 +24,11 @@
     "moduleFormat": "Deliberately no \"type\": \"module\". The shared/ schema files are dual CommonJS/browser scripts loaded directly by static pages with no build step; declaring the package as ESM would break both. Server code uses .mjs, which Node and Vercel treat as ESM regardless.",
     "dependencies": "@supabase/supabase-js is the only production dependency and is imported lazily inside the endpoint, so the unit suite runs without it installed. test:integration DOES require it.",
     "testScripts": "test and test:unit are deliberately identical and never touch a database — the default must be safe. test:integration writes permanent, append-only rows to a real Supabase development project and refuses to run without explicit opt-in. test:integration:local runs the same suite against a disposable PostgreSQL created inside the process, with no credential and nothing to leave behind. test:migration covers the migration chain itself: a clean install and an upgrade over populated pre-0006 data. test:browser drives the real page in headless Chrome over http, ONE FILE AT A TIME: node's test runner runs files concurrently, and five suites each launching their own browser and pair of servers contend for CPU until unrelated interactions time out. Serial is slower and is the difference between a suite that fails on load and one that fails on defects. See tests/integration/README.md.",
-    "devDependencies": "Both are test-only and neither is imported by any shipped file. @electric-sql/pglite is PostgreSQL compiled to WebAssembly and is what makes real-Postgres validation possible with no Docker, no daemon and no hosted project. puppeteer-core drives a browser the machine already has and downloads none."
+    "devDependencies": "All three are test-only and none is imported by any shipped file. @electric-sql/pglite is PostgreSQL compiled to WebAssembly and is what makes real-Postgres validation possible with no Docker, no daemon and no hosted project. puppeteer-core drives a browser the machine already has and downloads none. @vercel/nft is the SAME file tracer Vercel runs when it packages a function: tests/function-bundle-contract.test.mjs uses it to build the deployment artifact and import it, which is the only way this repository can see a missing transitive module before production does."
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.4",
+    "@vercel/nft": "^1.10.2",
     "puppeteer-core": "^25.5.0"
   }
 }

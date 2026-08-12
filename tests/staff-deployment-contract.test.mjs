@@ -232,14 +232,32 @@ test('three deployable functions, two configured — the counts are different on
   assert.equal(deployable.length, 3, 'three deployable filesystem functions');
   assert.deepEqual(configured, [
     'api/assessments.mjs',
-    'api/staff/identity-resolution/[...path].mjs'
+    'api/staff/identity-resolution/*.mjs'
   ], 'two entries in the vercel.json functions block');
 
-  for (const file of configured) {
-    assert.ok(deployable.includes(file),
-      `${file} is configured but is not a deployable function`);
+  /* THE KEYS ARE GLOBS, so they are resolved against the real functions
+     rather than compared as paths. Treating them as paths is what let the
+     staff key — the literal filename, whose `[...]` is a character class —
+     look configured while matching nothing at all.
+
+     `*` is expanded to "anything but a separator"; every other regex
+     metacharacter, brackets included, is escaped so a filesystem-routing
+     name is matched literally. */
+  const resolve_ = pattern => {
+    const rx = new RegExp(`^${pattern
+      .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      .replace(/\\\*/g, '[^/]*')}$`);
+    return deployable.filter(f => rx.test(f));
+  };
+
+  const covered = new Set();
+  for (const pattern of configured) {
+    const matched = resolve_(pattern);
+    assert.ok(matched.length >= 1,
+      `${pattern} is configured but matches no deployable function`);
+    matched.forEach(f => covered.add(f));
   }
-  assert.deepEqual(deployable.filter(f => !configured.includes(f)), ['api/analytics.mjs'],
+  assert.deepEqual(deployable.filter(f => !covered.has(f)), ['api/analytics.mjs'],
     'exactly one function is deliberately on platform defaults');
 });
 
@@ -604,7 +622,13 @@ test('the deployed function is the module the tests exercise, not a copy', async
 });
 
 test('the function budget is configured for the staff route as well', () => {
-  const fn = config.functions['api/staff/identity-resolution/[...path].mjs'];
+  /* Looked up by the GLOB the configuration actually carries. The key used
+     to be the literal filename, which in glob syntax is a character class
+     over {. p a t h} and matched nothing — so the budget asserted below was
+     never applied to anything. Reading the key by hand kept that invisible;
+     tests/function-bundle-contract.test.mjs now matches every key against
+     the filesystem. */
+  const fn = config.functions['api/staff/identity-resolution/*.mjs'];
   assert.ok(fn, 'the staff function is configured, not left to the platform default');
   assert.ok(fn.maxDuration >= 6,
     'the budget must exceed CED_DB_TIMEOUT_MS (6s) or the platform kills the request first');

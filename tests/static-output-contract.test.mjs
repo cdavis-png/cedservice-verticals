@@ -124,8 +124,21 @@ test('vercel.json is JSON, not JSONC — no comment syntax survives anywhere', (
      actually parses the raw text, which is what this does. */
   const raw = readFileSync(join(ROOT, 'vercel.json'), 'utf8');
   assert.doesNotThrow(() => JSON.parse(raw), 'vercel.json must be valid strict JSON');
-  assert.equal(/^\s*\/\//m.test(raw), false, 'no // line comment');
-  assert.equal(raw.includes('/*'), false, 'no /* block comment');
+
+  /* Comment syntax is looked for OUTSIDE string values, because a legitimate
+     value can contain the same characters. The `functions` key is a glob —
+     `api/staff/identity-resolution/*.mjs` — and a naive substring scan read
+     its `/*` as a block comment. JSON.parse above is the real guarantee (a
+     genuine comment makes the whole file throw); this is the belt-and-braces
+     check, and it has to be precise enough not to forbid a valid config. */
+  const outsideStrings = raw.replace(/"(?:[^"\\]|\\.)*"/g, '""');
+  assert.equal(/^\s*\/\//m.test(outsideStrings), false, 'no // line comment');
+  assert.equal(outsideStrings.includes('/*'), false, 'no /* block comment');
+
+  /* And the stripping must not have hidden a real comment: a block comment
+     between two keys survives it. */
+  const withComment = '{"a": 1, /* c */ "b": 2}'.replace(/"(?:[^"\\]|\\.)*"/g, '""');
+  assert.ok(withComment.includes('/*'), 'the scan still sees a genuine comment');
 });
 
 test('the explanatory prose the config cannot carry is written down somewhere', () => {
@@ -807,9 +820,23 @@ test('the api/ tree is untouched by the build and still holds exactly three func
 });
 
 test('the vercel.json functions block still names exactly the intended entries', () => {
+  /* THESE KEYS ARE GLOBS, NOT PATHS, and the staff entry says `*.mjs` for
+     that reason. `[...]` is a character class in a glob, so the previous key
+     — the literal filename `…/[...path].mjs` — matched one character from
+     {. p a t h} and therefore matched NO file at all. The staff function ran
+     on platform defaults with its declared budget silently discarded.
+
+     Backslash escaping is not an available fix: measured against the glob
+     dialect Vercel follows, `…/\[...path\].mjs` does not match the real
+     filename either. A wildcard is the form that demonstrably does.
+
+     This assertion compares STRINGS and cannot see any of that, which is
+     exactly how the defect survived. tests/function-bundle-contract.test.mjs
+     matches every key against the filesystem, which is the check with teeth.
+     Both are kept: this one pins intent, that one pins reality. */
   assert.deepEqual(Object.keys(config.functions).sort(), [
     'api/assessments.mjs',
-    'api/staff/identity-resolution/[...path].mjs'
+    'api/staff/identity-resolution/*.mjs'
   ]);
 });
 
