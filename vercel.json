@@ -7,11 +7,17 @@
       "maxDuration": 15,
       "memory": 512
     },
-    "api/staff/identity-resolution/[...path].mjs": {
+    "api/staff/identity-resolution/*.mjs": {
       "maxDuration": 15,
       "memory": 512
     }
   },
+  "rewrites": [
+    {
+      "source": "/api/staff/identity-resolution/:path+",
+      "destination": "/api/staff/identity-resolution/_router"
+    }
+  ],
   "regions": ["iad1"],
   "headers": [
     {

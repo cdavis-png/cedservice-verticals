@@ -27,19 +27,27 @@
 (() => {
   'use strict';
 
-  const req = name => (typeof module !== 'undefined' && module.exports) ? require(name) : null;
+  /* LITERAL require SPECIFIERS, DELIBERATELY. Routing these through a
+     helper that took the specifier as a VARIABLE made them invisible to
+     Vercel's file tracer: the modules below were never packaged, the require
+     threw at module scope, and /api/assessments answered
+     FUNCTION_INVOCATION_FAILED. The guard is unchanged — this file is also
+     loaded by a browser as a classic script, where `require` does not
+     exist — only the specifier moved from a variable to a literal.
+     See tests/function-bundle-contract.test.mjs. */
+  const isCjs = typeof module !== 'undefined' && !!module.exports;
 
-  const schema = req('../business-intelligence/report.schema.js') ||
+  const schema = (isCjs ? require('../business-intelligence/report.schema.js') : null) ||
     (typeof window !== 'undefined' ? window.CEDBusinessIntelligenceSchema : null);
-  const values = req('./value.schema.js') ||
+  const values = (isCjs ? require('./value.schema.js') : null) ||
     (typeof window !== 'undefined' ? window.CEDServiceMixValue : null);
-  const offerings = req('./offering.schema.js') ||
+  const offerings = (isCjs ? require('./offering.schema.js') : null) ||
     (typeof window !== 'undefined' ? window.CEDServiceMixOffering : null);
-  const calculate = req('./calculate.js') ||
+  const calculate = (isCjs ? require('./calculate.js') : null) ||
     (typeof window !== 'undefined' ? window.CEDServiceMixCalculate : null);
-  const classify = req('./classify.js') ||
+  const classify = (isCjs ? require('./classify.js') : null) ||
     (typeof window !== 'undefined' ? window.CEDServiceMixClassify : null);
-  const guidance = req('./guidance.js') ||
+  const guidance = (isCjs ? require('./guidance.js') : null) ||
     (typeof window !== 'undefined' ? window.CEDServiceMixGuidance : null);
 
   const SERVICE_MIX_BIR_SCHEMA_VERSION = 5;

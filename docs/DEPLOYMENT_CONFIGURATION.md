@@ -51,6 +51,35 @@ the `functions` block. Those two counts are different on purpose and
 [tests/staff-deployment-contract.test.mjs](../tests/staff-deployment-contract.test.mjs)
 pins both.
 
+### The keys are GLOBS, and the staff entry says `*.mjs` because of it
+
+`functions` keys are matched as globs, not compared as paths. In a glob
+`[...]` is a **character class**, so the staff key — written as the literal
+filename `api/staff/identity-resolution/[...path].mjs` — was read as *"one
+character from `{. p a t h}` followed by `.mjs`"*. It matched
+`…/p.mjs`, `…/a.mjs`, `…/t.mjs`, `…/h.mjs`, and **not the file it named**.
+
+The consequence was silent: the staff route deployed, served traffic, and ran
+on **platform defaults**, with the `maxDuration: 15` and `memory: 512`
+declared here never applied to it. Nothing failed loudly, and the contract
+test compared the key *strings*, so it could not see the mismatch either.
+
+**Backslash escaping is not the fix.** Measured against the glob dialect
+Vercel follows, `api/staff/identity-resolution/\[...path\].mjs` does not match
+the real filename either. The wildcard form is the one that demonstrably
+matches, and it is unambiguous here because that directory contains exactly
+one file — a fact
+[tests/static-output-contract.test.mjs](../tests/static-output-contract.test.mjs)
+already pins by asserting `api/` holds exactly three functions.
+
+The filename itself is unchanged: `[...path].mjs` is Vercel *filesystem
+routing* syntax, where the brackets are meaningful and correct. Only the
+configuration key that has to *match* that filename needed to change.
+
+[tests/function-bundle-contract.test.mjs](../tests/function-bundle-contract.test.mjs)
+now matches every `functions` key against the filesystem, so a key that names
+no file fails the suite instead of reaching production.
+
 ## `regions`
 
 Pin the function to the same region as the Supabase project. A function and a

@@ -28,13 +28,27 @@
 (() => {
   'use strict';
 
-  const req = name => (typeof module !== 'undefined' && module.exports) ? require(name) : null;
+  /* EVERY require SPECIFIER HERE IS A LITERAL, AND THAT IS LOAD-BEARING.
+     These three lines used to route through `req(name)`, which reads the
+     specifier from a VARIABLE. A file tracer cannot follow that — it records
+     no dependency and emits no warning — so Vercel packaged this module
+     without generate-service-mix-bir.js, the require threw at MODULE SCOPE,
+     and every request to /api/assessments answered
+     FUNCTION_INVOCATION_FAILED. tests/function-bundle-contract.test.mjs now
+     packages the traced set and imports it, which is what makes this
+     checkable rather than remembered.
 
-  const schema = req('./report.schema.js') ||
+     The GUARD is unchanged and still does the work it always did: this file
+     is also loaded by a browser as a classic script, where `require` does
+     not exist. `require` is evaluated only when isCjs is true, and
+     `typeof module` never throws on an undeclared identifier. */
+  const isCjs = typeof module !== 'undefined' && !!module.exports;
+
+  const schema = (isCjs ? require('./report.schema.js') : null) ||
     (typeof window !== 'undefined' ? window.CEDBusinessIntelligenceSchema : null);
-  const growth = req('./generate-bir.js') ||
+  const growth = (isCjs ? require('./generate-bir.js') : null) ||
     (typeof window !== 'undefined' ? window.CEDGenerateBir : null);
-  const serviceMix = req('../service-mix-engine/generate-service-mix-bir.js') ||
+  const serviceMix = (isCjs ? require('../service-mix-engine/generate-service-mix-bir.js') : null) ||
     (typeof window !== 'undefined' ? window.CEDServiceMixBir : null);
 
   /* The vocabulary. Mirrored by the review_type CHECK constraint in
