@@ -154,6 +154,47 @@ test('insufficient capacity clamps the range', () => {
   assert.match(none.capacityAdjusted.clampReason, /Capacity-limited/);
 });
 
+test('the capacity-adjusted range never tops out above the ceiling it states', () => {
+  /* The report used to state a ceiling and then print a range above it. With
+     headroom for 4.33 appointments a month at a 50 USD ticket the ceiling is
+     216.50, and the high bound was 281.45 — the same report contradicting
+     itself, and capacity appearing to RAISE an estimate it may only reduce.
+
+     Checked across every confidence band, because the defect was the spread
+     being applied to an already-clamped point. */
+  ['none', '1_5', '6_10', '11_20'].forEach(band => {
+    const fin = bir({ capacity90Day: band, averageTicket: '50' }).financialOpportunityProfile;
+    const adj = fin.capacityAdjusted;
+    if (adj.ceiling === null) return;
+
+    /* Recover the spread from the UNCONSTRAINED range, which the clamp never
+       touches, then subtract the backfill the ceiling does not bound. What is
+       left is newly created demand at the top of the range, and that is what
+       must sit under the ceiling. Derived independently of adj.high on
+       purpose: computing it from adj.high would assert a tautology. */
+    const spreadHigh = fin.unconstrained.high / fin.unconstrained.point;
+    const newDemandAtHigh = adj.high - (adj.backfillPortion * spreadHigh);
+    assert.ok(newDemandAtHigh <= adj.ceiling + 0.01,
+      `${band}: new demand at the high bound is ${newDemandAtHigh.toFixed(2)}, ` +
+      `above the stated ceiling ${adj.ceiling}`);
+    assert.ok(adj.low <= adj.point && adj.point <= adj.high,
+      `${band}: range is out of order`);
+    assert.ok(adj.high <= fin.unconstrained.high + 0.01,
+      `${band}: capacity raised the estimate above the unconstrained range`);
+  });
+});
+
+test('the reproduced contradiction stays fixed at its exact figures', () => {
+  const range = bie.visibleOpportunityRange({
+    point: 10000,
+    answers: { capacity90Day: '1_5', averageTicket: '50' }
+  });
+  assert.equal(range.point, 216.5);
+  assert.equal(range.clampApplied, true);
+  /* Was 281.45 — 30% above the stated ceiling. */
+  assert.ok(range.high <= 216.5, `high ${range.high} exceeds the 216.50 ceiling`);
+});
+
 test('a clamp never touches the unconstrained figure the visitor was shown', () => {
   const b = bir({ capacity90Day: 'none' });
   assert.equal(b.financialOpportunityProfile.unconstrained.point,
@@ -409,4 +450,102 @@ test('free-text answers are carried as evidence, never parsed for meaning', () =
   assert.equal(b.objectionProfile.openQuestions, 'How long is setup?');
   /* The severity comes from the enum, not the prose. */
   assert.equal(b.objectionProfile.severity, intel.SCALES.primaryConcern.price);
+});
+
+/* ============================================================
+   Capacity is monotonic, and it may only ever subtract
+   ------------------------------------------------------------
+   The ported repair fixed the reproduced contradiction. These
+   assert the PROPERTY the repair exists to guarantee, across
+   every band rather than at one worked example, because
+   CLAUDE.md section 4 states it without qualification: capacity
+   evidence may only reduce an estimate, never raise one.
+   ============================================================ */
+
+/* Least to most headroom. `undefined` is "not asked", which must behave as
+   no constraint rather than as a constraint of zero. */
+const CAPACITY_BANDS = ['none', '1_5', '6_10', '11_20', '21_plus', undefined];
+
+const rangeFor = (band, point = 10000, ticket = '50') => {
+  const answers = { averageTicket: ticket };
+  if (band !== undefined) answers.capacity90Day = band;
+  return bie.visibleOpportunityRange({ point, answers });
+};
+
+test('reducing capacity never raises either bound', () => {
+  /* Walked in increasing-headroom order: every bound must be non-decreasing,
+     so going the other way — reducing capacity — can only hold or lower it. */
+  let previous = null;
+  for (const band of CAPACITY_BANDS) {
+    const r = rangeFor(band);
+    if (previous) {
+      assert.ok(r.low >= previous.low - 0.001,
+        `low fell from ${previous.low} to ${r.low} as capacity INCREASED to ${band}`);
+      assert.ok(r.high >= previous.high - 0.001,
+        `high fell from ${previous.high} to ${r.high} as capacity INCREASED to ${band}`);
+    }
+    previous = r;
+  }
+});
+
+test('capacity never creates opportunity that did not exist unconstrained', () => {
+  /* The unconstrained range is the ceiling on the whole exercise: a capacity
+     answer may subtract from it and may never add. This is the direction the
+     defect broke — a clamped high bound 30% ABOVE the stated ceiling. */
+  const unconstrained = rangeFor(undefined);
+  for (const band of CAPACITY_BANDS) {
+    const r = rangeFor(band);
+    assert.ok(r.low <= unconstrained.low + 0.001,
+      `${band}: clamped low ${r.low} exceeds the unconstrained low ${unconstrained.low}`);
+    assert.ok(r.high <= unconstrained.high + 0.001,
+      `${band}: clamped high ${r.high} exceeds the unconstrained high ${unconstrained.high}`);
+    assert.ok(r.point <= unconstrained.point + 0.001,
+      `${band}: clamped point ${r.point} exceeds the unconstrained point`);
+  }
+});
+
+test('the range is always ordered, at every band and every ticket', () => {
+  for (const band of CAPACITY_BANDS) {
+    for (const ticket of ['0', '25', '50', '95', '250']) {
+      const r = rangeFor(band, 10000, ticket);
+      assert.ok(r.low <= r.point && r.point <= r.high,
+        `${band} @ ${ticket}: ${r.low} / ${r.point} / ${r.high} is out of order`);
+      assert.ok(r.low >= 0, `${band} @ ${ticket}: negative lower bound ${r.low}`);
+    }
+  }
+});
+
+test('a clamped bound never exceeds the ceiling the same report states', () => {
+  /* The self-contradiction itself, generalised: whatever the report prints as
+     its ceiling, no bound of the capacity-adjusted range may sit above it once
+     the backfill the ceiling does not bound is taken out. */
+  for (const band of CAPACITY_BANDS) {
+    const fin = bir({ capacity90Day: band, averageTicket: '50' }).financialOpportunityProfile;
+    const adj = fin.capacityAdjusted;
+    if (adj.ceiling === null) continue;
+    const spreadHigh = fin.unconstrained.high / fin.unconstrained.point;
+    const newDemandAtHigh = adj.high - (adj.backfillPortion * spreadHigh);
+    assert.ok(newDemandAtHigh <= adj.ceiling + 0.01,
+      `${band}: new demand at the high bound is ${newDemandAtHigh.toFixed(2)}, above ceiling ${adj.ceiling}`);
+  }
+});
+
+test('the repaired calculation is deterministic', () => {
+  /* A returning visitor seeing a different number for the same answers is a
+     trust problem, not a release note. Repeated across bands and repeats so a
+     stray Date.now() or Math.random() in the clamp path would surface. */
+  for (const band of CAPACITY_BANDS) {
+    const first = JSON.stringify(rangeFor(band));
+    for (let i = 0; i < 25; i++) {
+      assert.equal(JSON.stringify(rangeFor(band)), first,
+        `${band}: visibleOpportunityRange is not deterministic`);
+    }
+    const firstBir = JSON.stringify(
+      bir({ capacity90Day: band, averageTicket: '50' }).financialOpportunityProfile);
+    for (let i = 0; i < 5; i++) {
+      assert.equal(
+        JSON.stringify(bir({ capacity90Day: band, averageTicket: '50' }).financialOpportunityProfile),
+        firstBir, `${band}: the BIR financial profile is not deterministic`);
+    }
+  }
 });
