@@ -199,6 +199,43 @@ test('a queued request_in_flight is re-attempted and delivered', async () => {
   }
 });
 
+test('a successful retry returns its continuation with the original queued payload', async () => {
+  const restore = silence();
+  globalThis.localStorage = new MemoryStorage();
+  const original = {
+    ...payload(),
+    contact: { salonName: 'Queued Nail Studio', email: 'queued-owner@example.test' }
+  };
+  let announced = null;
+  try {
+    globalThis.fetch = async () => errorResponse(503, 'challenge_unavailable');
+    await submission.submitAssessment(original, OPTS);
+
+    const entry = JSON.parse(globalThis.localStorage.getItem(OPTS.queueKey));
+    entry[0].nextRetryAt = new Date(Date.now() - 1000).toISOString();
+    globalThis.localStorage.setItem(OPTS.queueKey, JSON.stringify(entry));
+
+    const responseBody = {
+      ok: true,
+      reviewType: 'growth_review',
+      continuationToken: 'growth.retry.issued.context'
+    };
+    globalThis.fetch = async () => jsonResponse(201, responseBody);
+    await submission.retryPendingSubmissions({
+      ...OPTS,
+      onContinuation: (token, body, queuedPayload) => {
+        announced = { token, body, queuedPayload };
+      }
+    });
+
+    assert.equal(announced.token, responseBody.continuationToken);
+    assert.deepEqual(announced.body, responseBody);
+    assert.deepEqual(announced.queuedPayload, original);
+  } finally {
+    restore();
+  }
+});
+
 test('a queued idempotency_key_conflict is skipped, not re-attempted', async () => {
   const restore = silence();
   globalThis.localStorage = new MemoryStorage();
