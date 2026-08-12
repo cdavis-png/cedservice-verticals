@@ -98,10 +98,50 @@
     staff: 'staff:'
   };
 
-  /* Header order matters. Vercel sets x-real-ip and x-forwarded-for; the
-     first entry of x-forwarded-for is the client as reported by the edge.
-     Everything here is advisory until proxy behaviour is verified. */
-  const ADDRESS_HEADERS = ['x-real-ip', 'x-forwarded-for', 'cf-connecting-ip', 'true-client-ip'];
+  /* Header order matters, and `x-vercel-forwarded-for` is FIRST deliberately.
+
+     It is set by Vercel's own edge for a request arriving directly at the
+     platform, and unlike the generic headers it cannot be appended to by an
+     intermediary the deployment does not control. The generic headers keep
+     their existing order and meaning behind it, so an explicitly supported
+     proxy in front of Vercel still works exactly as before — this only
+     changes which value WINS when the platform supplied one.
+
+     Everything here remains advisory until proxy behaviour is verified
+     against a real deployment. */
+  const ADDRESS_HEADERS = [
+    'x-vercel-forwarded-for',
+    'x-real-ip', 'x-forwarded-for', 'cf-connecting-ip', 'true-client-ip'
+  ];
+
+  /* Is this a usable caller identifier at all?
+
+     A rate-limit bucket keyed on garbage is a bucket nobody shares, which is
+     the same as no limit. Length-bounded and charset-bounded rather than
+     parsed as an IP: the value may legitimately be IPv4, IPv6, or IPv6 with a
+     zone, and this only has to reject what cannot be an address — empty,
+     whitespace, control characters, a header injection, or something long
+     enough to be a payload rather than an identifier.
+
+     Exported so a CALLER can decide what to do about an unusable value. This
+     module does not decide policy: buildRateLimitKeys keeps its existing
+     behaviour of simply deriving no key, and the staff route treats that as a
+     refusal. */
+  const MAX_ADDRESS_LENGTH = 64;
+  /* Letters generally, not just hex: an IPv6 zone identifier is an interface
+     name — `fe80::1%eth0` — and rejecting it would refuse a legitimate
+     caller. What stays out is everything an address never contains:
+     whitespace, quotes, semicolons, commas, slashes, angle brackets and
+     control characters. */
+  const ADDRESS_SHAPE = /^[0-9A-Za-z:.%_-]+$/;
+
+  const isUsableAddress = value => {
+    if (typeof value !== 'string') return false;
+    const trimmed = value.trim();
+    if (!trimmed || trimmed.length > MAX_ADDRESS_LENGTH) return false;
+    if (trimmed !== value) return false;          /* readAddress already trimmed */
+    return ADDRESS_SHAPE.test(trimmed);
+  };
 
   const readAddress = headers => {
     if (!headers || typeof headers.get !== 'function') return null;
@@ -187,7 +227,8 @@
   const API = {
     DEFAULTS, STAFF_DEFAULTS, STAFF_SIGNIN_DEFAULTS, STAFF_SESSION_DEFAULTS,
     SCOPES, NAMESPACES,
-    ADDRESS_HEADERS, readAddress, buildRateLimitKeys,
+    ADDRESS_HEADERS, readAddress, isUsableAddress, MAX_ADDRESS_LENGTH,
+    buildRateLimitKeys,
     rateLimitPolicy, staffRateLimitPolicy, staffSignInRateLimitPolicy,
     staffSessionRateLimitPolicy
   };

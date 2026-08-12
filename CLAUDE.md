@@ -34,7 +34,9 @@ openable by double-clicking `index.html`.
 deployment's static output from an explicit allowlist — see section 13. It does
 not bundle, transpile, minify, inline, or rewrite anything: every published
 file is a byte-for-byte copy of its canonical source, which stays exactly where
-it is. Nothing imports it, no page depends on it, and a vertical is still
+it is — with exactly one, named exception: one line of the staff onboarding
+page, where the Supabase project origin is generated into its
+Content-Security-Policy. See section 13. Nothing imports it, no page depends on it, and a vertical is still
 openable by double-clicking `index.html`. It exists because the alternative was
 publishing the repository root.
 
@@ -149,18 +151,34 @@ has a rule that must not be quietly relaxed:
 See [docs/PRODUCTION_HARDENING.md](docs/PRODUCTION_HARDENING.md) and
 [docs/IMPLEMENTATION_MILESTONE_1.md](docs/IMPLEMENTATION_MILESTONE_1.md).
 
-**Known outstanding gaps:** no production database is connected; migrations
-0006 and 0007 have been validated against a disposable local PostgreSQL 18.3 —
-the whole chain, a clean install and an upgrade over populated pre-0006 data,
-with the full integration suite including sections O through X passing — but
-neither has **ever been applied to a hosted database and neither has run
-against PostgreSQL 17**, which is what the hosted development project runs;
-nothing has ever run over PostgREST; migrations 0001–0005 are validated against
-that hosted development Postgres, but section M of the integration suite has
-not run over PostgREST either; the application is not deployed for public
-traffic; no challenge provider has been chosen; and nothing yet reports how
-many visitors open or finish the fit review, so there is no evidence about
-whether the two-stage split reduced abandonment or merely moved it.
+**Known outstanding gaps:** no production database is connected. Migrations
+0006 and 0007 are validated against a disposable local PostgreSQL 18.3 — the
+whole chain, a clean install and an upgrade over populated pre-0006 data, with
+the full integration suite including sections O through X passing — **and both
+are also present on the hosted development project** `qkpptajglstgucadhfwq`,
+which runs PostgreSQL 17.6.1.155. That was established on 2026-08-09 by
+read-only PostgREST existence-versus-permission probes, and it corrected a
+claim this file carried for some time: that neither had ever been hosted.
+
+A read-only hosted preflight has since read
+`supabase_migrations.schema_migrations` — **0001–0007 are recorded**, 0008 is
+not — and compared the deployed `enforce_bir_supersession_scope()` against
+migration 0006, which **matches exactly**. All three of 0008's findings are
+confirmed against the real database, including that `service_role` really does
+hold EXECUTE on the twelve internal functions from 0001/0004/0006.
+
+What is still open is narrower: no OTHER deployed definition has been diffed
+against its committed file, and nothing has been *executed* there. Nothing has
+been successfully *called* over PostgREST — the probes were permission
+refusals — so section M of the integration suite still has not run there, and
+neither have the staff route's five RPCs or its two direct table reads.
+Migration **0008 is applied and verified** on that project — ledger version
+`20260809173146`, so the hosted ledger records **0001 through 0008**. It is
+forward-only and repairs three defects in 0006 (see section 14). Beyond the
+database: the application is not deployed for public traffic; no challenge
+provider has been chosen; and nothing yet reports how many visitors open or
+finish the fit review, so there is no evidence about whether the two-stage
+split reduced abandonment or merely moved it.
 
 The identity-resolution queue now **has** a working surface — see section 12 —
 so ambiguous submissions can be resolved by a provisioned operator. What that
@@ -605,11 +623,16 @@ step and **makes no recommendation**.
 ### Known outstanding gaps
 
 Migration 0005 **has** been executed against the hosted development
-PostgreSQL 17 project; migrations 0006 and 0007 have been executed only against
-a disposable local PostgreSQL 18.3 through PGlite, and have never run against
-PostgreSQL 17, hosted Supabase, or PostgREST. Nothing has ever run through
-PostgREST at all. The single record of what has and has not executed is
-[docs/REAL_POSTGRES_VALIDATION.md](docs/REAL_POSTGRES_VALIDATION.md).
+PostgreSQL 17 project, and so, it turns out, have **0006 and 0007** — they are
+present on `qkpptajglstgucadhfwq`, confirmed on 2026-08-09 by read-only
+PostgREST probes. Both have additionally been executed against a disposable
+local PostgreSQL 18.3 through PGlite. What remains unverified is what the
+hosted definitions actually *are*, and no analytics function has ever been
+successfully **called** through PostgREST — the probes distinguished
+"permission denied" from "not found" and nothing more. Migration 0008 is
+applied and verified there, at ledger version `20260809173146`. The single
+record of what has and has not executed is
+[docs/REAL_POSTGRES_VALIDATION.md](docs/REAL_POSTGRES_VALIDATION.md), run 16.
 
 The analytics consent policy is **pending professional review** and no
 compliance claim is made anywhere. There is no signed session token, so the
@@ -635,6 +658,7 @@ and cannot do — is
 | | |
 | --- | --- |
 | Page | `staff/identity-resolution/` — `index.html`, `page.js`, `auth.js`, `styles.css` |
+| Onboarding page | `staff/identity-resolution/` — `accept-invite.html`, `accept-invite.js` |
 | Deployment entrypoint | `api/staff/identity-resolution/[...path].mjs` |
 | Implementation | `server/staff-identity-resolution.mjs` |
 | Migration | `supabase/migrations/0007_staff_identity_resolution.sql` |
@@ -656,15 +680,116 @@ them by reading the source — the same convention `api/assessments.mjs` and
 
 ### Supabase Auth runs on the server
 
-The browser holds **no Supabase client and no key of any kind**. It posts to
-three same-origin endpoints — `/session`, `/session/refresh`,
+The **console** page holds no Supabase client and no key of any kind. It posts
+to three same-origin endpoints — `/session`, `/session/refresh`,
 `/session/signout` — and the route makes every Auth call with the supported
 client, server-side. Nothing is hand-rolled.
+
+The **onboarding** page is deliberately the opposite; see below.
 
 This repository has no build step and no bundler, so putting
 `@supabase/supabase-js` in the page would have meant committing a generated
 third-party bundle or loading one from a CDN at runtime. Neither belongs in the
 sign-in path of a console that performs permanent, unerasable attachments.
+
+### Onboarding runs in the browser, and that is the point
+
+`identity_resolution_cases` had a human queue with nobody able to close one;
+the console had a sign-in with nobody able to reach it. `/session` correctly
+refuses an account with no verified factor, and nothing here could give an
+invited person one. `staff/identity-resolution/accept-invite.html` closes
+that.
+
+**The first attempt did it with two CED endpoints that accepted the password
+and the invitation token and returned the session, the TOTP secret and the
+otpauth URI. That was wrong** — CLAUDE.md §9 says this platform never
+transmits or stores passwords, tokens or credentials, and it did all of it.
+The reasoning behind it confused two keys: the **secret** key must never reach
+a browser; the **publishable** key is designed for one. Avoiding a public key
+by routing private credentials through a CED function traded a non-problem for
+a real one. Do not reintroduce it — a test names those endpoints and fails if
+they come back.
+
+- **No ONBOARDING OR RECOVERY credential touches CED.** The invitation token,
+  the recovery token, the password, both session tokens, the TOTP secret, the
+  `otpauth://` URI and the six-digit code go from the browser to Supabase Auth
+  directly. Those pages' only CED call is `GET …/auth-config`, which returns
+  the project origin and the publishable key and takes no body.
+
+  **This is a claim about onboarding and recovery, not about the whole
+  route.** The pre-existing console sign-in — `/session`,
+  `/session/refresh`, `/session/signout` — is deliberately server-mediated
+  and still handles the operator's password, TOTP code, access token and
+  refresh token, for the reasons in "Why the two pages differ" above. Those
+  endpoints are unchanged here and are out of scope for this rule. Anything
+  that reads as "no endpoint in this file accepts a credential" is wrong.
+- **The publishable key grants nothing, and that is a catalog fact.**
+  `tests/migration/0007-anon-grants.test.mjs` proves in real PostgreSQL that
+  `anon` and `authenticated` are refused SELECT, INSERT, UPDATE and DELETE on
+  every staff table and EXECUTE on every staff function, with RLS forced and
+  no policies. The same test proves `service_role` reaches them, so the
+  refusals are about the role rather than a broken fixture.
+- **`lowPrivilegeKey` guards the config endpoint,** so a secret key pasted
+  into the publishable variable is refused and the endpoint answers
+  `503 auth_unavailable` rather than serving an elevated credential.
+- **There is no registration path.** `OTP_TYPE` is a constant in the page and
+  is never read from the URL; a `type` parameter that is present and is not
+  `invite` refuses the link outright. Without a `token_hash`, the page offers
+  only recovery, which is a password sign-in against an account that must
+  already exist.
+- **Enrollment grants nothing.** The page cannot write `staff_operators` — it
+  cannot even see the table — and signs out when it finishes. A fully enrolled
+  account is refused the queue with `not_an_operator` until an owner
+  provisions it, and the page says so instead of letting them discover it.
+- **Interruption is recoverable without a second invitation, in both of its
+  shapes.** Accepting an invitation is two calls — `verifyOtp` consumes the
+  one-time token, then `updateUser` creates the password — and **between them
+  the account exists with no usable password**. Supabase cannot re-invite an
+  existing user, so:
+  - *password already set* → the page resumes with it, clears any abandoned
+    *unverified* factor, and re-enrolls;
+  - *password never set, or set with its response lost* → a **password
+    reset**, requested from the same page and completed on
+    `reset-password.html`. It depends on the account rather than the
+    invitation, so it works in every state that window can leave behind — and
+    the two are indistinguishable from the browser, which is why the reset is
+    offered rather than inferred.
+
+  An account that already has a *verified* factor is sent to sign in instead:
+  recovery is not a second way in. **The recovery page enrolls no factor,
+  writes no `staff_operators` row, and grants no queue access** — it sets a
+  password and signs out. The reset request answers identically for a real
+  account, an unknown address and an unreachable Supabase, so it is not an
+  account oracle.
+- **The client is vendored, not loaded from a CDN,** so `script-src` stays
+  `'self'`. `connect-src` is the only directive widened, to one exact project
+  origin — no wildcard, no `wss:`.
+- **That origin is GENERATED per build from `SUPABASE_URL`,** by
+  `tools/build-static.mjs`, through the same validator `GET /auth-config`
+  uses — so the origin the page is told to call and the origin it is permitted
+  to reach cannot diverge. `vercel.json` names no Supabase host at all: a
+  placeholder is a deployment waiting to ship a placeholder, and a hardcoded
+  development origin would point production at development data. Missing or
+  invalid configuration **fails the build**, and the committed page carries
+  `connect-src 'self'` with no host, so an unbuilt copy reaches nothing.
+- **The header CSP carries no `default-src` and no `connect-src`.** A header
+  policy and a meta policy are both enforced and the browser applies their
+  intersection, so either directive in the header would block the generated
+  origin. Per-page directives live in each page's `<meta>`, first in
+  `<head>`; `frame-ancestors` stays in the header, where a meta policy is
+  ignored.
+- **The invitation travels in the URL FRAGMENT, never the query.** A fragment
+  is never transmitted, so the token is absent from the page load itself —
+  the one request no page JavaScript could have cleaned up. The page removes
+  it with `replaceState` before its first fetch, and **refuses** a
+  `token_hash` offered in the query, because by then it has already leaked.
+- **`persistSession`, `autoRefreshToken` and `detectSessionInUrl` are all
+  off** in the browser client, for the same reasons they are off server-side
+  and one more: a persisted session would leave an `aal1` token in storage on
+  a shared machine.
+- **No QR image.** Supabase returns the QR as a `data:` image and the staff
+  CSP is `default-src 'none'` with no `img-src`. The setup key and the URI are
+  shown as text. Do not widen the header to render a convenience.
 
 Rules that must not be quietly relaxed:
 
@@ -754,12 +879,27 @@ session or continuation, and splices no supersession chain. RLS is enabled and
 
 Stated precisely, because everything below is still owed:
 
-- **PostgreSQL 17.** 0007 has run on 18.3 only, through PGlite.
-- **Hosted Supabase.** 0007 has never been applied to any hosted database.
-- **PostgREST.** The five functions the route calls have never been resolved
-  through it, and neither have the two direct table reads — local mode reaches
-  them as the database owner, so the `service_role` grants they depend on have
-  not been exercised as `service_role`.
+- **What most of the hosted definitions ARE.** 0007 is present on the hosted
+  development project `qkpptajglstgucadhfwq` (PostgreSQL 17.6.1.155) and
+  recorded as `20260808201535`, so the two entries that used to head this
+  list — "never run on 17", "never applied to a hosted database" — were false
+  and are gone. The migration history has been read and **one** deployed
+  definition, `enforce_bir_supersession_scope()`, has been compared and
+  matches. Every other function in 0006 and 0007 is still undiffed against its
+  committed source.
+- **PostgREST.** Its objects have been RESOLVED through PostgREST — that is
+  what the run 14 probes did — but none of the five functions the route calls
+  has ever been successfully **called** through it, and neither have the two
+  direct table reads. Local mode reaches them as the database owner, so the
+  `service_role` grants they depend on have not been exercised as
+  `service_role`.
+- **Migration 0008 is no longer on this list.** It is applied, recorded at
+  ledger version `20260809173146`, and verified — trigger coverage, all 16
+  internal functions' privileges, both pinned search paths, the two
+  security-advisor warnings gone, data intact, and the rule exercised
+  behaviourally inside a rolled-back transaction. Run 16. What that does *not*
+  establish is that any application code has reached the hardened schema; see
+  the PostgREST entry above.
 - **True multi-connection concurrency.** PGlite is a single connection. The
   *mechanism* that decides a race is proven — a unique index, a `for update`
   on the case, a ledger recheck after the lock — but the race itself has never
@@ -770,9 +910,27 @@ Stated precisely, because everything below is still owed:
   client on the server and a stubbed network in the browser. No real access
   token has ever been verified, no real factor enrolled or challenged, and no
   real session refreshed or revoked.
-- **Vercel.** No `vercel build` and no preview deployment. Routing, header
-  rules, function count and file tracing are asserted against a *model* of
-  documented behaviour. That is a check on the configuration, not on the
+- **Real invitations.** No `verifyOtp` on a token Supabase minted, no real
+  password change, no real `mfa.enroll`, and no authenticator app has ever
+  read a real secret. The invite email template the runbook specifies is
+  written from Supabase's documented variables and **has never been sent**;
+  until it is, `{{ .TokenHash }}` reaching `accept-invite.html` is a
+  documented behaviour this repository models rather than one it has seen.
+  The onboarding browser suite drives the real page and the real vendored
+  client over real sockets, but the Auth server it reaches is a fixture
+  speaking GoTrue's shape, not Supabase.
+- **A real Supabase origin in a real CSP.** The generation is exercised with
+  two different project origins and its refusals are pinned, but no
+  deployment has set `SUPABASE_URL`, so no browser has been permitted to
+  reach a real `*.supabase.co` origin from a staff page. Whether Vercel
+  serves the header policy on the generated paths is still the run 8 gap.
+- **Vercel.** A Preview build has run on the platform and **failed closed**
+  with `SUPABASE_URL is not set.` — see run 13 in
+  [docs/REAL_POSTGRES_VALIDATION.md](docs/REAL_POSTGRES_VALIDATION.md). That
+  observes that Vercel executes `buildCommand` and that the guard works
+  there; it observes nothing downstream, because the build aborted. Routing,
+  header rules, function count and file tracing are still asserted against a
+  *model* of documented behaviour. That is a check on the configuration, not on the
   platform. What is no longer open is *what would be published*: the
   deployment now has an explicit output directory built from an allowlist
   (section 13). Whether Vercel honours that configuration is still platform
@@ -808,6 +966,25 @@ could see the question either way. That is what changed.
 `vercel.json` sets `"buildCommand": "node tools/build-static.mjs"` and
 `"outputDirectory": "dist"`. The build copies exactly the files named in the
 manifest into `dist/`, **byte for byte**, at their existing relative paths.
+
+**One line of one file is generated, and that is the whole exception.**
+`staff/identity-resolution/accept-invite.html` talks to Supabase Auth
+directly, so its `connect-src` must name the exact project origin — which
+differs between Preview and Production. `tools/build-static.mjs` reads
+`SUPABASE_URL`, validates it as an exact scheme-host-port through
+`shared/security/supabase-origin.js` (the same validator `GET /auth-config`
+uses, so the two cannot diverge), and replaces one known line. It then proves
+the substitution: the base line was present exactly once, it is gone, the new
+line is there, the file changed by exactly that delta, and nothing key-shaped
+appeared. Missing or invalid configuration fails the build before anything is
+deleted or staged.
+
+**No secret is ever substituted.** The publishable key is fetched at run time
+from `/auth-config` and is deliberately not built in, so "no secret can be
+inlined at build time" remains a property of the build rather than of care.
+`SUPABASE_URL` is the only variable read and it reaches only the CSP text —
+no path, no output directory and no part of the delete fence can be
+influenced by the environment.
 
 **`vercel.json` carries configuration and nothing else.** It is strict JSON
 validated against a schema that sets `"additionalProperties": false`, so it can
@@ -868,7 +1045,121 @@ under `shared/security/`, audit it first and record the audit.
 proves the build is deterministic, that the output is exactly the manifest,
 that every referenced asset resolves, and that no forbidden path appears.
 
-**Still unvalidated:** no `vercel build` and no preview deployment has been
-run. Whether the platform honours `outputDirectory`, still discovers `api/`
-functions alongside a build command, and still traces `server/` and `shared/`
-is documented behaviour that this repository models but has not observed.
+**Still unvalidated:** the only platform build so far failed closed at
+`tools/build-static.mjs` with `SUPABASE_URL is not set.`, which proves Vercel
+runs the `buildCommand` and nothing after it. Whether the platform honours
+`outputDirectory`, still discovers `api/` functions alongside a build
+command, and still traces `server/` and `shared/` is documented behaviour
+that this repository models but has not observed.
+
+---
+
+## 14. Migrations against a hosted database
+
+The hosted development project `qkpptajglstgucadhfwq` already holds migrations
+**0001 through 0007**. That is the starting fact, and it was discovered rather
+than recorded: this file previously said 0006 and 0007 had never been hosted,
+which was false. See run 14 in
+[docs/REAL_POSTGRES_VALIDATION.md](docs/REAL_POSTGRES_VALIDATION.md).
+
+### Applied history is never rewritten
+
+A migration that has run against a hosted database is history. Fixing a defect
+in it means **a new forward-only migration**, never an edit to the old file.
+
+Editing 0006 to repair a defect would produce a repository whose 0006 has never
+run anywhere and a database whose 0006 is unrecoverable — and a `db push`
+against a project that already recorded 0006 would skip the edit entirely,
+leaving the fix in the file and out of the database. This is the failure mode
+that makes the edit worse than the defect.
+
+`supabase/migrations/0008_staff_migration_hardening.sql` is the worked example.
+It repairs three defects in 0006 — F3 supersession-scope trigger coverage, F6
+`service_role` on the internal helpers, F7 the two unpinned `search_path`s —
+and touches neither 0006 nor 0007.
+
+### Present is not the same as known
+
+Run 15's preflight read the history and compared the one function 0008 must
+replace. It did not diff the rest, so the working assumption for anything
+already hosted stays:
+
+- **Do not assume a deployed object matches the committed file** until it has
+  been read. An earlier draft, a hand-edit in the SQL editor, or a
+  half-applied file all look identical from outside.
+- **Prefer the narrowest instrument.** `alter function … set`, `revoke`,
+  `create index if not exists` change one thing and leave a body alone.
+  `create or replace function` **overwrites whatever is deployed**, so use it
+  only where the body must change, and compare the deployed definition first.
+  0008 does this once, and that comparison has been done.
+- **Write every statement to be re-runnable.**
+
+### Applying a migration must also RECORD it
+
+`supabase_migrations.schema_migrations` records **0001–0008**, 0008 at version
+`20260809173146`. A migration applied without a history row leaves the two
+disagreeing, and nothing downstream can then tell an unrecorded migration from
+an unapplied one. 0008 is the worked example of doing it right: one
+`apply_migration` call wrote the DDL and the ledger row together.
+
+- **Do not paste a migration into the SQL editor.** It applies the DDL and
+  records nothing. Earlier guidance in this repository said to do exactly
+  that; it was wrong.
+- **Do not use `supabase db push`.**
+- **Do not write a history row by hand**, before or after. The apply operation
+  writes it; a hand-written row is a record nothing verified.
+- **Do not use `supabase migration repair`.** It rewrites history to match an
+  assumption, and this project's history has been read and is correct.
+- The mechanism is the connected Supabase **MCP `apply_migration`** operation,
+  which applies the file and records it in one call, and it requires explicit
+  human authorization immediately beforehand.
+
+The full procedure — the exact project ref, migration name and query, the
+verification queries, and what to do when something fails — is
+[docs/SUPABASE_SETUP.md §2](docs/SUPABASE_SETUP.md).
+
+### Correct forward, and only as far as the defect
+
+A migration that has been applied and recorded is history even when it is
+wrong. If 0008 is recorded and its verification fails, the answer is a
+forward-only 0009 carrying **only** the corrective change — not deleting a
+history row, not marking it reverted, not rerunning it blindly, and not
+manually reversing everything it did.
+
+Two limits on any such correction, both learned from a rollback paragraph this
+repository actually carried:
+
+- **Independent repairs are not unpicked together.** 0008 fixes three separate
+  things; a fault in one is not a reason to reverse the other two.
+- **Never restore `service_role` execute on an internal function** unless a
+  named caller and a named failure prove that exact grant is needed. The
+  retracted rollback would have granted all sixteen internal functions back,
+  including four from 0007 that were correctly blocked *before* 0008 ran —
+  leaving the database less safe than before the attempt.
+
+**0008 is applied, recorded and verified** on the hosted development project —
+ledger version `20260809173146`, run 16. The recovery procedure above was not
+needed and is retained for the next migration.
+
+### One elevated key, one selector
+
+`SUPABASE_SECRET_KEY` is preferred everywhere;
+`SUPABASE_SERVICE_ROLE_KEY` is the legacy name and a fallback only when the
+preferred variable is **unset**. All three server surfaces —
+`api/assessments.mjs`, `api/analytics.mjs` and
+`server/staff-identity-resolution.mjs` — resolve it through
+[shared/security/supabase-keys.js](shared/security/supabase-keys.js) and none
+reads either variable directly. A test asserts that last part by reading the
+sources.
+
+They used to disagree: the staff route preferred the modern name and the two
+public endpoints read only the legacy one, so a deployment following current
+Supabase documentation brought up the authenticated console while assessment
+capture answered `503 not_configured`. **A split credential configuration
+fails in the direction that leaves the privileged surface working and the
+public one dark**, which is the direction nobody notices. Do not reintroduce a
+second place that reads an elevated key variable.
+
+A preferred variable that is set but malformed **fails closed and does not
+fall back** — a typo must be a refusal to fix rather than a silent demotion to
+the legacy key.

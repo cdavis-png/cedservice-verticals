@@ -6,6 +6,34 @@ Postgres, and the checklist for repeating it.
 **Status: executed and passed.** Blocker B7 — "the SQL has never run" — is
 closed. Everything below was observed, not predicted.
 
+> **Correction, 2026-08-09 — read [run 14](#run-14--0006-and-0007-are-already-on-the-hosted-project) first.**
+> Migrations **0006 and 0007 are present on the hosted development project**
+> `qkpptajglstgucadhfwq` (PostgreSQL 17.6.1.155). Every statement below that
+> says either has "never been applied to a hosted database", "never run on
+> PostgreSQL 17", or that nothing here has "ever run through PostgREST" was
+> written in good faith and is **false**. Those passages are left in place as
+> the record of what each run observed at the time, each marked with a
+> pointer here; run 14 is the current state.
+>
+> What run 14 did **not** establish is as important: the deployed definitions
+> have not been compared against this repository, the migration-history rows
+> have not been read, and the application time and method are unknown. Do not
+> read "present" as "matches what is committed".
+>
+> **Run 15 closes most of that.** The history rows are read (0001–0007
+> recorded, 0008 not), the supersession function is compared (it matches), and
+> all three of 0008's findings are confirmed against the real database. What
+> is still open: nothing has been *executed* there, and only the one function
+> has been diffed.
+>
+> **Run 16 then applied 0008** through the tracked `apply_migration` operation
+> — ledger version `20260809173146` — and verified it: the trigger now covers
+> UPDATE, no internal function is reachable by `service_role`, both helpers are
+> pinned, the two security-advisor warnings are gone, all data is intact, and
+> the rule was exercised behaviourally inside a rolled-back transaction. **The
+> hosted ledger records through 0008.** Runs 14 and 15 are the before; run 16
+> is the current state.
+
 ## Runs
 
 | | Run 1 — Milestone 1.1 | Run 2 — migration 0004 |
@@ -171,6 +199,12 @@ Postgres and remains outstanding.
 **Migration 0006 is validated as SQL and as a migration. It has still never
 been applied to a hosted database, and the hosted run remains outstanding.**
 
+> **Superseded by run 14.** The second sentence is false: 0006 **is** present
+> on the hosted development project. What run 4 validated is unchanged — this
+> was a local run and it proved what it says it proved. What is wrong is only
+> its statement about the hosted database. The deployed definition has still
+> not been compared against this repository.
+
 ---
 
 ## Run 6 — migration 0007, staff identity resolution, against a disposable local PostgreSQL
@@ -232,13 +266,22 @@ Stated plainly, because every one of these is still owed:
 - **PostgreSQL 17.** This ran on **18.3**. The hosted development project runs
   **17.6.1.155**. A behaviour that differs between the two majors would not be
   caught here, and 0007 has never run on 17.
+  *(Superseded by run 14: 0007 is present on the hosted 17.6.1.155 project, so
+  it has run on 17. This run still did not observe that, and the deployed
+  definition is still uncompared.)*
 - **Hosted Supabase.** 0007 has **never been applied to any hosted database**.
+  *(**False** — superseded by run 14. 0007 is present on
+  `qkpptajglstgucadhfwq`. When and how it was applied is unknown.)*
 - **PostgREST.** Local mode speaks SQL directly. The staff route calls five
   functions over `db.rpc(...)` — `staff_operator_guard`,
   `staff_identity_queue`, `staff_identity_case`,
   `resolve_identity_case_link_existing`, `check_rate_limit` — and **none of
   them has ever been resolved through PostgREST**. Nothing in this repository
   ever has.
+  *(Partly superseded by run 14. PostgREST has now RESOLVED these objects —
+  that is what the existence-versus-permission probes did. None has been
+  successfully **called** through it, which is what this bullet was really
+  about, and that part still stands.)*
 - **The two direct table reads.** The route reads
   `identity_resolution_cases` and `assessment_submissions` through PostgREST
   with the elevated key. Local mode reaches them as the database owner
@@ -279,9 +322,10 @@ Stated plainly, because every one of these is still owed:
   routing for `api/staff/identity-resolution/[...path].mjs`, the header rules,
   the runtime, and the fact that exactly one function now deploys rather than
   two — is asserted by `tests/staff-deployment-contract.test.mjs` against a
-  model of Vercel's documented routing. **No `vercel build` has been run**,
-  because the CLI is not a dependency of this repository and installing one
-  was out of bounds. The model is a check on the configuration, not on the
+  model of Vercel's documented routing. **No local `vercel build` has been
+  run**, because the CLI is not a dependency of this repository and
+  installing one was out of bounds. A platform build has since run and failed
+  closed before reaching routing; see run 13. The model is a check on the configuration, not on the
   platform. In particular, that the file tracer bundles `server/` alongside
   `api/` is expected — the imports are static, which is what
   `api/assessments.mjs` and `api/analytics.mjs` already rely on — but it has
@@ -306,6 +350,13 @@ Stated plainly, because every one of these is still owed:
 over a direct SQL connection. It has never been applied to a hosted database,
 never run on PostgreSQL 17, never been reached through PostgREST, and never
 been raced. All four remain deployment blockers.**
+
+> **Superseded by run 14 on three of the four.** 0007 **is** present on the
+> hosted development project, which runs PostgreSQL 17.6.1.155, and PostgREST
+> has resolved its objects. It has still **never been raced**, no staff
+> function has been successfully called through PostgREST, and the deployed
+> definitions have not been compared against this repository. What run 6
+> itself validated is unaffected.
 
 ---
 
@@ -426,10 +477,11 @@ decided it — the root was published by omission.
 
 ### What run 8 did NOT validate
 
-- **No `vercel build` and no preview deployment.** The Vercel CLI is not a
-  dependency of this repository and installing or authenticating one was out of
-  bounds. Everything above is a check on the *configuration and the generated
-  tree*, not on the platform.
+- **No local `vercel build`.** The Vercel CLI is not a dependency of this
+  repository and installing or authenticating one was out of bounds.
+  Everything above is a check on the *configuration and the generated tree*,
+  not on the platform. **A platform build has since run — see run 13**, and
+  it confirms only that Vercel executes the configured `buildCommand`.
 - **Whether Vercel honours `outputDirectory`** as documented.
 - **Whether `api/` functions are still discovered** when a `buildCommand` is
   present. This is documented behaviour for the "Other" preset; it has not been
@@ -444,6 +496,683 @@ decided it — the root was published by omission.
 **Until a real preview deployment exists, the static boundary is configured and
 tested but not observed.** Do not describe it as verified on the strength of
 this run.
+
+---
+
+## Run 14 — 0006 and 0007 are already on the hosted project
+
+**This run corrects a factual error that had propagated through eight
+documents.** Every statement in this repository of the form "0006 and 0007
+have never been applied to a hosted database" was **false**, and had been for
+some time before it was noticed.
+
+| | Run 14 |
+|---|---|
+| Date | 2026-08-09 |
+| Project | `qkpptajglstgucadhfwq` — the persistent hosted **development** project |
+| Postgres | 17.6.1.155 |
+| Transport | **PostgREST**, read-only |
+| Method | Existence-versus-permission probes: ask for an object and distinguish "permission denied" from "not found" |
+| Result | **0006 and 0007 are present.** No migration was applied, and nothing was written. |
+
+### What run 14 establishes
+
+- **Migrations 0006 and 0007 are present in the hosted development project.**
+  The objects they create resolve through PostgREST and answer *permission
+  denied* rather than *not found*, which "not applied" cannot produce.
+- **They have therefore run on PostgreSQL 17**, on hosted Supabase. Two of the
+  four blockers run 6 closed its section with are not blockers; they were
+  already cleared, unrecorded.
+- **PostgREST has resolved these objects.** "Nothing in this repository has
+  ever run through PostgREST" is no longer true as written.
+
+### What run 14 does NOT establish — and this is the more important half
+
+Presence is not equivalence. A probe that distinguishes *denied* from *absent*
+learns that a name exists. It learns nothing about what is behind the name.
+
+- **The deployed definitions are unverified.** Whether the hosted
+  `ingest_review`, `enforce_bir_supersession_scope`, `staff_operator_guard` or
+  any other object is byte-for-byte what this repository holds is **unknown**.
+  An earlier draft, a hand-edit in the SQL editor, or a partially applied file
+  would all probe identically.
+- **The migration-history records are unverified.** Whether
+  `supabase_migrations.schema_migrations` contains rows for 0006 and 0007 —
+  and therefore whether `supabase db push` would consider them applied — is
+  unknown.
+- **When and how they were applied is unknown.** No date, no method, no actor.
+- **Execution is still unproven.** The probes were permission refusals. No
+  staff function has been *called* through PostgREST, no ingestion has run
+  there, and the two direct table reads the route depends on have still never
+  been exercised as `service_role`.
+- **Nothing else changed.** Real Supabase Auth, real TOTP, real invitations,
+  true multi-connection concurrency and the Vercel platform gaps are all
+  exactly where runs 6 and 13 left them.
+
+### What this changes about how the next migration is written
+
+Migration **0008** exists because of three defects found in the audit that
+followed this discovery (see below), and it is written for a database whose
+current definitions cannot be assumed:
+
+- It is **forward-only**. 0006 and 0007 are not edited. A hosted migration is
+  history, and history is not rewritten to fix a defect found after it ran.
+- It prefers the **narrowest instrument**: `alter function … set search_path`
+  and `revoke` change a setting and an ACL without touching a body. Only F3
+  requires `create or replace`, and that statement overwrites whatever is
+  deployed — which is why comparing the deployed definition first is a
+  **required** step in the procedure, not a nicety.
+- It is **idempotent**, so applying it to a database whose state is partly
+  unknown cannot make things worse on a second attempt.
+
+### The three defects 0008 repairs
+
+| | Defect | Instrument |
+|---|---|---|
+| **F3** | `bir_supersession_scope` fires on INSERT only, so the invariant 0006 states as absolute is not enforced against any UPDATE | `create or replace` + recreate the trigger for `insert or update` |
+| **F6** | 0006's internal functions are revoked from `public, anon, authenticated` but **not** `service_role`, which a Supabase project grants directly through default privileges | `revoke … from … service_role` |
+| **F7** | `identity_value_acceptable` and `identity_evidence_fault` are the only two functions in the chain with no pinned `search_path` | `alter function … set search_path` |
+
+F3 is **defence in depth, not a live escape** — stated that way deliberately.
+The one UPDATE in the chain that touches a field the rule reads
+(`resolve_identity_case_link_existing`) cannot currently violate it, because a
+queued report has a null supersession chain. Nothing enforces that coincidence
+and nothing tested it.
+
+A fourth defect, **F8**, was application code and needed no migration: the
+staff route's `requestHash` omitted the resolution note, so a second call on
+one request id with a rewritten justification replayed the first outcome and
+discarded the new note. Repaired in `server/staff-identity-resolution.mjs`.
+
+### Deferred findings — recorded, deliberately not repaired
+
+Two audit findings are carried forward rather than fixed. Both are recorded
+here so that "not fixed" is a decision with a reason attached rather than an
+omission somebody rediscovers.
+
+- **`ingest_review` rule B4v is a dead branch.** 0006 lines 1204–1205 test
+  `v_proposal_vetoed or v_proposals_disagree` inside an `else` reachable only
+  when both are false, so B4v can never fire. The OUTCOME is unaffected — the
+  earlier branch already queues for review — but a vetoed submission skips
+  candidate discovery entirely, so its `identity_resolution_cases` row carries
+  an empty `candidate_business_ids` even where identifier candidates exist.
+
+  **Not a blocker for the staff resolution path**, and this is the reason it
+  can wait: 0007 derives the operator's eligible targets from the case's
+  persisted proposal evidence through
+  `identity_case_eligible_targets`, not from `candidate_business_ids`. An
+  operator working a proposal-vetoed case still sees targets. Repairing B4v is
+  a change to what a queued case RECORDS, which is worth doing on its own
+  terms and worth keeping out of a migration-hardening pass.
+
+- **Unacceptable identity values are handled two ways.**
+  `identity_proposal_conflict` REFUSES a value failing
+  `identity_value_acceptable`; the candidate-matching CTE and the
+  signal-writing loop silently FILTER one. Both directions are safe here —
+  filtering a value out of candidate matching cannot cause a wrong link, it
+  can only fail to find a right one — but the same input produces a refusal on
+  one path and a shrug on another, and that inconsistency is the kind that
+  gets resolved in the wrong direction later.
+
+Neither was touched by 0008, by the source reconciliation that followed it, or
+by its application in run 16. **Both remain deferred**, on the same reasoning.
+
+### Verification
+
+`tests/migration/0008-migration-hardening.test.mjs` applies the chain to 0007,
+**observes all three defects present**, applies 0008, and asks the same
+questions again. F6 needs a deliberate extra step to be honest: the local
+fixture creates `anon`, `authenticated` and `service_role` without the default
+privileges a real Supabase project carries, so the pre-existing assertion in
+`tests/migration/0006-rpc-roles.test.mjs` that "service_role cannot execute
+these" was passing **against an absence**. The new test grants the privilege
+explicitly first, so the revoke has something real to remove.
+
+**0008 has since been applied and verified — see
+[run 16](#run-16--0008-applied-and-verified-on-the-hosted-project).** The
+sentence that stood here, "0008 has not been applied anywhere", was true when
+run 14 was written and is not now.
+
+---
+
+## Run 16 — 0008 applied and verified on the hosted project
+
+**The migration is applied, recorded, and verified.** This is the first time
+any migration in this repository has been applied to a hosted database by this
+project's own tracked procedure, with the verification run immediately
+afterwards rather than promised.
+
+| | Run 16 |
+|---|---|
+| Date | 2026-08-09 |
+| Project | `qkpptajglstgucadhfwq` — the persistent hosted **development** project |
+| Postgres | 17.6.1.155 |
+| Migration | `0008_staff_migration_hardening` |
+| Source blob | `f992a3a85c40abf429d7d346de09fb0ad9102f19`, from commit `6939887836aaa2aa3e18cfdcacb5b3319f5bd98b` |
+| Mechanism | The tracked `apply_migration` operation — DDL and history row in one call |
+| Ledger version | **`20260809173146`** |
+| Authorization | Explicit, immediately before the operation, naming the project ref, migration name and source commit |
+| Result | **Applied, recorded, and verified. No rollback, no repair, no manual history row.** |
+
+The hosted ledger now records migrations **through 0008**.
+
+### What the post-application verification found
+
+Every item below was checked after the migration ran.
+
+**Migration ledger.** `supabase_migrations.schema_migrations` records the chain
+through 0008 at version `20260809173146`. The row was written by
+`apply_migration` itself; nothing was inserted by hand.
+
+**F3 — trigger coverage.** `bir_supersession_scope` is an **enabled,
+row-level `BEFORE INSERT OR UPDATE`** trigger. The `BEFORE INSERT`-only
+definition run 15 observed is gone.
+
+**F6 — internal function privileges.** All **16** internal functions exist, and
+none exposes unexpected EXECUTE to `PUBLIC`, `anon`, `authenticated` or
+`service_role`. The twelve that genuinely held a `service_role` grant from
+Supabase's default privileges no longer do; the four from 0007 that were
+already correctly blocked are unchanged, which is the outcome the retracted
+blanket-rollback paragraph would have destroyed.
+
+**F7 — pinned search paths.** Both helper functions —
+`identity_value_acceptable` and `identity_evidence_fault` — carry pinned search
+paths, and **the two mutable-search-path warnings from Supabase's security
+advisor are gone.** An independent instrument agreeing that the finding is
+closed is worth more than reading the catalog back.
+
+**Performance advisor.** Results **unchanged**. 0008 adds no index, no column
+and no plan-visible object, so an unchanged performance profile is the expected
+result and is recorded because "we did not check" and "nothing changed" look
+identical in a report that omits it.
+
+**Data integrity — nothing moved.**
+
+| | Before (run 15) | After |
+|---|---|---|
+| Business Records | 12 | **12** |
+| Submissions | 16 | **16** |
+| BIRs | 16 | **16** |
+| Identity-resolution cases | 3 | **3** |
+| Supersession chains | 3 | **3** |
+
+Zero broken predecessors, zero cross-business violations, zero
+cross-review-type violations — the same three zeros run 15 recorded, now
+re-confirmed with the stricter trigger in force.
+
+### Behavioural testing, inside a transaction, with nothing left behind
+
+The catalog says what the trigger *is*. This says what it *does*. Every case
+ran inside a transaction that was rolled back, so the hosted database took
+**zero persistent test writes** — the counts above are unchanged precisely
+because of that.
+
+| Case | Result |
+|---|---|
+| A valid update to a chained report | **allowed** |
+| Moving a chained report to another business | **rejected** |
+| Changing a chained report's review type | **rejected** |
+| Pointing at an invalid predecessor | **rejected** |
+| Pointing at an unknown predecessor | **rejected** |
+
+This is the first time F3's rule has been exercised against real data on
+PostgreSQL 17. Until now it had only ever run on PGlite 18.3 against fixtures.
+
+### What run 16 still does NOT establish
+
+- **PostgREST execution.** Still nothing. No RPC has been called through it,
+  and the staff route's five functions and two direct table reads remain
+  unexercised as `service_role`. The verification above is catalog and SQL, not
+  the transport the application uses.
+- **The rest of the deployed definitions.** Run 15 compared
+  `enforce_bir_supersession_scope()` against its committed source, and 0008 has
+  now replaced that one. Every other function in 0006 and 0007 is still
+  undiffed against the repository.
+- **True multi-connection concurrency.** Unchanged from run 6. The mechanism
+  that decides a race is proven; the race has still never been run.
+- **Real Supabase Auth, TOTP, invitations and recovery.** Unchanged from runs
+  6, 10, 11 and 12 — all still fixtures.
+- **Vercel.** Unchanged from run 13. No elevated credential is configured on
+  any environment, so no application code has yet reached this schema. Preview
+  configuration and hosted end-to-end testing are a separate, separately
+  authorized phase.
+
+---
+
+## Run 15 — the hosted preflight for 0008 *(superseded by run 16 — retained as the evidence that justified applying it)*
+
+> **Superseded by [run 16](#run-16--0008-applied-and-verified-on-the-hosted-project).**
+> Everything below was true of the database *before* 0008 was applied, and it
+> is retained deliberately: it is the record of the three defects being
+> confirmed present on the real database, which is what made applying 0008 a
+> repair rather than a guess. Read it as the "before" half of a before-and-after
+> pair, not as current state. In particular the `BEFORE INSERT`-only trigger,
+> the twelve `service_role` grants and the two mutable-`search_path` warnings
+> described below are all **now fixed**.
+
+Run 14 found that 0006 and 0007 were present and said, repeatedly, that
+*present is not known*. This run reads what run 14 only probed for.
+
+| | Run 15 |
+|---|---|
+| Date | 2026-08-09 |
+| Project | `qkpptajglstgucadhfwq` — the persistent hosted **development** project |
+| Postgres | 17.6.1.155 |
+| Method | Read-only preflight: catalog reads and migration-history reads |
+| Result | **Every one of 0008's three findings confirmed against the real database.** Nothing was applied and nothing was written. |
+
+### Migration history — now read, not unknown
+
+`supabase_migrations.schema_migrations` records **0001 through 0007**,
+including:
+
+| Version | Name |
+|---|---|
+| `20260808200326` | `0006_service_mix_review` |
+| `20260808201535` | `0007_staff_identity_resolution` |
+
+**0008 is not recorded and has not been applied.** The "the history rows have
+never been read" caveat in runs 6 and 14 is closed.
+*(As of run 16, 0008 **is** applied and recorded at version `20260809173146`.
+The sentence above describes the state this preflight found.)*
+
+### The definition comparison — done, and it matched
+
+The deployed `enforce_bir_supersession_scope()` body **matches repository
+migration 0006 exactly.** This was the one open risk in applying 0008: its F3
+repair is a `create or replace`, which overwrites whatever is deployed, and
+nobody had looked. There is nothing to lose.
+
+The deployed `bir_supersession_scope` trigger is **`BEFORE INSERT` only** —
+the F3 defect, observed on the real database rather than inferred from the
+migration file.
+
+### The two ACL findings, confirmed as real
+
+- **F6.** `service_role` holds EXECUTE on the **12** internal functions
+  originating in 0001, 0004 and 0006. The four from 0007 are already correctly
+  refused. This is the Supabase default-privilege defect exactly as described:
+  0006 revoked from `public, anon, authenticated` and the direct grant to
+  `service_role` survived. **0008's 16-function revoke stays at full scope** —
+  the hosted ACLs prove the broader set fixes something real, and narrowing it
+  to one function would leave eleven holes.
+- **F7.** `identity_value_acceptable` and `identity_evidence_fault` are the
+  only public functions with no pinned `search_path`, and **Supabase's own
+  security advisor reports exactly those two mutable-search-path warnings** —
+  an independent instrument reaching the same list.
+
+### Context that bounds the blast radius
+
+- `anon`, `authenticated` and `service_role` **cannot CREATE in schema
+  `public`**, which is what makes F7 a hygiene and consistency defect rather
+  than an exploitable one: there is no role able to plant a shadowing function
+  for an unpinned `search_path` to resolve to.
+- The function owner `postgres` has `BYPASSRLS` but is **not** `rolsuper`.
+
+### Existing data
+
+| | |
+|---|---|
+| Business Records | 12 |
+| Submissions | 16 |
+| BIRs | 16 |
+| Identity-resolution cases | 3 |
+| Supersession chains | 3 |
+| Cross-business supersession violations | **0** |
+| Cross-review-type supersession violations | **0** |
+
+Zero violations is the expected result and is worth stating: F3 is a coverage
+gap, not evidence that anything has already gone wrong. Nothing needs
+repairing before 0008 is applied.
+
+### What run 15 still did NOT establish
+
+- **Nothing was executed.** No RPC was called, no ingestion run, no staff
+  function invoked. This was catalog and history reads.
+- **Only one definition was compared.** `enforce_bir_supersession_scope()`
+  matches; the other functions in 0006 and 0007 have not been diffed against
+  their committed source.
+- **PostgREST execution.** No privileged RPC has been resolved or executed
+  through PostgREST. As of run 15, no elevated credential was configured on
+  any Vercel environment.
+
+  **Correction (2026-08-10).** An earlier version of this bullet also stated
+  that `GET /auth-config` "is hosted and answers HTTP 200". That assertion is
+  **withdrawn**. No reproducible hosted request to it has been identified: no
+  host, deployment id, timestamp, response body or header set was ever
+  recorded, and a later commit on this same branch (`42f3f7b`) states that
+  `/auth-config` was never called and no response header was observed. The
+  endpoint exists in this branch's implementation, and its response contract
+  is covered by the automated unit and browser suites against local servers —
+  which is a different claim from having observed it on a deployment. The
+  current Preview is protected by Vercel SSO, so the deployed endpoint's
+  response, headers and returned public configuration remain **unobserved**.
+  This does not assert that no manual call was ever made; only that no
+  sufficient evidence record of one exists.
+- **0008 remains unapplied**, on this project and everywhere else.
+  *(No longer true — run 16 applied and verified it.)*
+
+---
+
+## Run 13 — the first platform build
+
+**A preview deployment HAS now been attempted, and it failed by design.**
+The repository is connected to Vercel through Chris's other Vercel account.
+Pushing `agent/staff-secure-onboarding` triggered Preview deployment
+`dpl_Ew4VxQhkPHdeErYomKcJgKuTzJzu`. Its Build Logs — inspected manually in
+that account — show the build stopped with `SUPABASE_URL is not set.`:
+`tools/build-static.mjs` failed closed exactly as designed. **No Preview was
+published.** The failed Preview was not retried or modified. `main` @
+`8ac657f` had previously deployed successfully.
+
+That observes two things and no more: **Vercel runs the configured
+`buildCommand`**, and **the fail-closed guard fires on the real platform**.
+Everything downstream of the build — `outputDirectory`, `api/` discovery,
+file tracing, the header rules — is still unobserved, because the build
+aborted before reaching any of it.
+
+### What run 13 DID validate
+
+- **Vercel executes `buildCommand`.** The build log shows
+  `tools/build-static.mjs` running and producing its own refusal message,
+  which is only possible if the platform invoked it.
+- **The fail-closed guard is real, not just local.** With no `SUPABASE_URL`
+  the build refuses rather than publishing a page whose `connect-src` names
+  nothing. That is the designed behaviour and it is now observed on the
+  platform rather than modelled.
+- **A failed build publishes nothing.** No Preview URL was produced.
+
+### What run 13 did NOT validate
+
+- **Everything downstream of the build.** `outputDirectory`, `api/` function
+  discovery alongside a `buildCommand`, file tracing from `api/` into
+  `server/` and `shared/`, and whether the header rules are applied to the
+  generated paths — the build aborted before any of it.
+- **A successful Preview.** None has been produced, because
+  `SUPABASE_URL` has not been set on any environment.
+- Nothing about Supabase, PostgREST, PostgreSQL 17, real Auth, real
+  invitations or real recovery emails changed. Runs 6, 10, 11 and 12 stand.
+
+---
+
+## Run 12 — the invitation failure window
+
+Runs 10 and 11 left one gap. Accepting an invitation is two calls —
+`verifyOtp({ type: 'invite' })` then `updateUser({ password })` — and between
+them the account exists with **no usable password**. The password-based resume
+path needs a password, and the invitation cannot be reissued, so that person
+was stranded. Password recovery closes it, because it depends on the account
+rather than on the invitation.
+
+### What run 12 DID validate
+
+- **Window A — `updateUser` refused.** Driven end to end in a real browser:
+  the account is created with no password, the invitation is proven
+  unreplayable, a reset is requested, a new password is set on
+  `reset-password.html`, and the MFA-resume flow is then reached and
+  enrollment completed.
+- **Window B — `updateUser` succeeded and its response was lost.** The fixture
+  sets the password and destroys the socket, through auth-js's own retries, so
+  the account has a password its owner never learned. Proven that the resume
+  path cannot help (a guessed password is refused) and that recovery restores
+  access anyway.
+- **Not an account oracle.** An unknown address produces the *same words* and
+  the same absence of an error as a real one, and so does an unreachable
+  Supabase — asserted by comparing the rendered strings, not by reading the
+  code.
+- **The redirect is exact and same-origin.** `redirect_to` on the observed
+  `POST /auth/v1/recover` equals the CED origin plus the exact recovery page
+  path, and the request carried the publishable key.
+- **Recovery tokens fail safely**: wrong type, absent, expired/never-issued,
+  malformed, replayed after use, and supplied in the query string. A refused
+  query token consumes nothing — the genuinely issued reset is still
+  available afterwards.
+- **Nothing leaks.** Across the whole recovery flow, CED sees only
+  `GET …/auth-config`: no body, no query, no `Referer` carrying a token, and
+  the ten sensitive values are absent from every CED request, response and log
+  line. `localStorage`, `sessionStorage` and `document.cookie` are empty.
+- **Recovery grants nothing.** No factor enrolled, no aal2 session produced,
+  no database touched (the injected `db` throws on any access), and a genuine
+  aal2 token is still refused `not_an_operator` with no queue read.
+- **Under the generated CSP**, served as built, with only the CED and Supabase
+  origins contacted and zero CSP violations.
+
+### What run 12 did NOT validate
+
+- **No real recovery email has been sent.** The reset-password template in
+  runbook §2.0 is written from Supabase's documented variables; whether
+  `{{ .RedirectTo }}` renders as the URL the browser supplied, and
+  `{{ .TokenHash }}` into the fragment, is unobserved.
+- **The redirect URL has never been added to a project's allowed list**, so
+  Supabase has never accepted or refused it — and a refused `redirectTo`
+  falls back to the Site URL, which is the wrong-host outcome the
+  `{{ .RedirectTo }}` template exists to avoid. That fallback has not been
+  observed either.
+- **The invitation template still depends on `{{ .SiteURL }}`**, necessarily:
+  invitations are created from the Dashboard with no `redirectTo`, so
+  `{{ .RedirectTo }}` would be empty. Whether a per-project Site URL routes
+  invitations to the right environment is a configuration constraint this
+  repository documents and tests for, not one it has observed.
+- The Auth server remains a fixture, and every gap from runs 6, 8, 10 and 11
+  is unchanged.
+
+---
+
+## Run 11 — the CSP origin is generated, and the invitation moved to the fragment
+
+Run 10 left one deployment defect: `vercel.json`'s staff CSP carried
+`https://REPLACE-WITH-PROJECT-REF.supabase.co`, to be replaced by hand after
+review. A deployable file with a placeholder in it is a deployment waiting to
+ship the placeholder, and hardcoding the development origin instead would have
+pointed a production page at development data.
+
+### What run 11 DID validate
+
+- **Two environments, two exact origins, one source tree.** Building with
+  `SUPABASE_URL=https://qkpptajglstgucadhfwq.supabase.co` and with a second,
+  different project origin produces two policies that differ **only** in that
+  origin — asserted by substring-removal equality, not by eyeballing.
+- **The build fails closed** on absent, empty, whitespace, `http`, no-scheme,
+  credential-bearing, path-bearing, query-bearing, fragment-bearing,
+  ported, foreign-host, bare-domain, nested-subdomain, wildcard,
+  suffix-trick, too-short, whitespace-separated, `;`-injecting, quote-bearing
+  and key-shaped values — 24 cases, each refused by the validator **and** by
+  the whole build. Each refusal leaves the previous `dist/` byte-identical and
+  no staging directory behind, because the origin is resolved before anything
+  is deleted.
+- **The refusal never echoes the value**, so a pasted key cannot land in a
+  build log.
+- **No placeholder anywhere.** `vercel.json` contains neither
+  `REPLACE-WITH-PROJECT-REF` nor the string `supabase` at all, and every one of
+  the 30 published files is scanned for placeholder-shaped text.
+- **One line, one file.** The byte-for-byte test now exempts exactly one
+  named file, and a companion test proves that file differs from its source by
+  exactly one line, that the line is the base CSP line, that the replacement is
+  what `cspLineFor` produces, and that `connect-src` holds exactly two sources
+  with no wildcard and no `wss:`.
+- **The build and the route cannot diverge** — one variable, one validator,
+  three configured spellings (bare, trailing slash, second project) each
+  produce a generated `connect-src` and an `/auth-config` `supabaseUrl` that
+  are the same string.
+- **The header/meta split works in a real browser.** The onboarding suite now
+  serves the page **as built**, through the build's own `cspLineFor`, under the
+  real `vercel.json` header policy. The full flow completes with zero CSP
+  violation messages — which would not be true if the header still carried
+  `default-src` or `connect-src`, because the intersection would block the
+  Auth origin.
+- **The invitation never reaches CED.** It travels in the URL **fragment**, so
+  it is absent from the page load's own request line — observed on every
+  request Chrome made to the CED origin, on `pathname + search`, plus every
+  `Referer`, plus everything the server recorded, plus the logs.
+- **A query-string invitation is refused**, on its own and even when a valid
+  fragment token is also present, with zero Supabase calls. The page says why.
+- **`/auth-config`** returns exactly `{ ok, supabaseUrl, publishableKey }`,
+  normalised, `Cache-Control: no-store`, GET-only, with no secret, no legacy
+  service-role key and no unrelated configuration.
+- **The loopback exception is fenced.** Local development needs
+  `SUPABASE_URL` pointed at an http stub; that is accepted **only** with
+  `CED_ALLOW_INSECURE_STAFF=true`, a loopback request host, and a non-production
+  `NODE_ENV` — all three asserted individually — and the **build** refuses it
+  regardless, so no published page can name a loopback origin.
+
+### What run 11 did NOT validate
+
+- **No deployment has set `SUPABASE_URL`,** so no browser has been permitted to
+  reach a real `*.supabase.co` origin from a staff page. The generation is
+  exercised; the deployed result is not.
+- **Whether Vercel serves the header policy on the generated paths**, and
+  whether it honours `outputDirectory` and still discovers `api/` alongside a
+  `buildCommand` — the run 8 gaps, unchanged.
+- **Whether a real Supabase invite email renders `{{ .TokenHash }}` into a
+  fragment** the way the template in the runbook specifies. Never sent.
+- Everything run 10 left open: the Auth server is still a fixture, no real
+  invitation, no real TOTP, and PostgREST / hosted Supabase / PostgreSQL 17 are
+  unchanged from run 6.
+
+---
+
+## Run 10 — onboarding moved out of CED
+
+Run 9's onboarding was **withdrawn**. It put two CED endpoints in the credential
+path: they accepted the invited user's password and invitation token and
+returned the Supabase session, the TOTP secret and the `otpauth://` URI.
+CLAUDE.md §9 forbids this platform from transmitting or storing credentials.
+The reasoning behind it — "the browser must hold no Supabase key" — confused
+the **secret** key, which must never reach a browser, with the **publishable**
+key, which is designed for one.
+
+Onboarding now runs between the browser and Supabase Auth directly, with the
+vendored supported client. Run 9's results below are superseded except where
+this run repeats them.
+
+### What run 10 DID validate
+
+- **No ONBOARDING credential reaches CED, observed on the wire.** Scoped
+  deliberately: the console's own `/session` endpoints still exchange a
+  password and a TOTP code server-side and are unchanged. The browser suite runs
+  two servers on two origins and records the raw body of every request to
+  both. Across the full flow and the recovery flow, CED receives exactly one
+  request — `GET …/auth-config` — with an empty body, an empty query string,
+  and no `Referer` carrying the token. The password, both tokens, the secret,
+  the URI and the code are asserted absent from every CED request, response
+  and log line.
+- **The browser reaches only two origins**, recorded from Chrome's own request
+  events: the CED origin and the configured Supabase origin. No CDN.
+- **The real vendored client against a real GoTrue wire shape.** The fixture
+  Auth server implements `/auth/v1/verify`, `/token?grant_type=password`,
+  `/user` (GET and PUT), `/factors`, `/factors/:id/challenge`,
+  `/factors/:id/verify`, `/factors/:id` (DELETE) and `/logout`, taken from the
+  installed `@supabase/auth-js` 2.112.0. Every request carried the publishable
+  key; none carried the secret key.
+- **Under the shipped CSP.** The static server sets the real `/staff/(.*)`
+  policy read from `vercel.json`, with the placeholder replaced by the fixture
+  origin. The console is watched for CSP violation messages; there are none.
+- **The publishable key can reach nothing**, in real PostgreSQL through
+  PGlite, against the full chain including 0007:
+  `tests/migration/0007-anon-grants.test.mjs` proves `anon` and
+  `authenticated` are refused SELECT/INSERT/UPDATE/DELETE on six staff tables
+  and EXECUTE on six staff functions including the attach mutation, that RLS
+  is enabled **and forced** with **no policies**, and that `service_role`
+  reaches the same function body — so the refusals are about the role, not a
+  broken fixture.
+- **Type confinement.** `signup`, `magiclink`, `recovery`, `email_change`,
+  `email`, `sms` and an explicitly empty `type` all refuse the link with zero
+  Supabase calls. The token is still stripped from the URL when the type is
+  refused.
+- **Recovery works.** Reload after the password step, with no link parameters:
+  password sign-in, stale unverified factor deleted, fresh factor enrolled,
+  code verified — and **no `verifyOtp` call**, so no second invitation was
+  needed. A wrong password enrolls nothing; an already-verified account is
+  refused and signed out.
+- **Nothing is persisted.** `localStorage`, `sessionStorage` and
+  `document.cookie` are all empty after a completed flow.
+- **Enrollment still grants nothing.** A genuine `aal2` token is refused
+  `not_an_operator`, from a real browser, with no queue read on its behalf.
+- **The dead credential path is gone.** A test names
+  `handleInviteAccept`, `handleInviteVerify`, `onboardingPayload`,
+  `TOKEN_HASH_RE`, `TOTP_CODE_RE`, `MIN_PASSWORD` and `MAX_TOKEN_HASH` and
+  fails if any reappears in the route, and fires a full credential payload at
+  seven paths asserting none answers `200`.
+- **The vendored client is a copy, not a fork** — byte-identical to the
+  installed package, checksum recorded and re-verified.
+
+### What run 10 did NOT validate
+
+- **Supabase Auth is still a fixture.** It speaks the right protocol on the
+  right paths; it is not Supabase. No real invitation, no real password
+  change, no real factor, no real TOTP code.
+- **The invite email template has never been sent.** Whether
+  `{{ .TokenHash }}` and `{{ .SiteURL }}` render as documented, and whether
+  the link arrives intact, is unobserved.
+- **TOTP has never been enabled on a project.**
+- **The CSP placeholder has never been replaced.** No browser has been
+  permitted to reach a real `*.supabase.co` origin from a staff page, and
+  whether Vercel serves that header on the generated paths is still the run 8
+  gap.
+- **PostgREST, hosted Supabase and PostgreSQL 17** — unchanged from run 6. The
+  anon-grant proof ran on PGlite 18.3 as the database owner switching roles,
+  not through PostgREST as `anon`.
+
+---
+
+## Run 9 — invitation onboarding *(superseded by run 10 — the endpoints it validated have been removed)*
+
+The runbook told an invited person to accept an invitation, set a password and
+enroll a second factor. The repository could do none of it, and `/session`
+correctly refuses an account with no verified factor — so an invited operator
+met `mfa_enrollment_required` and stopped. The queue was unreachable for
+everybody this repository could actually onboard, which was nobody.
+
+Two endpoints now close it: `POST …/onboarding/invite` and
+`POST …/onboarding/verify`, with `staff/identity-resolution/accept-invite.html`
+as the page.
+
+### What run 9 DID validate
+
+- **The server half**, against a stubbed Auth client whose shape is pinned to
+  the installed `@supabase/auth-js` 2.112.0 — `verifyOtp`, `updateUser`,
+  `setSession`, `signOut`, `mfa.enroll`, `mfa.challengeAndVerify` all exist on
+  a genuinely constructed production client, and the stub invents nothing the
+  library lacks. 29 tests in
+  [tests/staff-invite-onboarding.test.mjs](../tests/staff-invite-onboarding.test.mjs).
+- **The browser half over a real socket** — real Chrome, `window.fetch` NOT
+  replaced, the real page, the real `handleRequest`. 10 tests in
+  [tests/browser/staff-invite-browser.test.mjs](../tests/browser/staff-invite-browser.test.mjs).
+- **Invite-only**, twice over: the page shows no form without a `token_hash`,
+  and the route hard-codes `type: 'invite'` so the request cannot ask for
+  another type.
+- **The invitation is not spent on refusable input.** A short password, an
+  over-long one, and a malformed token are all refused with zero Supabase
+  calls — observed against a call recorder, not read off the source.
+- **Onboarding emits `aal1` and only `aal1`,** and `/onboarding/verify`
+  returns no session at all. The `aal2` token was checked as absent from the
+  raw HTTP response body on the wire, not just from a parsed object.
+- **Neither endpoint touches the database.** Both suites inject a `db` proxy
+  that throws on any property access; both flows complete.
+- **A fully enrolled account is still refused the queue** with
+  `not_an_operator`, and no queue read runs on its behalf.
+- **Nothing sensitive is logged.** Console output is captured at
+  `CED_LOG_LEVEL=debug` across seven paths, including every failure path, and
+  asserted free of the invitation token, the password, the TOTP secret, the
+  `otpauth://` URI, both access tokens, the refresh token and the code.
+
+### What run 9 did NOT validate
+
+- **No real invitation has ever been accepted.** The Auth client is a stub in
+  both suites. No real `verifyOtp`, no real password change, no real
+  `mfa.enroll`, no real `challengeAndVerify`.
+- **The invite email template has never been sent.** The template in runbook
+  §2.0 is written from Supabase's documented variables. Whether
+  `{{ .TokenHash }}` and `{{ .SiteURL }}` render as expected, and whether the
+  resulting link reaches `accept-invite.html` intact, is unobserved.
+- **TOTP has never been enabled on a project**, so `mfa.enroll` returning
+  `502 enrollment_unavailable` when it is disabled is a path this repository
+  models rather than one it has seen.
+- **No authenticator app has read a real secret.** Manual key entry is
+  documented app behaviour, not a thing observed here.
+- **Vercel.** The two new static files are in the manifest and the build
+  copies 29 rather than 27, but no local `vercel build` has run — unchanged
+  from run 8. A platform build has since run and failed closed; see run 13.
 
 ---
 

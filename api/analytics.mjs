@@ -49,6 +49,7 @@ import { createHash, createHmac, randomUUID } from 'node:crypto';
 import analyticsEvents from '../shared/analytics/events.js';
 import bodyReader from '../shared/security/read-body.js';
 import rateLimit from '../shared/security/rate-limit.js';
+import supabaseKeys from '../shared/security/supabase-keys.js';
 
 const {
   ANALYTICS_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSIONS, LIMITS,
@@ -305,15 +306,33 @@ const toRow = (event, now) => {
 
 /* ---------- database ---------- */
 
+/* Selected by `shared/security/supabase-keys.js` — one definition of "prefer
+   SUPABASE_SECRET_KEY, accept the legacy SUPABASE_SERVICE_ROLE_KEY, refuse
+   anything that is not positively an elevated key". Reading the legacy
+   variable directly here meant a secret-key-only deployment lost analytics
+   while the staff console came up.
+
+   Returning null is the configured behaviour for this endpoint and stays
+   that way: analytics never affects the assessment, so a missing or
+   unusable key costs a measurement rather than a visitor's work.
+
+   The cache is keyed on (url, key), matching the other two server surfaces:
+   a bare `if (cachedClient)` outlived a key rotation inside a warm
+   instance. */
 let cachedClient = null;
 const getClient = async env => {
-  if (cachedClient) return cachedClient;
-  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) return null;
+  const url = env.SUPABASE_URL || '';
+  const key = supabaseKeys.elevatedKey(env);
+  if (!url || !key) return null;
+  if (cachedClient && cachedClient.url === url && cachedClient.key === key) {
+    return cachedClient.client;
+  }
   const { createClient } = await import('@supabase/supabase-js');
-  cachedClient = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
+  const client = createClient(url, key, {
     auth: { persistSession: false, autoRefreshToken: false }
   });
-  return cachedClient;
+  cachedClient = { url, key, client };
+  return client;
 };
 
 const callRpc = (db, name, args, signal) => {
@@ -559,9 +578,49 @@ export async function handleRequest(request, deps = {}) {
   }
 }
 
-export default async function handler(request) {
-  return handleRequest(request);
-}
+/* ============================================================
+   NAMED METHOD EXPORTS — the Vercel Node runtime contract.
+
+   Vercel's Node.js runtime selects its invocation contract from
+   the EXPORT SHAPE:
+
+     export default handler        -> Node signature (req, res)
+     export function POST(request) -> Web signature (Request)
+
+   This file is written for the Web signature, so it must use
+   named method exports. As a DEFAULT export it was called with
+   (req, res): `req.url` is a path rather than an absolute URL,
+   `req.headers` has no `.get()`, and — decisively — the returned
+   `Response` was DISCARDED because a Node-signature handler
+   answers through `res`. Nothing ever wrote to `res`, so every
+   invocation ran to the platform's 15-second limit and answered
+   504 FUNCTION_INVOCATION_TIMEOUT with no exception to show.
+
+   EVERY STANDARD METHOD IS EXPORTED, and that does NOT widen what
+   this endpoint accepts. POST is the endpoint; OPTIONS is its CORS preflight, answered 204. handleRequest
+   already answers a deterministic `405 method_not_allowed` with
+   `Allow: POST, OPTIONS` for anything else. A method with no
+   named export is refused by VERCEL with a generic 405 instead,
+   losing the JSON envelope, the error code, the correlation id
+   and the CORS headers. Forwarding the method so the application
+   can refuse it is what preserves that contract.
+   ============================================================ */
+
+/* One argument in, one argument forwarded: handleRequest's second parameter
+   is a test-only injection seam and nothing the platform passes may reach
+   it. */
+const respond = request => handleRequest(request);
+
+export const POST = respond;
+export const OPTIONS = respond;
+
+/* Forwarded ONLY so the application's own 405 answers them, never to accept
+   them. */
+export const GET = respond;
+export const PUT = respond;
+export const PATCH = respond;
+export const DELETE = respond;
+export const HEAD = respond;
 
 export const config = { runtime: 'nodejs' };
 
@@ -574,3 +633,8 @@ export const ANALYTICS = {
   MAX_EVENT_AGE_MS,
   EVENT_NAMES: Object.keys(EVENTS)
 };
+
+/* Exported so the suite can exercise the PRODUCTION client factory, for the
+   reason api/assessments.mjs gives: it is what proves this endpoint prefers
+   SUPABASE_SECRET_KEY and treats SUPABASE_SERVICE_ROLE_KEY as legacy. */
+export const __testing = { getClient };

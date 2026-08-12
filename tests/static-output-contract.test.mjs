@@ -45,7 +45,15 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const config = JSON.parse(readFileSync(join(ROOT, 'vercel.json'), 'utf8'));
 
 /* One build for the whole file. Determinism gets its own second build. */
-const { outputRoot, written } = buildStatic({ quiet: true });
+/* The build now generates the onboarding page's connect-src from
+   SUPABASE_URL, and fails closed without it. Every build in this file uses
+   one fixed origin so the output is comparable between runs; the generation
+   itself — including its refusals — is owned by
+   tests/build-csp-generation.test.mjs. */
+const SUPABASE_ORIGIN = 'https://qkpptajglstgucadhfwq.supabase.co';
+const BUILD_ENV = { SUPABASE_URL: SUPABASE_ORIGIN };
+
+const { outputRoot, written } = buildStatic({ quiet: true, env: BUILD_ENV });
 
 const hashOf = path => createHash('sha256').update(readFileSync(path)).digest('hex');
 const outPath = rel => join(outputRoot, rel.split('/').join(sep));
@@ -172,7 +180,7 @@ test('the build tooling is NOT git-ignored, or the deployment build cannot run',
 
 test('two consecutive builds produce the same inventory and the same content hashes', () => {
   const first = listOutput(outputRoot).map(f => [f, hashOf(outPath(f))]);
-  const second = buildStatic({ quiet: true });
+  const second = buildStatic({ quiet: true, env: BUILD_ENV });
   const after = listOutput(second.outputRoot).map(f => [f, hashOf(outPath(f))]);
 
   assert.deepEqual(after.map(e => e[0]), first.map(e => e[0]), 'identical file inventory');
@@ -180,12 +188,144 @@ test('two consecutive builds produce the same inventory and the same content has
 });
 
 test('every generated file is a byte-for-byte copy of its canonical source', () => {
-  /* This is what makes "no secret can be injected at build time" a property of
-     the build rather than a hope: there is no transform step to inject one. */
+  /* EXACTLY ONE EXEMPTION, named as a constant by the build itself rather
+     than restated here. Everything else is still a pure copy, which is what
+     keeps "no secret can be injected at build time" a property of the build:
+     there is one transform, it writes one line, and the next test pins what
+     that line may contain. */
   for (const rel of STATIC_MANIFEST) {
+    if (buildTesting.GENERATED_FILES.includes(rel)) continue;
     assert.equal(hashOf(outPath(rel)), hashOf(join(ROOT, rel.split('/').join(sep))),
       `${rel}: the published copy differs from the canonical source`);
   }
+});
+
+test('each generated file differs from its source by exactly the CSP line', () => {
+  /* Two pages talk to Supabase Auth directly — the invitation page and the
+     password-recovery page — so both need the exact origin. Neither may
+     change by anything else. */
+  assert.ok(buildTesting.GENERATED_FILES.length >= 1);
+  for (const rel of buildTesting.GENERATED_FILES) assertOneLineDelta(rel);
+});
+
+const assertOneLineDelta = rel => {
+  const source = readFileSync(join(ROOT, rel.split('/').join(sep)), 'utf8');
+  const built = readFileSync(outPath(rel), 'utf8');
+
+  const sourceLines = source.split(/\r?\n/);
+  const builtLines = built.split(/\r?\n/);
+  assert.equal(builtLines.length, sourceLines.length, `${rel}: no line was added or removed`);
+
+  const changed = sourceLines
+    .map((line, i) => (line === builtLines[i] ? null : i))
+    .filter(i => i !== null);
+  assert.equal(changed.length, 1, `${rel}: exactly one line changed, not ${changed.length}`);
+  assert.equal(sourceLines[changed[0]], buildTesting.CSP_SOURCE_LINE);
+  assert.equal(builtLines[changed[0]], buildTesting.cspLineFor(SUPABASE_ORIGIN));
+
+  /* And the generated LINE is a CSP and nothing else — no key, no second
+     host, no wildcard. Scoped to the line, because the surrounding document
+     is prose and may legitimately contain an asterisk. */
+  const line = builtLines[changed[0]];
+  assert.equal(/sb_(secret|publishable)_|service_role/.test(built), false, rel);
+  assert.equal(line.includes('*'), false, `${rel}: no wildcard source`);
+  assert.equal(line.includes('wss'), false, `${rel}: no WebSocket source`);
+  const connect = line.match(/connect-src ([^;]+);/)[1].trim().split(/\s+/);
+  assert.deepEqual(connect, ["'self'", SUPABASE_ORIGIN],
+    `${rel}: exactly two sources — self and the one validated project origin`);
+};
+
+/* ============================================================
+   Per-environment generation
+   ------------------------------------------------------------
+   THIS FILE OWNS THE REPOSITORY'S dist/, so it owns every test
+   that calls buildStatic — node's test runner runs files
+   concurrently, and two files rebuilding one directory is a race
+   rather than a test. The validator, the route half and the
+   source contract live in tests/build-csp-generation.test.mjs,
+   which deliberately calls no build.
+   ============================================================ */
+
+/* A second, different project origin. Preview and Production must be able to
+   produce different policies from the same source tree — that is the whole
+   reason the origin is generated instead of committed. */
+const PRODUCTION_ORIGIN = 'https://abcdefghijklmnopqrst.supabase.co';
+
+test('Preview and Production generate different exact CSP origins', () => {
+  const cspIn = () => readFileSync(outPath(buildTesting.GENERATED_FILES[0]), 'utf8')
+    .match(/<meta http-equiv="Content-Security-Policy" content="([^"]+)">/)[1];
+
+  const preview = buildStatic({ quiet: true, env: { SUPABASE_URL: SUPABASE_ORIGIN } });
+  const previewCsp = cspIn();
+  assert.equal(preview.supabaseOrigin, SUPABASE_ORIGIN);
+  assert.ok(previewCsp.includes(`connect-src 'self' ${SUPABASE_ORIGIN};`), previewCsp);
+  assert.equal(previewCsp.includes(PRODUCTION_ORIGIN), false);
+
+  const production = buildStatic({ quiet: true, env: { SUPABASE_URL: PRODUCTION_ORIGIN } });
+  const productionCsp = cspIn();
+  assert.equal(production.supabaseOrigin, PRODUCTION_ORIGIN);
+  assert.ok(productionCsp.includes(`connect-src 'self' ${PRODUCTION_ORIGIN};`), productionCsp);
+  assert.equal(productionCsp.includes(SUPABASE_ORIGIN), false,
+    'a production build must not be permitted to reach the development project');
+
+  /* The two differ ONLY in the origin. Nothing else about the policy — or the
+     page — moves between environments. */
+  assert.equal(previewCsp.replace(SUPABASE_ORIGIN, ''), productionCsp.replace(PRODUCTION_ORIGIN, ''));
+
+  buildStatic({ quiet: true, env: BUILD_ENV });
+});
+
+test('a trailing slash builds the same policy as no trailing slash', () => {
+  const cspIn = () => readFileSync(outPath(buildTesting.GENERATED_FILES[0]), 'utf8')
+    .match(/<meta http-equiv="Content-Security-Policy" content="([^"]+)">/)[1];
+
+  buildStatic({ quiet: true, env: { SUPABASE_URL: `${SUPABASE_ORIGIN}/` } });
+  const withSlash = cspIn();
+  buildStatic({ quiet: true, env: BUILD_ENV });
+  assert.equal(cspIn(), withSlash, 'one origin has one spelling in the policy');
+});
+
+test('a missing or invalid SUPABASE_URL fails the build before anything is touched', () => {
+  const cspIn = () => readFileSync(outPath(buildTesting.GENERATED_FILES[0]), 'utf8');
+  const before = cspIn();
+
+  for (const value of [undefined, '', 'https://evil.test', 'sb_secret_abcdefghijk',
+                       'http://qkpptajglstgucadhfwq.supabase.co',
+                       `${SUPABASE_ORIGIN}/auth/v1`, 'https://*.supabase.co',
+                       `${SUPABASE_ORIGIN} https://evil.test`]) {
+    assert.throws(() => buildStatic({ quiet: true, env: { SUPABASE_URL: value } }),
+      /refusing to build/, String(value));
+  }
+
+  /* And every one of those refusals left the previous output exactly as it
+     was — the origin is resolved before the delete, not after. */
+  assert.equal(cspIn(), before, 'the published page is untouched');
+  assert.deepEqual(listOutput(outputRoot), [...STATIC_MANIFEST].sort());
+  const strays = readdirSync(ROOT).filter(e => e.startsWith(buildTesting.TEMP_PREFIX));
+  assert.deepEqual(strays, [], 'and no staging directory was left behind');
+});
+
+test('no placeholder survives into the built output, anywhere', () => {
+  for (const rel of STATIC_MANIFEST) {
+    const text = readFileSync(outPath(rel), 'utf8');
+    assert.equal(text.includes('REPLACE-WITH-PROJECT-REF'), false,
+      `${rel} carries a placeholder`);
+    assert.equal(/PROJECT-REF|YOUR-PROJECT|<your-|TODO:/i.test(text), false,
+      `${rel} carries something that reads as a placeholder`);
+  }
+});
+
+test('vercel.json carries no placeholder and no Supabase host at all', () => {
+  /* THE DEFECT THIS PINS. The staff CSP once carried
+     `https://REPLACE-WITH-PROJECT-REF.supabase.co`, which had to be replaced
+     by hand after review — a deployable configuration with a placeholder in
+     it. Hardcoding the development origin instead would have been worse: the
+     production deployment would have been permitted to reach the development
+     project's Auth server. The origin is generated per environment now, and
+     no Supabase host belongs in this file. */
+  const raw = readFileSync(join(ROOT, 'vercel.json'), 'utf8');
+  assert.equal(raw.includes('REPLACE-WITH-PROJECT-REF'), false);
+  assert.equal(raw.includes('supabase'), false, 'vercel.json names no Supabase host');
 });
 
 test('the NUL byte in guidance.js survives the copy, so the build is byte-safe', () => {
@@ -209,7 +349,7 @@ test('a stale file does not survive a rebuild', () => {
   writeFileSync(stray, 'this should not survive');
   assert.ok(existsSync(stray), 'the stray file was really created');
 
-  buildStatic({ quiet: true });
+  buildStatic({ quiet: true, env: BUILD_ENV });
 
   assert.equal(existsSync(stray), false, 'the rebuild started from empty');
   assert.deepEqual(listOutput(outputRoot), [...STATIC_MANIFEST].sort(),
@@ -245,7 +385,7 @@ test('a build that fails part way leaves the PREVIOUS output intact and current'
     console.error('  ! failed-build test SKIPPED: directory symlinks unavailable');
   } else {
     try {
-      assert.throws(() => buildStatic({ quiet: true }), /symbolic link/,
+      assert.throws(() => buildStatic({ quiet: true, env: BUILD_ENV }), /symbolic link/,
         'the build refused rather than proceeding');
 
       assert.deepEqual(listOutput(outputRoot).map(f => [f, hashOf(outPath(f))]), before,
@@ -260,7 +400,7 @@ test('a build that fails part way leaves the PREVIOUS output intact and current'
   }
 
   /* The next real build still succeeds and restores the invariant. */
-  buildStatic({ quiet: true });
+  buildStatic({ quiet: true, env: BUILD_ENV });
   assert.deepEqual(listOutput(outputRoot), [...STATIC_MANIFEST].sort());
 });
 
@@ -536,6 +676,7 @@ test('a direct URL for a private path resolves to nothing', () => {
     '/api/assessments.mjs',
     '/shared/security/rate-limit.js',
     '/shared/security/origin.js',
+    '/shared/security/supabase-keys.js',
     '/shared/security/read-body.js',
     '/shared/security/staff-note.js',
     '/shared/security/verify-challenge.js',
@@ -738,7 +879,61 @@ test('the staff CSP and security headers still cover every generated staff asset
     assert.equal(headers['cache-control'], 'no-store', rel);
     assert.equal(headers['referrer-policy'], 'no-referrer', rel);
     assert.equal(headers['x-robots-tag'], 'noindex, nofollow, noarchive', rel);
-    assert.match(headers['content-security-policy'] || '', /^default-src 'none';/, rel);
+
+    /* THE HEADER POLICY CARRIES NO `default-src` AND NO `connect-src`, and
+       that is the correction rather than a relaxation.
+
+       A response-header CSP and a meta CSP are BOTH enforced, and the result
+       is their intersection. A header saying `connect-src 'self'` would
+       therefore have blocked the Supabase origin the onboarding page's own
+       policy permits — and `default-src 'none'` would have done it too, being
+       the fallback for connect-src. So the two directives that differ per
+       page live in each page's meta, and the header keeps what a meta cannot
+       express. */
+    const csp = headers['content-security-policy'] || '';
+    assert.match(csp, /^frame-ancestors 'none';/, `${rel}: the header leads with the one directive a meta cannot express`);
+    assert.equal(/(^|;)\s*default-src/.test(csp), false,
+      `${rel}: default-src in the header would intersect with the generated connect-src`);
+    assert.equal(/(^|;)\s*connect-src/.test(csp), false,
+      `${rel}: connect-src in the header would intersect with the generated one`);
+    /* The directives that are identical on every staff page stay in the
+       header, where they also cover a response no page element declares. */
+    for (const directive of ["script-src 'self'", "style-src 'self'",
+                             "form-action 'none'", "base-uri 'none'", "object-src 'none'"]) {
+      assert.ok(csp.includes(directive), `${rel}: the header still carries ${directive}`);
+    }
+  }
+});
+
+test('every generated staff HTML page carries its own meta CSP, before any resource', () => {
+  /* The header cannot carry default-src or connect-src, so each page must —
+     and a page that forgot would be governed by nothing but the header,
+     which permits any connection. */
+  for (const rel of listOutput(outputRoot).filter(f => f.startsWith('staff/') && f.endsWith('.html'))) {
+    const html = readFileSync(outPath(rel), 'utf8');
+    const meta = html.match(/<meta http-equiv="Content-Security-Policy" content="([^"]+)">/);
+    assert.ok(meta, `${rel} declares no meta CSP`);
+
+    const policy = meta[1];
+    assert.ok(policy.startsWith("default-src 'none'"), `${rel}: ${policy}`);
+    assert.ok(policy.includes("script-src 'self'"), rel);
+    assert.ok(policy.includes("style-src 'self'"), rel);
+    assert.ok(policy.includes("connect-src 'self'"), rel);
+    assert.equal(policy.includes('frame-ancestors'), false,
+      `${rel}: frame-ancestors is ignored in a meta policy and belongs in the header`);
+    assert.equal(policy.includes('data:'), false, `${rel}: no data: source`);
+    assert.equal(policy.includes('*'), false, `${rel}: no wildcard`);
+
+    /* BEFORE ANY SCRIPT, STYLESHEET OR OTHER FETCH. A meta policy governs
+       only what is parsed after it, so one placed below a <script> or a
+       <link> would not have covered it. */
+    const at = html.indexOf(meta[0]);
+    for (const marker of ['<script', '<link', '<img', '<style']) {
+      const first = html.indexOf(marker);
+      if (first !== -1) {
+        assert.ok(at < first, `${rel}: the meta CSP must precede the first ${marker}`);
+      }
+    }
   }
 });
 

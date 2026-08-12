@@ -30,6 +30,7 @@ import { randomUUID, createHmac } from 'node:crypto';
 
 import { handleRequest, __testing } from '../server/staff-identity-resolution.mjs';
 import rateLimit from '../shared/security/rate-limit.js';
+import { PUBLISHABLE_FIXTURE, SECRET_FIXTURE } from './helpers/supabase-keys.mjs';
 
 const OPERATOR = '11111111-1111-4111-8111-111111111111';
 const CASE_ID = '22222222-2222-4222-8222-222222222222';
@@ -43,6 +44,10 @@ const ENV = {
   SUPABASE_URL: 'https://example.supabase.co',
   SUPABASE_ANON_KEY: 'anon-never-real',
   SUPABASE_SERVICE_ROLE_KEY: 'service-never-real',
+  /* Rate limiting FAILS CLOSED on a missing secret, so every staff fixture
+     must configure one or the route answers 503 before the test's own
+     subject is reached. Never a real value. */
+  CED_RATE_LIMIT_SECRET: 'test-rate-limit-secret',
   CED_LOG_LEVEL: 'error'
 };
 
@@ -117,7 +122,7 @@ const ORIGIN = 'https://staff.example.com';
    older clients that send neither. */
 const call = async ({ method = 'GET', path = '/cases', token = 'good', body, rawBody,
                       headers = {}, db, env = ENV, verify, authClient,
-                      origin, fetchSite = 'same-origin' } = {}) => {
+                      origin, fetchSite = 'same-origin', callerIp = ADDRESS } = {}) => {
   /* `undefined` means "whatever a browser would send for this method"; `null`
      means "explicitly none", which is what the absent-Origin tests need. An
      unsafe method really does carry an Origin, so its default is the console's
@@ -130,6 +135,7 @@ const call = async ({ method = 'GET', path = '/cases', token = 'good', body, raw
     headers: {
       ...(token ? { authorization: `Bearer ${token}` } : {}),
       'x-forwarded-proto': 'https',
+      ...(callerIp ? { 'x-vercel-forwarded-for': callerIp } : {}),
       ...(effectiveOrigin ? { origin: effectiveOrigin } : {}),
       ...(fetchSite ? { 'sec-fetch-site': fetchSite } : {}),
       ...((body || rawBody) ? { 'content-type': 'application/json' } : {}),
@@ -230,7 +236,10 @@ test('separate operators and separate addresses are separate buckets', async () 
   const other = '99999999-9999-4999-8999-999999999999';
   const keysFor = async (address, operator) => {
     const db = stubDb();
-    await call({ db, env: LIMITED_ENV, headers: { 'x-real-ip': address },
+    /* `callerIp`, not an x-real-ip header: x-vercel-forwarded-for is resolved
+       FIRST now, so a header set alongside the helper's default would be
+       shadowed and every address would hash identically. */
+    await call({ db, env: LIMITED_ENV, callerIp: address,
       verify: verifier({ userId: operator, aal: 'aal2', emailConfirmed: true }) });
     const authed = db.calls.filter(c => c.name === 'check_rate_limit')[1].args.p_keys;
     return {
@@ -259,7 +268,7 @@ test('a pre-authentication refusal verifies no token and reads nothing', async (
   const request = new Request(
     `https://staff.example.com/api/staff/identity-resolution/cases/${CASE_ID}/link`, {
       method: 'POST',
-      headers: { authorization: 'Bearer good', 'x-forwarded-proto': 'https', origin: ORIGIN,
+      headers: { authorization: 'Bearer good', 'x-forwarded-proto': 'https', 'x-vercel-forwarded-for': '203.0.113.9', origin: ORIGIN,
                  'x-real-ip': ADDRESS, 'content-type': 'application/json' },
       body: JSON.stringify(linkBody())
     });
@@ -481,7 +490,7 @@ test('an oversized body is refused without being buffered', async () => {
   const request = new Request(
     `https://staff.example.com/api/staff/identity-resolution/cases/${CASE_ID}/link`,
     { method: 'POST', body, duplex: 'half',
-      headers: { authorization: 'Bearer good', 'x-forwarded-proto': 'https', origin: ORIGIN,
+      headers: { authorization: 'Bearer good', 'x-forwarded-proto': 'https', 'x-vercel-forwarded-for': '203.0.113.9', origin: ORIGIN,
                  'content-type': 'application/json' } });
 
   const res = await handleRequest(request, {
@@ -505,7 +514,7 @@ test('a declared Content-Length over the limit is refused before the stream open
   const request = new Request(
     `https://staff.example.com/api/staff/identity-resolution/cases/${CASE_ID}/link`,
     { method: 'POST', body, duplex: 'half',
-      headers: { authorization: 'Bearer good', 'x-forwarded-proto': 'https', origin: ORIGIN,
+      headers: { authorization: 'Bearer good', 'x-forwarded-proto': 'https', 'x-vercel-forwarded-for': '203.0.113.9', origin: ORIGIN,
                  'content-type': 'application/json', 'content-length': '900000' } });
 
   const res = await handleRequest(request, {
@@ -812,7 +821,7 @@ test('provenance is checked before the rate limiter, so a flood cannot be launde
 
 test('HTTPS is still checked before the origin, so an http request says so', async () => {
   const request = new Request('http://staff.example.com/api/staff/identity-resolution/cases', {
-    headers: { 'x-forwarded-proto': 'http', origin: 'https://evil.example' }
+    headers: { 'x-forwarded-proto': 'http', 'x-vercel-forwarded-for': '203.0.113.9', origin: 'https://evil.example' }
   });
   const res = await handleRequest(request, { env: ENV, db: stubDb() });
   assert.equal(res.status, 403);
@@ -870,26 +879,44 @@ test('an elevated key in a browser-key variable is refused, not used', () => {
   const serviceJwt = jwt({ role: 'service_role', iss: 'supabase' });
   const anonJwt = jwt({ role: 'anon', iss: 'supabase' });
 
-  assert.equal(looksElevated('sb_secret_abc123'), true);
+  assert.equal(looksElevated(SECRET_FIXTURE), true);
   assert.equal(looksElevated(serviceJwt), true);
-  assert.equal(looksElevated('sb_publishable_abc123'), false);
-  assert.equal(looksBrowserSafe('sb_publishable_abc123'), true);
+  assert.equal(looksElevated(PUBLISHABLE_FIXTURE), false);
+  assert.equal(looksBrowserSafe(PUBLISHABLE_FIXTURE), true);
   assert.equal(looksBrowserSafe(anonJwt), true);
 
   /* THE MISTAKE THIS CATCHES: a secret key pasted into the publishable
      variable. Token verification would otherwise have run with an elevated
      credential and nothing would have said so. */
-  assert.equal(lowPrivilegeKey({ SUPABASE_PUBLISHABLE_KEY: 'sb_secret_oops' }), '');
+  assert.equal(lowPrivilegeKey({ SUPABASE_PUBLISHABLE_KEY: SECRET_FIXTURE }), '');
   assert.equal(lowPrivilegeKey({ SUPABASE_ANON_KEY: serviceJwt }), '');
-  assert.equal(elevatedKey({ SUPABASE_SECRET_KEY: 'sb_publishable_oops' }), '');
+  assert.equal(elevatedKey({ SUPABASE_SECRET_KEY: PUBLISHABLE_FIXTURE }), '');
   assert.equal(elevatedKey({ SUPABASE_SERVICE_ROLE_KEY: anonJwt }), '');
 
-  /* The right keys in the right places still work, and an unrecognised string
-     is left alone rather than guessed about. */
-  assert.equal(lowPrivilegeKey({ SUPABASE_PUBLISHABLE_KEY: 'sb_publishable_ok' }),
-    'sb_publishable_ok');
-  assert.equal(elevatedKey({ SUPABASE_SECRET_KEY: 'sb_secret_ok' }), 'sb_secret_ok');
-  assert.equal(lowPrivilegeKey({ SUPABASE_ANON_KEY: 'opaque-local-value' }), 'opaque-local-value');
+  /* The right keys in the right places still work. */
+  assert.equal(lowPrivilegeKey({ SUPABASE_PUBLISHABLE_KEY: PUBLISHABLE_FIXTURE }),
+    PUBLISHABLE_FIXTURE);
+  assert.equal(elevatedKey({ SUPABASE_SECRET_KEY: SECRET_FIXTURE }), SECRET_FIXTURE);
+
+  /* AND AN UNRECOGNISED STRING IS REFUSED, NOT "LEFT ALONE".
+
+     This assertion used to read
+       lowPrivilegeKey({ SUPABASE_ANON_KEY: 'opaque-local-value' })
+         === 'opaque-local-value'
+     and it was the defect written down as a guarantee. Classification was
+     residual — "return it unless it looks elevated" — so a truncated key, a
+     typo, a whole .env line or a password pasted into the wrong box was
+     handed to a browser by /auth-config as a publishable key.
+
+     A key we cannot classify is not evidence of anything, which is exactly
+     why it must fail closed. `looksBrowserSafe` and `looksElevated` are now
+     positive tests for the four types Supabase actually issues. */
+  assert.equal(lowPrivilegeKey({ SUPABASE_ANON_KEY: 'opaque-local-value' }), '',
+    'an unclassifiable value must never be served as a publishable key');
+  assert.equal(looksBrowserSafe('opaque-local-value'), false);
+  assert.equal(looksElevated('opaque-local-value'), false);
+  assert.equal(looksBrowserSafe('sb_publishable_'), false, 'an empty suffix is not a key');
+  assert.equal(looksElevated('sb_secret_'), false);
 });
 
 test('a misconfigured browser key makes sign-in unavailable rather than elevated', async () => {
@@ -898,6 +925,7 @@ test('a misconfigured browser key makes sign-in unavailable rather than elevated
   const env = {
     CED_LOG_LEVEL: 'error',
     SUPABASE_URL: 'https://example.supabase.co',
+    CED_RATE_LIMIT_SECRET: 'test-rate-limit-secret',
     SUPABASE_PUBLISHABLE_KEY: 'sb_secret_pasted_in_the_wrong_box',
     SUPABASE_SECRET_KEY: 'sb_secret_pasted_in_the_wrong_box'
   };
@@ -916,6 +944,7 @@ test('paging past the last row reports the real total, not zero', async () => {
   const db = {
     calls: [],
     async rpc(name, args) {
+      if (name === 'check_rate_limit') return { data: { allowed: true }, error: null };
       if (name === 'staff_operator_guard') return { data: 'owner', error: null };
       asked.push({ limit: args.p_limit, offset: args.p_offset });
       if (args.p_offset > 0) return { data: [], error: null };
@@ -943,6 +972,9 @@ test('a first page that is empty asks for nothing extra', async () => {
   const asked = [];
   const db = {
     async rpc(name, args) {
+      /* The limiter runs before the guard now and must not be mistaken for a
+         queue page — without this it would record a bogus offset. */
+      if (name === 'check_rate_limit') return { data: { allowed: true }, error: null };
       if (name === 'staff_operator_guard') return { data: 'owner', error: null };
       asked.push(args.p_offset);
       return { data: [], error: null };

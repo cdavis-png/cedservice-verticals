@@ -26,11 +26,11 @@ family is mostly copy work. A new *family* needs its own assessment design.
 > assessment JavaScript of its own.
 >
 > Lead capture is built, shared, and hardened, but **not connected to
-> production**. Migrations 0001–0005 have been executed against a hosted
-> development PostgreSQL 17 project; migration 0006 has been executed only
-> against a disposable local PostgreSQL 18.3 through PGlite, and never against
-> PostgreSQL 17, hosted Supabase, or PostgREST. No production project is
-> configured and no challenge provider has been chosen. Over `file://` the
+> production**. Migrations 0001–0008 are applied and recorded on a hosted
+> **development** PostgreSQL 17 project, though only one deployed definition
+> has been compared against its committed file and nothing has been
+> successfully called through PostgREST. No production project is configured
+> and no challenge provider has been chosen. Over `file://` the
 > endpoint resolves to `null` and assessments are logged locally; over http(s)
 > it posts to `/api/assessments`.
 >

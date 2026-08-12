@@ -68,9 +68,10 @@ steps in [SUPABASE_SETUP.md](SUPABASE_SETUP.md) connect it to a live database.
 Ordering in the function is deliberate: everything that can refuse a request
 cheaply runs before anything that costs a network call or a transaction.
 
-The browser never sees a credential. `SUPABASE_SERVICE_ROLE_KEY` is read only
-inside the function, and the Supabase client is imported lazily so the module
-loads (and the tests run) without it.
+The browser never sees a credential. The elevated key — `SUPABASE_SECRET_KEY`,
+or the legacy `SUPABASE_SERVICE_ROLE_KEY` — is selected by
+`shared/security/supabase-keys.js` and read only inside the function, and the
+Supabase client is imported lazily so the module loads without it.
 
 **Why the BIR is generated before the transaction.** The BIR is a pure function
 of the payload — nothing about it depends on which business it belongs to except
@@ -259,10 +260,11 @@ no longer true of the repository.
 for step, and the unit suite still proves the endpoint rather than the SQL. But
 there is now a real PostgreSQL in the test environment: `tests/migration/` and
 `npm run test:integration:local` run the whole migration chain against a
-disposable local PostgreSQL 18.3 through PGlite, and migrations 0001–0005 have
-additionally been executed against a hosted development PostgreSQL 17 project.
-Migration 0006 has **not** run against PostgreSQL 17, hosted Supabase, or
-PostgREST. See [REAL_POSTGRES_VALIDATION.md](REAL_POSTGRES_VALIDATION.md),
+disposable local PostgreSQL 18.3 through PGlite, and migrations **0001–0007**
+are present on the hosted development PostgreSQL 17 project. What has *not*
+happened is a comparison of any deployed definition against its committed file,
+or a successful call through PostgREST. Migration 0008 has been applied
+nowhere. See [REAL_POSTGRES_VALIDATION.md](REAL_POSTGRES_VALIDATION.md) run 14,
 which is the one place execution status is maintained.
 
 It **does** now enforce the CHECK constraints that ingestion can violate. That
@@ -309,12 +311,15 @@ assessments then log locally and nothing is sent.
 ## 10. Known limitations
 
 1. ~~**The SQL is unverified at runtime.** It has never been executed.~~
-   *Historical, superseded.* Migrations 0001–0005 have since been executed
-   against Supabase PostgreSQL 17.6.1.155, and 0006 against a disposable local
-   PostgreSQL 18.3 through PGlite. 0006 has **not** run against PostgreSQL 17,
-   hosted Supabase, or PostgREST. See
-   [REAL_POSTGRES_VALIDATION.md](REAL_POSTGRES_VALIDATION.md), which is the one
-   place execution status is stated.
+   *Historical, superseded.* Migrations **0001–0008** are applied and recorded
+   on Supabase PostgreSQL 17.6.1.155, 0008 at ledger version `20260809173146`
+   with its verification passed, and 0006–0008 also run against a disposable
+   local PostgreSQL 18.3 through PGlite. The remaining gap is narrower and
+   still real: **only one deployed definition has been compared against its
+   committed file**, and nothing has been successfully called through
+   PostgREST. See
+   [REAL_POSTGRES_VALIDATION.md](REAL_POSTGRES_VALIDATION.md) run 16, which is
+   the one place execution status is stated.
 2. **No manual identity-resolution surface.** `identity_resolution_cases` rows
    accumulate with nothing to work them. Ambiguous submissions are stored safely
    but nobody can resolve them yet — and Milestone 1.1 sends *more* to that

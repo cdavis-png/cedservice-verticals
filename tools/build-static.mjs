@@ -61,18 +61,51 @@
    real one, and only the exact directory this process created is
    ever cleaned up.
 
-   NO ENVIRONMENT OVERRIDE. Nothing here reads process.env. A
-   deletion target that a variable could redirect is not fenced.
+   ------------------------------------------------------------
+   ONE GENERATED VALUE, IN TWO NAMED FILES.
+
+   Every file is copied byte for byte EXCEPT a single line in each
+   of the two staff pages that talk to Supabase Auth directly —
+   accept-invite.html and reset-password.html — where
+   `connect-src` is completed with the Supabase project origin.
+
+   WHY IT HAS TO BE GENERATED. Those pages talk to Supabase Auth
+   directly, so the policy has to name the exact project origin —
+   and the origin differs between Preview and Production. A
+   literal in `vercel.json` would be a placeholder somebody has to
+   remember to replace (unsafe, and it shipped once), or the
+   development project's origin hardcoded into main (worse: the
+   production deployment would be permitted to reach the
+   development database's Auth server).
+
+   WHAT THAT DOES NOT LOOSEN. The substitution is one known line,
+   in each named file, replaced with one value that has been
+   validated as an exact scheme-host-port by
+   shared/security/supabase-origin.js. The replacement is checked
+   after it is made. NO KEY, NO SECRET AND NO CREDENTIAL IS EVER
+   SUBSTITUTED — the publishable key is fetched at run time from
+   /auth-config and is deliberately NOT built in, so the property
+   "no secret can be inlined at build time" still holds by
+   construction rather than by care.
+
+   NO ENVIRONMENT OVERRIDE OF ANY PATH. `SUPABASE_URL` is the only
+   variable read, it reaches only the CSP text, and nothing about
+   the output directory, the staging directory, the manifest or
+   the delete fence can be influenced by the environment. A
+   deletion target a variable could redirect is not fenced.
    ============================================================ */
 
 import {
   rmSync, mkdirSync, copyFileSync, existsSync, statSync, lstatSync,
-  readdirSync, realpathSync, renameSync
+  readdirSync, realpathSync, renameSync, readFileSync, writeFileSync
 } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve, join, relative, isAbsolute, sep } from 'node:path';
 
 import { STATIC_MANIFEST, OUTPUT_DIR } from './static-manifest.mjs';
+import supabaseOrigin from '../shared/security/supabase-origin.js';
+
+const { validateSupabaseOrigin, describeOriginFailure } = supabaseOrigin;
 
 /* CANONICAL. realpath rather than resolve, so a repository reached through a
    symlinked parent still compares equal to the paths derived from it. Every
@@ -282,6 +315,87 @@ export const planManifest = (entries = STATIC_MANIFEST, root = ROOT) => {
   return plan;
 };
 
+/* ============================================================
+   The one generated value
+   ============================================================ */
+
+/* The ONLY files whose bytes the build is allowed to change, named here so no
+   other file can acquire the exemption by accident.
+
+   Both talk to Supabase Auth directly — one accepts an invitation, the other
+   completes a password recovery — so both policies must name the exact
+   project origin. Everything else in the manifest is still copied byte for
+   byte. */
+export const GENERATED_FILES = Object.freeze([
+  'staff/identity-resolution/accept-invite.html',
+  'staff/identity-resolution/reset-password.html'
+]);
+
+/* The exact line as it exists in the source, and the exact line the build
+   writes in its place. Matched literally rather than by pattern: a regex over
+   a Content-Security-Policy is a way to rewrite more of it than intended, and
+   an exact match means a change to the page's policy has to be a deliberate
+   change here too. */
+export const CSP_SOURCE_LINE =
+  `  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; `
+  + `script-src 'self'; style-src 'self'; connect-src 'self'; form-action 'none'; `
+  + `base-uri 'none'; object-src 'none'">`;
+
+export const cspLineFor = origin =>
+  CSP_SOURCE_LINE.replace(`connect-src 'self';`, `connect-src 'self' ${origin};`);
+
+/* Reads and validates the project origin. Pure apart from the object it is
+   handed, so the failing cases are testable without touching process.env. */
+export const resolveSupabaseOrigin = (env = process.env) => {
+  const result = validateSupabaseOrigin(env && env.SUPABASE_URL);
+  if (!result.ok) {
+    fail(`refusing to build: ${describeOriginFailure(result.reason)}\n`
+       + '       The onboarding page\'s Content-Security-Policy is generated from it, '
+       + 'and a build\n       that guessed would publish a page permitted to reach the '
+       + 'wrong Supabase project.');
+  }
+  return result.origin;
+};
+
+/* Applies the substitution inside the STAGED tree, and proves it happened.
+
+   Everything is checked after the write, not before: that the source line was
+   present exactly once, that it is gone, that the generated line is there,
+   that the rest of the file is untouched, and that nothing key-shaped was
+   introduced. A generated file nobody verified is a file nobody can trust. */
+const generateCspIn = (stageRoot, origin, relPath) => {
+  const target = join(stageRoot, ...relPath.split('/'));
+  const before = readFileSync(target, 'utf8');
+
+  const occurrences = before.split(CSP_SOURCE_LINE).length - 1;
+  if (occurrences !== 1) {
+    fail(`refusing to build: ${relPath} must contain the base CSP line exactly `
+       + `once (found ${occurrences}). The build cannot generate a policy it cannot find.`);
+  }
+
+  const generated = cspLineFor(origin);
+  const after = before.replace(CSP_SOURCE_LINE, generated);
+
+  if (!after.includes(generated)) fail('refusing to build: the CSP line was not written');
+  if (after.includes(CSP_SOURCE_LINE)) fail('refusing to build: the base CSP line survived');
+  if (after.length !== before.length + (generated.length - CSP_SOURCE_LINE.length)) {
+    fail('refusing to build: the CSP substitution changed more than one line');
+  }
+  /* Belt and braces on the property that matters most about a build that
+     rewrites bytes at all. */
+  if (/sb_(secret|publishable)_|service_role/.test(after)) {
+    fail('refusing to build: a key-shaped value reached the generated page');
+  }
+
+  writeFileSync(target, after);
+};
+
+/* Every generated page, or the build fails. A page that quietly kept the
+   fail-closed baseline would be a page that silently cannot reach Supabase. */
+const generateCsp = (stageRoot, origin) => {
+  for (const relPath of GENERATED_FILES) generateCspIn(stageRoot, origin, relPath);
+};
+
 /* Every file actually present in the output, as repository-relative POSIX
    paths. Sorted, so the inventory is comparable between runs. */
 export const listOutput = (outputRoot) => {
@@ -297,7 +411,13 @@ export const listOutput = (outputRoot) => {
   return out.sort();
 };
 
-export const buildStatic = ({ quiet = false } = {}) => {
+export const buildStatic = ({ quiet = false, env = process.env } = {}) => {
+  /* ---------- 0. the generated value, before anything is touched ----------
+     A misconfigured origin must cost nothing: no delete, no staging
+     directory, no half-published site. It is also the failure most likely to
+     happen, because it is the one thing that differs per environment. */
+  const supabase = resolveSupabaseOrigin(env);
+
   /* ---------- 1. the output target, before anything exists ---------- */
   assertOutputName(OUTPUT_DIR);
   const outputRoot = join(ROOT, OUTPUT_DIR);
@@ -330,6 +450,12 @@ export const buildStatic = ({ quiet = false } = {}) => {
       copyFileSync(from, to);
     }
 
+    /* ---------- 3a. the one generated value ----------
+       After every copy, inside the staging directory, so the canonical source
+       is never written to and a failure here still leaves the live output
+       exactly as it was. */
+    generateCsp(stageRoot, supabase);
+
     /* ---------- 4. prove the staged tree before it becomes the site ---------- */
     const written = listOutput(stageRoot);
     const expected = [...STATIC_MANIFEST].sort();
@@ -345,8 +471,13 @@ export const buildStatic = ({ quiet = false } = {}) => {
     renameSync(stageRoot, outputRoot);
     owned = false;
 
-    if (!quiet) console.log(`Static output: ${written.length} files -> ${OUTPUT_DIR}/`);
-    return { outputRoot, written };
+    if (!quiet) {
+      console.log(`Static output: ${written.length} files -> ${OUTPUT_DIR}/`);
+      /* The origin is not a secret and printing it is how a deploy log shows
+         which project the published page was permitted to reach. */
+      console.log(`Onboarding connect-src: 'self' ${supabase}`);
+    }
+    return { outputRoot, written, supabaseOrigin: supabase };
   } finally {
     /* ONLY the directory this process created, and only if it still owns it. */
     if (owned) {
@@ -360,7 +491,8 @@ export const buildStatic = ({ quiet = false } = {}) => {
 export const __testing = {
   ROOT, PERMITTED_OUTPUT_NAME, TEMP_PREFIX, SOURCE_DIRECTORIES,
   assertOutputName, assertTemporaryName, assertDirectChildOfRoot, assertNotSymlink,
-  validateManifestPath, assertSafeSource, assertSafeDestination, planManifest
+  validateManifestPath, assertSafeSource, assertSafeDestination, planManifest,
+  GENERATED_FILES, CSP_SOURCE_LINE, cspLineFor, resolveSupabaseOrigin
 };
 
 /* Runnable as the Vercel build command, and by hand. */

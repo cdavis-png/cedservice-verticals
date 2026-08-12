@@ -77,9 +77,16 @@
    not the next token refresh, and the only thing that can promise
    that is a lookup.
 
-   The browser never touches an identity table, never calls a
-   privileged function, and never holds a Supabase key of any
-   kind. It calls this route; this route holds the keys.
+   The browser never touches an identity table and never calls a
+   privileged function. The console page holds no Supabase key at
+   all; the onboarding page holds the PUBLISHABLE key, which is
+   the key Supabase publishes for browser clients and which grants
+   nothing here — RLS is forced with no policies and no function
+   is executable by `anon`. The SECRET key never leaves this
+   function's environment, and no password, session token, TOTP
+   code or TOTP secret is ever accepted by, returned by, or logged
+   by any endpoint in this file. See the note above the route
+   table for what that replaced and why.
    ============================================================ */
 
 import { randomUUID, createHash, createHmac } from 'node:crypto';
@@ -88,20 +95,45 @@ import staffNote from '../shared/security/staff-note.js';
 import rateLimit from '../shared/security/rate-limit.js';
 import bodyReader from '../shared/security/read-body.js';
 import originPolicy from '../shared/security/origin.js';
+import supabaseOriginPolicy from '../shared/security/supabase-origin.js';
+import supabaseKeys from '../shared/security/supabase-keys.js';
 
 const { screenResolutionNote } = staffNote;
 const {
   buildRateLimitKeys, staffRateLimitPolicy, staffSignInRateLimitPolicy,
-  staffSessionRateLimitPolicy, NAMESPACES
+  staffSessionRateLimitPolicy, NAMESPACES, readAddress, isUsableAddress
 } = rateLimit;
 const { readBoundedBody, parseJsonSafely, OUTCOME: BODY } = bodyReader;
 const { configuredOrigins, isAllowedOrigin } = originPolicy;
+const { validateSupabaseOrigin, validateLocalSupabaseOrigin } = supabaseOriginPolicy;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_BODY_BYTES = 8192;
 const MAX_NOTE = 2000;
 const MIN_NOTE = 8;
 const MIN_SUBSTANTIVE_NOTE = 40;
+
+/* ---------- what onboarding does NOT come through here ----------
+   An earlier version of this file carried two onboarding endpoints that
+   accepted the invitation token and the new password, and returned the
+   Supabase session, the TOTP secret and the otpauth URI. That was wrong, and
+   it was wrong in the direction this repository is least willing to be wrong
+   in: CLAUDE.md §9 says this platform never stores or transmits passwords,
+   tokens or other credentials, and those endpoints did all of it.
+
+   The reasoning that produced them — "the browser must hold no Supabase key"
+   — confused two different keys. The SECRET key must never reach a browser.
+   The PUBLISHABLE key is designed for exactly that: it is what every
+   documented Supabase browser client uses, it carries no privilege of its
+   own, and every table has RLS enabled and FORCED with no policies so it can
+   read nothing. Avoiding a public key by routing private credentials through
+   a CED function traded a non-problem for a real one.
+
+   Onboarding is now done by the browser, directly with Supabase Auth, using
+   the vendored supported client. The only thing this route still does for it
+   is answer `GET /auth-config` with the project URL and the publishable key —
+   neither of which is a credential, and neither of which is any of the seven
+   values that must never touch a CED endpoint. */
 
 const hmac = (secret, input) => createHmac('sha256', secret).update(input).digest('hex');
 
@@ -145,46 +177,45 @@ const decodeClaims = token => {
   } catch { return {}; }
 };
 
-/* Supabase issues two recognisable shapes for each privilege level: the
-   current `sb_secret_` / `sb_publishable_` prefixes, and legacy JWTs whose
-   payload carries `role`. Both are checked, and anything unrecognised is
-   left alone — a key we cannot classify is not evidence of anything. */
-const looksElevated = value => {
-  const v = String(value || '');
-  if (!v) return false;
-  if (v.startsWith('sb_secret_')) return true;
-  return decodeClaims(v).role === 'service_role';
-};
+/* ---------- key classification ----------
+   POSITIVE, NOT RESIDUAL. THIS IS THE FIX FOR A REAL DEFECT.
 
-const looksBrowserSafe = value => {
-  const v = String(value || '');
-  if (!v) return false;
-  if (v.startsWith('sb_publishable_')) return true;
-  return decodeClaims(v).role === 'anon';
-};
+   These used to be "does it LOOK elevated / LOOK browser-safe", and
+   `lowPrivilegeKey` returned anything that did not look elevated. An
+   unrecognisable value — a truncated key, a typo, a whole `.env` line, a
+   password pasted into the wrong box — was therefore treated as a
+   publishable key and served to a browser by `/auth-config`. The check said
+   "not obviously the wrong one" and was read as "the right one".
 
-/* ---------- environment keys ----------
-   Supabase renamed its keys: `publishable` for the low-privilege key and
-   `secret` for the elevated one. The old `anon` and `service_role` names
-   still work on existing projects, so both are accepted and the current
-   name is preferred. Which one was used is never logged — the NAME is not
-   sensitive but the habit of logging around key material is.
+   A key we cannot classify is not evidence of anything, which is exactly why
+   it must be REFUSED rather than passed along. Both functions below answer
+   "is this positively one of the four types Supabase actually issues", and
+   everything else is unusable.
 
-   The two are kept strictly apart, and the separation FAILS CLOSED in both
-   directions rather than merely being separate variables. A secret key put
-   in the publishable variable is not returned, so the route answers
-   `auth_unavailable` instead of quietly performing token verification with
-   an elevated credential; a publishable key put in the secret variable is
-   not returned either. Neither mistake becomes a silent privilege change. */
-const lowPrivilegeKey = env => {
-  const chosen = env.SUPABASE_PUBLISHABLE_KEY || env.SUPABASE_ANON_KEY || '';
-  return looksElevated(chosen) ? '' : chosen;
-};
+   THE FOUR SUPPORTED TYPES, and nothing invented:
 
-const elevatedKey = env => {
-  const chosen = env.SUPABASE_SECRET_KEY || env.SUPABASE_SERVICE_ROLE_KEY || '';
-  return looksBrowserSafe(chosen) ? '' : chosen;
-};
+     browser-safe   sb_publishable_<suffix>
+                    legacy JWT whose decoded `role` is exactly "anon"
+     elevated       sb_secret_<suffix>
+                    legacy JWT whose decoded `role` is exactly "service_role"
+
+   The classifier, the two documented key formats, the legacy-JWT role read
+   and the preferred-then-legacy variable rule all now live in
+   `shared/security/supabase-keys.js`. They moved there unchanged, because
+   `api/assessments.mjs` and `api/analytics.mjs` read only
+   `SUPABASE_SERVICE_ROLE_KEY` and a deployment configured with just
+   `SUPABASE_SECRET_KEY` therefore brought THIS route up while leaving
+   assessment ingestion and analytics answering `not_configured`. That module
+   states the whole rule and why each half of it fails closed; this route
+   holds the names it already used so nothing below had to change.
+
+   `shared/security/supabase-keys.js` is SERVER-ONLY — absent from the static
+   manifest and asserted absent from the published output by name. */
+const {
+  PUBLISHABLE_KEY_FORMAT, SECRET_KEY_FORMAT,
+  legacyKeyRole, classifyKey, looksElevated, looksBrowserSafe,
+  selectKey, lowPrivilegeKey, elevatedKey
+} = supabaseKeys;
 
 /* Structured, identifiers-only, same rule as the public route: no contact
    detail, no token, no identifier value, and no credential the sign-in
@@ -282,11 +313,41 @@ const getServiceClient = async env => {
    person, so a second operator reusing the first one's request id must be
    refused rather than handed the first one's outcome and told they resolved
    it. The database enforces the same thing independently, against the ledger
-   row's own operator column. */
-const requestHash = ({ caseId, targetBusinessId, operatorUserId, overrideConflict, overrideReason }) =>
+   row's own operator column.
+
+   THE NOTE IS PART OF THE DECISION TOO, and it was left out. "Not the note's
+   whitespace" is right; "not the note" was not, and the difference is what
+   the note is FOR. `resolve_identity_case_link_existing` writes it to
+   `identity_resolution_cases.resolution_notes`, and for an
+   `other_verified_evidence` override the note IS the justification — it is
+   the only record of why a contradiction was overridden to make a permanent,
+   unerasable attachment, and the mutation requires forty characters of it.
+
+   Left out of the hash, a second call on the same request id with a
+   materially different note matched `identity_resolution_replay`, returned
+   the FIRST outcome with `replayed: true` and a 200, and discarded the new
+   note without saying so. An operator correcting or completing their
+   justification was told it had been recorded. It had not, and a replay
+   writes nothing, so there was no second row to find it in either.
+
+   So the note is hashed, normalised for whitespace only: trimmed, and runs of
+   whitespace collapsed to one space. A genuine network retry re-sends the
+   same body and still replays. A reworded justification is a different
+   request and is refused as one — which is the answer the operator can act
+   on, rather than a success they cannot verify.
+
+   Note this changes the hash for a given decision. The ledger is keyed on the
+   request id and holds no rows anywhere yet, so there is nothing in flight to
+   strand; a deploy made after real resolutions exist would need to consider
+   the retry in the window, and the failure mode would be a 409 telling an
+   operator to reissue, never a wrong attachment. */
+const normalizeNote = note => String(note ?? '').trim().replace(/\s+/g, ' ');
+
+const requestHash = ({ caseId, targetBusinessId, operatorUserId, overrideConflict,
+                       overrideReason, note }) =>
   createHash('sha256').update(JSON.stringify([
     'link_existing', caseId, targetBusinessId, operatorUserId || null,
-    overrideConflict === true, overrideReason || null
+    overrideConflict === true, overrideReason || null, normalizeNote(note)
   ])).digest('hex');
 
 /* ---------- the postgrest error surface ----------
@@ -365,6 +426,119 @@ const caseIdFrom = segment => {
     fail(400, 'invalid_case_id', 'A case id must be a UUID.');
   }
   return decoded;
+};
+
+/* ---------- a body where none is permitted ----------
+   THIS EXISTS BECAUSE THE CLAIM WAS UNTESTABLE AS WRITTEN. "auth-config
+   accepts no body" was only ever exercised with POST/PUT/PATCH/DELETE, which
+   are refused for their METHOD long before any body is considered. A GET
+   carrying a body was never checked, and whether the runtime hands one over
+   is the platform's business, not ours to assume.
+
+   THREE SIGNALS, NONE OF WHICH READS THE BODY. Reading it would mean
+   buffering something we have already decided is not allowed, and a value we
+   never read is a value we cannot accidentally log:
+
+     · Content-Length, when it declares a non-zero length;
+     · Transfer-Encoding, in any form — a chunked body declares no length at
+       all, so length alone would miss it;
+     · request.body being present, which is what a Web-standard runtime
+       exposes when a body was actually attached.
+
+   The stream is left untouched and un-cancelled. The answer is a stable 400
+   with a fixed code and no detail: the caller learns the shape was wrong and
+   nothing about what arrived. */
+const assertNoBody = request => {
+  const declared = request.headers.get('content-length');
+  if (declared !== null && declared.trim() !== '' && Number(declared) > 0) {
+    fail(400, 'unexpected_body', 'This endpoint accepts no request body.');
+  }
+  const encoding = request.headers.get('transfer-encoding');
+  if (encoding !== null && encoding.trim() !== '') {
+    fail(400, 'unexpected_body', 'This endpoint accepts no request body.');
+  }
+  /* Truthy only when a body was genuinely attached; a bodyless Request has
+     `null` here in every runtime this repository targets. */
+  if (request.body) {
+    fail(400, 'unexpected_body', 'This endpoint accepts no request body.');
+  }
+};
+
+/* ---------- bounding the rate-limit call ----------
+   THE BUDGET THIS PROTECTS. The pre-authentication rate-limit pass runs on
+   EVERY request, before the access token is verified, and it is a network
+   call to Supabase. It had no timeout. A slow or unreachable database could
+   therefore consume the platform's entire 15-second function budget on its
+   own, and the caller would get 504 FUNCTION_INVOCATION_TIMEOUT — no body, no
+   code, nothing to act on.
+
+   TWO SECONDS. Short enough that even three sequential passes cannot approach
+   the budget, and far longer than a healthy `check_rate_limit`, which is a
+   single indexed upsert. Configurable so an unusually distant database can be
+   accommodated without editing code, and clamped so a mistyped value cannot
+   reintroduce the unbounded case.
+
+   THE SIGNAL IS SENT AND THE PROMISE IS RACED, both — the same reasoning as
+   the helper in api/assessments.mjs. An abort signal only helps if the
+   transport honours it; a driver that ignores it, or a test double that never
+   settles, would hang the function anyway.
+
+   ONE TIMER, NOT TWO, and this differs from that helper deliberately. Two
+   timers armed at the same delay race each other: the expiry timer resolves
+   first, the `finally` then clears the abort timer, and the abort never
+   fires — so a real PostgREST call is left running into a void rather than
+   cancelled. Aborting inside the single timer, before resolving, makes the
+   cancellation actually happen. A test asserts the signal is aborted. */
+const DEFAULT_RATE_LIMIT_TIMEOUT_MS = 2000;
+const MIN_RATE_LIMIT_TIMEOUT_MS = 250;
+/* Four seconds, not five. A request takes at most two passes today
+   (pre-authentication, then one of sign-in / session / authenticated), but
+   the bound is chosen so that even THREE at the ceiling — 12s — still leave
+   headroom inside the platform's 15s. A maximum that could exactly consume
+   the budget is not a bound. */
+const MAX_RATE_LIMIT_TIMEOUT_MS = 4000;
+
+const rateLimitTimeoutMs = env => {
+  const configured = Number(env.CED_RATE_LIMIT_TIMEOUT_MS);
+  if (!Number.isFinite(configured) || configured <= 0) return DEFAULT_RATE_LIMIT_TIMEOUT_MS;
+  return Math.min(MAX_RATE_LIMIT_TIMEOUT_MS, Math.max(MIN_RATE_LIMIT_TIMEOUT_MS,
+    Math.floor(configured)));
+};
+
+/* A sentinel rather than a thrown error, so a timeout is a value the caller
+   handles explicitly instead of an exception that could be swallowed by a
+   catch written for something else. */
+const TIMED_OUT = Symbol('rate_limit_timed_out');
+
+/* Fixed and short. Not derived from anything upstream — nothing upstream
+   answered — so it cannot leak a window length or a bucket state. */
+const RATE_LIMIT_UNAVAILABLE_RETRY_SECONDS = 5;
+
+const runWithTimeout = async (factory, timeoutMs) => {
+  const controller = new AbortController();
+  let timer = null;
+  try {
+    const work = Promise.resolve(factory(controller.signal));
+    const expiry = new Promise(resolve => {
+      timer = setTimeout(() => {
+        /* Abort FIRST, then resolve. Reversing these lets the race settle and
+           the finally clear the timer before the abort ever runs. */
+        try { controller.abort(); } catch { /* nothing depends on it landing */ }
+        resolve(TIMED_OUT);
+      }, timeoutMs);
+    });
+    return await Promise.race([work, expiry]);
+  } finally {
+    /* Always, so a prompt answer never leaves the event loop pinned. */
+    if (timer) clearTimeout(timer);
+  }
+};
+
+/* PostgREST exposes `.abortSignal()` on a query builder. A test double that
+   does not is called plainly — the race still bounds it. */
+const callRpc = (db, name, args, signal) => {
+  const call = db.rpc(name, args);
+  return (call && typeof call.abortSignal === 'function') ? call.abortSignal(signal) : call;
 };
 
 const readBody = async request => {
@@ -501,6 +675,67 @@ const assertOrigin = (request, env, url) => {
   if (!SAFE_FETCH_SITES.has(site)) {
     fail(403, 'origin_required', 'This endpoint accepts staff-console requests only.');
   }
+};
+
+/* ---------- the method each path serves ----------
+   ONE TABLE, CHECKED BEFORE ANYTHING IS SPENT.
+
+   THE DEFECT THIS CLOSES. Only two paths validated their method inline —
+   /session and /auth-config — so every other path let an unsupported method
+   fall through the whole chain and answer with whatever it happened to hit:
+   `OPTIONS /cases` reached the bearer-token check and returned 401,
+   `PUT /cases/:id` the same, and an unrecognised path returned 404 only after
+   authentication. None of those is an answer about the METHOD, and none
+   carries an `Allow` header a client can act on.
+
+   Every method is now decided here, from one table, in one place.
+
+   ORDER MATTERS AND IS DELIBERATE:
+
+     · AFTER the origin gate, so a cross-origin caller still gets the uniform
+       403 it always got and cannot enumerate which methods a path serves.
+     · BEFORE the rate limiter, so a refusal costs no bucket, no database
+       round trip and no Supabase client — the same reasoning the origin gate
+       already follows — and so a limiter that is unavailable cannot mask a
+       405 with a 503.
+
+   MORE SPECIFIC PATTERNS FIRST: `/cases/:id/link` is a POST route that would
+   otherwise be matched by the `/cases/:id` GET rule.
+
+   This adds no accepted operation. Every path serves exactly the one method
+   it served before; the table only makes the refusal deterministic. */
+/* One spelling of the public-configuration path, shared by the method table,
+   the rate-limit exemption and the branch that answers it. Three copies of one
+   regex is three chances for the exemption to stop matching the route it is
+   supposed to describe — which would not fail loudly, it would quietly start
+   metering a read that must not be metered. No `g` flag, so `test` keeps no
+   position between callers. */
+const AUTH_CONFIG_PATH = /\/auth-config$/;
+
+const ROUTE_METHODS = Object.freeze([
+  [/\/session(?:\/(?:refresh|signout))?$/, 'POST'],
+  [AUTH_CONFIG_PATH, 'GET'],
+  [/\/cases\/[^/]+\/link$/, 'POST'],
+  [/\/cases\/[^/]+$/, 'GET'],
+  [/\/cases$/, 'GET']
+]);
+
+/* Returns a 405 Response when the method is wrong for a KNOWN path, and null
+   otherwise. An unknown path is left to the existing chain, which answers 404
+   after authentication — deliberately, so the set of real paths is not
+   enumerable by an unauthenticated caller. */
+const methodRefusal = (request, path, correlationId) => {
+  const method = String(request.method || '').toUpperCase();
+  for (const [pattern, allowed] of ROUTE_METHODS) {
+    if (!pattern.test(path)) continue;
+    if (method === allowed) return null;
+    /* The established shape, unchanged: same code, same message, same header
+       the two inline checks produced. */
+    return json(405, {
+      ok: false, code: 'method_not_allowed', message: `${allowed} is required.`
+    }, correlationId, { Allow: allowed });
+  }
+  return null;
 };
 
 /* A JSON body is declared as JSON. `text/plain` is what a cross-site simple
@@ -699,6 +934,7 @@ const handleSignOut = async (body, client) => {
   return { ok: true };
 };
 
+
 /* ============================================================
    handleRequest
    ============================================================ */
@@ -731,7 +967,55 @@ export async function handleRequest(request, deps = {}) {
        a same-origin read that a browser sends no Origin for. Both refusals
        happen here, so neither costs a bucket. */
     assertOrigin(request, env, url);
-    if (request.body) assertJsonContentType(request);
+
+    /* A SAFE METHOD CARRYING A BODY IS REFUSED AS A BODY PROBLEM, before the
+       content-type gate below can call it a content-type problem.
+
+       No endpoint this route serves over GET or HEAD reads a body, so one is
+       always a mistake or a probe. Answering `415 unsupported_media_type`
+       would be misleading — the media type is not the issue — and it would
+       invite the caller to retry with `application/json`, which would then be
+       ignored. `400 unexpected_body` is the honest answer, and it is reached
+       without reading a byte. */
+    if (SAFE_METHODS.has(String(request.method || '').toUpperCase())) {
+      assertNoBody(request);
+    } else if (request.body) {
+      assertJsonContentType(request);
+    }
+
+    /* ---------- 2a. the method, deterministically ----------
+       Before the rate limiter, so a wrong method costs no bucket and cannot
+       be masked by a limiter that is unavailable. See ROUTE_METHODS. */
+    const wrongMethod = methodRefusal(request, path, correlationId);
+    if (wrongMethod) return wrongMethod;
+
+    /* ---------- 2b. the one read that is not rationed ----------
+       `GET /auth-config` returns two values that are public by construction —
+       the project origin and the publishable key, which Supabase publishes for
+       browser clients. It authenticates nothing, reads no body, consults no
+       token and touches no table.
+
+       IT IS THEREFORE NOT SUBJECT TO THE DATABASE-BACKED PRE-AUTHENTICATION
+       LIMITER, and the reason is not convenience. Metering it made the
+       console's ability to load its own configuration depend on the elevated
+       Supabase client and a `check_rate_limit` round trip: a deployment with
+       no elevated credential answered `503 database_unavailable`, and a
+       database wobble would stop the sign-in page rendering rather than stop
+       an attack. A limiter whose failure mode is "nobody can sign in" is not
+       protecting this endpoint — the endpoint has nothing to protect.
+
+       THIS IS NOT A BYPASS AND IS NOT CONDITIONAL ON ANYTHING. It is one
+       method on one path, decided identically in every environment; there is
+       no variable that widens it and none that narrows it.
+
+       Everything ahead of this point still applies in full: HTTPS, the origin
+       and Fetch Metadata gate, the no-body rule, and the method table that
+       answers `405` with `Allow: GET`. Everything behind it is untouched —
+       /session, its refresh and signout, every case read and every link still
+       fail closed on a missing secret, an unusable caller identifier, a
+       limiter timeout, an RPC failure and a missing elevated credential. */
+    const publicConfigRead =
+      String(request.method || '').toUpperCase() === 'GET' && AUTH_CONFIG_PATH.test(path);
 
     /* The elevated client, built at most once per request and only when
        something actually needs it. */
@@ -744,30 +1028,97 @@ export async function handleRequest(request, deps = {}) {
 
     /* One rate-limit pass. Returns a Response when the caller must be
        refused, and null when they may continue. Nothing about the bucket, the
-       address or the operator reaches the caller — only how long to wait. */
+       address or the operator reaches the caller — only how long to wait.
+
+       FAILS CLOSED IN EVERY DIRECTION, and two of those reverse earlier
+       decisions:
+
+         · no secret     used to mean NO RATE LIMITING AT ALL, logged at error
+                         level in production and otherwise silent. That is an
+                         unmetered authentication path created by forgetting
+                         one environment variable — the exact configuration
+                         mistake a limiter exists to survive.
+         · unavailable   used to allow the request through: "a rate limiter
+                         that cannot answer must not take the console down
+                         with it". Treating an unavailable limiter as
+                         permission turns a database wobble into an unmetered
+                         path, silently.
+
+       Both now refuse. `503` rather than `429` because the caller did
+       nothing wrong and their quota is not the reason, and `Retry-After` is a
+       fixed short value — not derived from anything upstream, because nothing
+       upstream answered.
+
+       THE REASON TOKEN IS FIXED VOCABULARY. An upstream error body can carry
+       the statement, the parameters and the shape of the schema; the
+       configured secret must never be echoed at all. Only which pass failed,
+       and which of a closed set of reasons. */
+    const unavailable = (event, reason) => {
+      log('error', 'staff_rate_limit_unavailable', { pass: event, reason });
+      return json(503, {
+        ok: false, code: 'rate_limit_unavailable',
+        message: 'Staff requests cannot be processed right now. Please try again shortly.'
+      }, correlationId, { 'Retry-After': String(RATE_LIMIT_UNAVAILABLE_RETRY_SECONDS) });
+    };
+
     const limitPass = async ({ namespace, policy, sessionId = null, includeSession, event }) => {
+      /* THE SECRET IS CHECKED HERE, EXPLICITLY, AND NOT INFERRED FROM AN
+         EMPTY KEY LIST. buildRateLimitKeys returns [] for two unrelated
+         reasons — no secret, and no derivable caller address — and conflating
+         them is what let a missing variable read as "nothing to limit".
+         Whitespace counts as missing: a variable set to " " is a variable
+         somebody meant to set and did not. */
+      const secret = typeof env.CED_RATE_LIMIT_SECRET === 'string'
+        ? env.CED_RATE_LIMIT_SECRET.trim() : '';
+      if (!secret) return unavailable(event, 'missing_secret');
+
+      /* THE CALLER MUST BE IDENTIFIABLE, or there is nothing to meter.
+
+         A bucket keyed on nothing is not a bucket, and a bucket keyed on
+         garbage is one nobody else shares — both are "no limit" wearing a
+         limiter's clothes. This was the last unmetered shape: a request with
+         no forwarding header used to pass straight through.
+
+         Checked against the resolved address, not inferred from an empty key
+         list, so a missing identifier is distinguishable from a missing
+         secret and each gets its own fixed reason. The value itself is never
+         logged: it is the caller's IP address. */
+      const address = readAddress(request.headers);
+      if (!isUsableAddress(address)) return unavailable(event, 'missing_identifier');
+
       const keys = buildRateLimitKeys({
         headers: request.headers, sessionId, env, hmacFn: hmac, namespace, includeSession
       });
       if (!keys.length) {
-        if (String(env.NODE_ENV || '').toLowerCase() === 'production') {
-          /* No secret configured means no rate limiting at all — visible, not silent. */
-          log('error', 'staff_rate_limit_not_configured', { pass: event });
-        }
-        return null;
+        /* Belt and braces: a usable address that still derived no key means
+           the builder and this check disagree, which is a defect rather than
+           a caller problem — and it must not become permission. */
+        return unavailable(event, 'missing_identifier');
       }
-      const db = await database();
-      const { data: limit, error: limitError } = await db.rpc('check_rate_limit', {
-        p_keys: keys,
-        p_window_seconds: policy.windowSeconds,
-        p_max_requests: policy.maxRequests
-      });
-      if (limitError) {
-        /* A rate limiter that cannot answer must not take the console down
-           with it; every other layer still applies. */
-        log('warn', 'staff_rate_limit_unavailable', { pass: event, reason: 'rpc_error' });
-        return null;
+
+      let outcome;
+      try {
+        const db = await database();
+        outcome = await runWithTimeout(
+          signal => callRpc(db, 'check_rate_limit', {
+            p_keys: keys,
+            p_window_seconds: policy.windowSeconds,
+            p_max_requests: policy.maxRequests
+          }, signal),
+          rateLimitTimeoutMs(env));
+      } catch (err) {
+        /* A thrown driver error, an aborted call, or an unconfigured elevated
+           key. `StaffError` is the route's own refusal — 503
+           database_unavailable from getServiceClient — and is re-thrown so it
+           keeps its own status and code. */
+        if (err instanceof StaffError) throw err;
+        outcome = { error: { message: 'threw' } };
       }
+
+      if (outcome === TIMED_OUT) return unavailable(event, 'timeout');
+      if (!outcome || outcome.error) return unavailable(event, 'rpc_error');
+
+      const limit = outcome.data;
       if (limit && limit.allowed === false) {
         const retryAfter = Number(limit.retryAfterSeconds) > 0
           ? Math.ceil(Number(limit.retryAfterSeconds)) : policy.windowSeconds;
@@ -785,14 +1136,20 @@ export async function handleRequest(request, deps = {}) {
     /* ---------- 3. pre-authentication, by address alone ----------
        BEFORE token verification, because verification is an outbound HTTPS
        call to Supabase Auth. Charged to its own namespace so a legitimate
-       request is not also charged to the authenticated bucket below. */
-    const preAuthRefusal = await limitPass({
-      namespace: NAMESPACES.staffPreAuth,
-      policy: staffPolicy,
-      includeSession: false,
-      event: 'staff_rate_limited_preauth'
-    });
-    if (preAuthRefusal) return preAuthRefusal;
+       request is not also charged to the authenticated bucket below.
+
+       Skipped for the public configuration read, and skipped HERE rather than
+       inside limitPass, so the exemption is visible at the call site and
+       limitPass keeps exactly one behaviour: fail closed. */
+    if (!publicConfigRead) {
+      const preAuthRefusal = await limitPass({
+        namespace: NAMESPACES.staffPreAuth,
+        policy: staffPolicy,
+        includeSession: false,
+        event: 'staff_rate_limited_preauth'
+      });
+      if (preAuthRefusal) return preAuthRefusal;
+    }
 
     /* ---------- 4. the session endpoints ----------
        No bearer token, no operator, no database read.
@@ -807,6 +1164,9 @@ export async function handleRequest(request, deps = {}) {
        consume the other. */
     const sessionRoute = path.match(/\/session(?:\/(refresh|signout))?$/);
     if (sessionRoute) {
+      /* Unreachable while ROUTE_METHODS carries this path — kept as a second
+         line so the branch is correct on its own terms, whatever the table
+         says. */
       if (request.method !== 'POST') {
         return json(405, { ok: false, code: 'method_not_allowed', message: 'POST is required.' },
           correlationId, { Allow: 'POST' });
@@ -831,6 +1191,71 @@ export async function handleRequest(request, deps = {}) {
         return json(200, await handleSignOut(body, client), correlationId);
       }
       return json(200, await handleSignIn(body, client, log), correlationId);
+    }
+
+    /* ---------- 4a. the browser's Supabase configuration ----------
+       The onboarding page talks to Supabase Auth directly, so it needs the
+       project URL and the publishable key. It cannot be given them at build
+       time: this repository has no build-time substitution anywhere, by
+       design (CLAUDE.md §13), and inventing one to inline a value would be a
+       larger change than reading it at runtime.
+
+       NOTHING HERE IS A CREDENTIAL. The publishable key is the key Supabase
+       publishes for browser clients; it grants nothing on its own, because
+       every table has RLS enabled and FORCED with no policies and no execute
+       grant on any function. `lowPrivilegeKey` is what reads it, so the
+       cross-check applies in both directions and a SECRET key pasted into the
+       publishable variable is refused rather than served to a browser.
+
+       No body, no token, no password, no session, no secret. It is a GET, so
+       a same-origin call carries no Origin and is judged on Fetch Metadata by
+       the same gate as every other read. */
+    if (AUTH_CONFIG_PATH.test(path)) {
+      /* Second line, as above. Matched on the PATH rather than on
+         `publicConfigRead`, so a wrong method still lands in this branch and
+         is answered here if the table above ever stops covering it, instead of
+         falling through to the bearer-token check and returning 401. */
+      if (request.method !== 'GET') {
+        return json(405, { ok: false, code: 'method_not_allowed', message: 'GET is required.' },
+          correlationId, { Allow: 'GET' });
+      }
+      /* Before the key is read and before anything is built. A GET with a
+         body is not a request this endpoint serves, and refusing it without
+         reading it is what makes "accepts no body" true rather than
+         incidental. */
+      assertNoBody(request);
+      /* THE SAME VALIDATOR THE BUILD USES, on the same variable, so the
+         origin this hands the browser and the origin the browser is
+         PERMITTED to reach by the generated connect-src cannot disagree.
+         Two spellings of one host would be a blocked request at run time
+         with nothing to explain it. `.origin` is returned rather than the raw
+         value for the same reason: one host, one spelling. */
+      let project = validateSupabaseOrigin(env.SUPABASE_URL);
+      /* The local-development exception, behind the switch that already
+         requires all three of the variable, a loopback request host and a
+         non-production NODE_ENV. `insecureAllowed` is the same gate that
+         lets this route answer over plain http at all, so a deployment
+         cannot reach this branch. The BUILD has no such exception: it stays
+         strict, so a published page never names a loopback origin. */
+      if (!project.ok && insecureAllowed(env, url)) {
+        project = validateLocalSupabaseOrigin(env.SUPABASE_URL);
+      }
+      const key = lowPrivilegeKey(env);
+      if (!project.ok || !key) {
+        /* The same refusal the Auth path gives, for the same reason and by
+           the same rule: a crossed key is a misconfiguration, not a fallback.
+           The reason is logged, never returned — it describes the
+           deployment's configuration, not the caller's request. */
+        log('error', 'staff_auth_config_unavailable', {
+          reason: project.ok ? 'no_publishable_key' : project.reason
+        });
+        return json(503, {
+          ok: false, code: 'auth_unavailable', message: 'Staff authentication is not configured.'
+        }, correlationId);
+      }
+      return json(200, {
+        ok: true, supabaseUrl: project.origin, publishableKey: key
+      }, correlationId);
     }
 
     /* ---------- 5. the access token ---------- */
@@ -1030,7 +1455,7 @@ export async function handleRequest(request, deps = {}) {
         p_target_business_id: targetBusinessId,
         p_resolution_request_id: resolutionRequestId,
         p_request_hash: requestHash({
-          caseId, targetBusinessId, operatorUserId, overrideConflict, overrideReason
+          caseId, targetBusinessId, operatorUserId, overrideConflict, overrideReason, note
         }),
         p_note: note,
         p_signals: signals,
@@ -1079,10 +1504,22 @@ export async function handleRequest(request, deps = {}) {
    the exact argument rather than restating the object and agreeing with
    itself. */
 export const __testing = {
+  /* The production elevated-client factory, exported for the same reason
+     `defaultAuthClient` is: tests/supabase-key-selection.test.mjs exercises all
+     three server surfaces through the factory each one really uses, so "every
+     consumer prefers SUPABASE_SECRET_KEY" is observed rather than asserted of
+     a shared helper called a second time. */
+  getServiceClient,
   requestHash, OVERRIDE_REASONS, classifyDbError, decodeClaims,
   lowPrivilegeKey, elevatedKey, looksElevated, looksBrowserSafe,
   insecureAllowed, LOCAL_HOSTS, verifiedTotpFactor,
   defaultAuthClient, SIGN_OUT_LOCAL, staffOrigins, decodeSegment,
   assertOrigin, SAFE_METHODS, SAFE_FETCH_SITES,
-  MAX_BODY_BYTES, MAX_NOTE, MIN_NOTE, MIN_SUBSTANTIVE_NOTE
+  MAX_BODY_BYTES, MAX_NOTE, MIN_NOTE, MIN_SUBSTANTIVE_NOTE,
+  classifyKey, legacyKeyRole, selectKey, assertNoBody,
+  PUBLISHABLE_KEY_FORMAT, SECRET_KEY_FORMAT,
+  ROUTE_METHODS, methodRefusal,
+  rateLimitTimeoutMs, runWithTimeout, callRpc, TIMED_OUT,
+  DEFAULT_RATE_LIMIT_TIMEOUT_MS, MIN_RATE_LIMIT_TIMEOUT_MS, MAX_RATE_LIMIT_TIMEOUT_MS,
+  RATE_LIMIT_UNAVAILABLE_RETRY_SECONDS
 };

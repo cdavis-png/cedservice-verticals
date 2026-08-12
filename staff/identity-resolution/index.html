@@ -4,6 +4,16 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex, nofollow, noarchive">
+  <meta name="referrer" content="no-referrer">
+  <!-- The console's own policy, stated here rather than only in the response
+       header. The header no longer carries `default-src` or `connect-src` —
+       it cannot, because the onboarding page beside this one has to be
+       permitted one extra origin and a header policy would intersect with
+       that and block it. So each page declares its own connect-src, and this
+       one needs nothing but the same-origin staff API.
+
+       `frame-ancestors` stays in the header, where a meta policy is ignored. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; form-action 'none'; base-uri 'none'; object-src 'none'">
   <title>Identity resolution — CED Service staff</title>
   <!-- This page is NOT a public vertical. It is exempt from the file://
        requirement in CLAUDE.md §1 because a secure authentication callback

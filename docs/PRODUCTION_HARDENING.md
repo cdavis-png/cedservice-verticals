@@ -14,12 +14,27 @@ moment rather than as a current statement.
 [REAL_POSTGRES_VALIDATION.md](REAL_POSTGRES_VALIDATION.md) and repeated
 nowhere else in a form that can drift:
 
-- Migrations 0001–0005 have been executed against **Supabase PostgreSQL
-  17.6.1.155**, in a development project.
-- Migration 0006 has been executed against a **disposable local PostgreSQL
-  18.3** through PGlite, clean-install and upgrade, and has **not** been
-  executed against PostgreSQL 17, hosted Supabase, or PostgREST.
-- Nothing has ever run through PostgREST.
+- Migrations **0001–0007** are present on the hosted development project
+  (**Supabase PostgreSQL 17.6.1.155**). For 0006 and 0007 this was established
+  on 2026-08-09 by read-only PostgREST existence-versus-permission probes, and
+  it corrected a claim carried here for some time that neither had ever been
+  hosted.
+- **Present is not verified.** No deployed definition has been compared against
+  the committed file, `supabase_migrations.schema_migrations` has not been
+  read, and the application time and method are unknown.
+- Migrations 0006 and 0007 have additionally been executed against a
+  **disposable local PostgreSQL 18.3** through PGlite, clean-install and
+  upgrade.
+- Migration **0008 is applied, recorded and verified** on the hosted
+  development project — ledger version `20260809173146`, so the hosted ledger
+  records **0001–0008**. Trigger coverage, all 16 internal functions'
+  privileges, both pinned search paths, the two security-advisor warnings
+  cleared, data intact, and the rule exercised behaviourally inside a
+  rolled-back transaction. Run 16.
+- Nothing has ever been successfully **called** through PostgREST. The run 14
+  probes resolved object names and collected permission refusals; run 16's
+  verification was catalog and SQL. No function has executed over the
+  transport the application uses.
 
 Nothing here changes pricing, scoring, the visible assessment design,
 deterministic BIR generation, append-only guarantees, idempotency semantics,
@@ -528,13 +543,14 @@ violate, which is what makes the timestamp tests meaningful — but it is not
 Postgres.
 
 *Historical, superseded:* this section once continued "and the PL/pgSQL has
-never run". It has since run. Migrations 0001–0005 executed against a hosted
-development PostgreSQL 17 project, and the whole chain including 0006 executes
-against a disposable local PostgreSQL 18.3 through PGlite on every
-`npm run test:migration`. **0006 has not run against PostgreSQL 17, hosted
-Supabase, or PostgREST**, and nothing has ever run through PostgREST — both
-remain deployment blockers. See
-[REAL_POSTGRES_VALIDATION.md](REAL_POSTGRES_VALIDATION.md).
+never run". It has since run. Migrations **0001–0007** are present on the
+hosted development PostgreSQL 17 project, and the whole chain — 0008
+included — executes against a disposable local PostgreSQL 18.3 through PGlite
+on every `npm run test:migration`. What remains open is narrower than what this
+paragraph used to claim: **no deployed definition has been compared against the
+committed file**, and **nothing has ever been successfully called through
+PostgREST**. Both remain deployment blockers. Migration 0008 has been applied
+nowhere. See [REAL_POSTGRES_VALIDATION.md](REAL_POSTGRES_VALIDATION.md) run 14.
 
 The plan below is still the one to run against a scratch project before any
 pilot traffic; the local run does not replace it.
