@@ -244,6 +244,45 @@
     };
   };
 
+  /* One bound of the capacity-adjusted range.
+
+     The confidence spread scales the ADJUSTED estimate, and the ceiling
+     re-caps it afterwards. Two mistakes are possible here and this function
+     exists because both were made in turn.
+
+     FIRST MISTAKE — spreading the already-clamped point without re-capping.
+     A business with headroom for 4.33 appointments a month at a 50 USD ticket
+     was told its ceiling was 216.50 and shown a range topping at 281.45: the
+     report contradicting itself one line later, and capacity appearing to
+     RAISE an estimate it may only reduce.
+
+     SECOND MISTAKE — capping the spread of the UNCAPPED new demand. Writing
+     `min(newDemandPortion * factor, ceiling)` fixes the high bound and breaks
+     the low one, because when new demand vastly exceeds the ceiling even the
+     0.7 factor leaves it above: min(10000 * 0.7, 216.50) = 216.50. The lower
+     bound was lifted from 151.55 to 216.50 and the range collapsed onto the
+     ceiling — a capacity answer raising a floor, which is the same
+     prohibition broken from the other side, and worse than the defect it
+     replaced because it asserts certainty the evidence does not support.
+
+     The spread therefore scales the CAPPED new demand — the part that
+     actually survives the clamp — and the ceiling caps the result again:
+
+       min(min(newDemand, ceiling) * factor, ceiling)
+
+     At 0.7 that is min(151.55, 216.50) = 151.55; at 1.3, min(281.45, 216.50)
+     = 216.50. The ceiling now only ever removes, which is the whole rule.
+
+     Backfill keeps its full spread: recovering a booked slot needs no
+     headroom, so no ceiling bounds it. */
+  const capacityAdjustedBound = (clamp, factor) => {
+    if (clamp.ceiling === null) return round2(clamp.point * factor);
+    const cappedNewDemand = Math.min(clamp.newDemandPortion || 0, clamp.ceiling);
+    const newDemand = Math.min(cappedNewDemand * factor, clamp.ceiling);
+    const backfill = (clamp.backfillPortion || 0) * factor;
+    return round2(newDemand + backfill);
+  };
+
   /* ---------- confidence ---------- */
 
   const computeConfidence = (answers, capacity, stage = 2) => {
@@ -333,9 +372,9 @@
     const clamp = applyCapacityClamp({ point, answers, capacity });
 
     return {
-      low: round2(clamp.point * spread.low),
+      low: capacityAdjustedBound(clamp, spread.low),
       point: clamp.point,
-      high: round2(clamp.point * spread.high),
+      high: capacityAdjustedBound(clamp, spread.high),
       unconstrainedPoint: round2(point),
       capacityKnown: capacity.known && clamp.ceiling !== null,
       capacityBand: capacity.band,
@@ -599,8 +638,8 @@
     const high = round2(point * spread.high);
 
     const clamp = applyCapacityClamp({ point, answers, capacity });
-    const adjustedLow = round2(clamp.point * spread.low);
-    const adjustedHigh = round2(clamp.point * spread.high);
+    const adjustedLow = capacityAdjustedBound(clamp, spread.low);
+    const adjustedHigh = capacityAdjustedBound(clamp, spread.high);
 
     const closeReadiness = computeCloseReadiness({
       answers, confidence, packageRecommendation: pkg, dimensions: intelligence, capacity, stage

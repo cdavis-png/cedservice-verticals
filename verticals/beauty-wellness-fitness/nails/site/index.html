@@ -326,6 +326,14 @@
           <label>Salon name<input name="salonName" required placeholder="Example: Polished Nail Studio"></label>
           <label>Your name<input name="ownerName" required placeholder="Owner or manager"></label>
           <label>Email<input name="email" type="email" required placeholder="you@example.com"></label>
+          <!-- Why a required field that sends nothing. Email is a real identity
+               signal: extractIdentitySignals derives email_exact and
+               email_domain from it, and the ingest transaction resolves the
+               submission against the Business Record. Both signals are WEAK —
+               rule B5 in resolve-identity.js refuses to link on weak evidence
+               alone — so this says "match", not "identify". It does not
+               promise delivery, because nothing is delivered by email. -->
+          <p class="consent-note">We use your email to match this review to your Business Record. Your results appear here. Entering your email does not opt you into marketing.</p>
           <label>Mobile phone <span class="label-hint">(optional)</span><input name="mobile" type="tel" inputmode="tel" autocomplete="tel" placeholder="864-555-0134"></label>
         </div>
 
@@ -418,18 +426,30 @@
         </div>
 
         <div class="review-step" data-step="8" data-stage="1">
-          <h3>Where to send your results.</h3>
-          <p>We will email your Growth Review to the address you gave us.</p>
+          <h3>Before we show your results.</h3>
+          <p>Your Growth Review appears on this page as soon as you finish.</p>
 
           <!-- ================================================================
                LEGAL REVIEW PENDING — this consent wording has not been reviewed
                by counsel. No vertical may launch until it has. Remove the
                data-legal-review attribute below only after sign-off.
+
+               The required permission describes what ACTUALLY happens: the
+               assessment is sent to CED Solutions, the figures are worked out,
+               and the results appear on this page. It does not promise an
+               email, because no email is sent — this repository has no
+               delivery path, and a permission describing a behaviour we do
+               not have is not consent to anything. The optional marketing
+               permissions below are separate and are permissions for future
+               contact, not claims that anything has been sent. When a
+               delivery path exists and its state is tracked truthfully, the
+               wording changes with it. Same pattern as the Service Mix
+               review.
                ================================================================ -->
           <div class="consent-group" data-legal-review="pending">
             <label class="consent-field">
               <input type="checkbox" name="consentResults" value="granted" required>
-              <span data-consent-for="consentResults">Send my assessment results and directly related follow-up to the email address above. This is required to deliver your results.</span>
+              <span data-consent-for="consentResults">Send my assessment to CED Solutions so my results can be worked out and shown to me on this page.</span>
             </label>
 
             <label class="consent-field">
@@ -442,7 +462,7 @@
               <span data-consent-for="consentSmsMarketing">Optional: send me occasional offers and updates by text at the mobile number above. Message frequency varies. Message and data rates may apply. Reply STOP to opt out, HELP for help.</span>
             </label>
 
-            <p class="consent-note">Consent to marketing messages is not a condition of purchase. Your results are delivered by email whether or not you opt in to marketing.</p>
+            <p class="consent-note">Consent to marketing messages is not a condition of purchase. Your results appear on this page whether or not you opt in to marketing.</p>
           </div>
         </div>
 
@@ -834,7 +854,7 @@
           <a class="btn btn-primary btn-wide"
              href="mailto:cdavis@cedservice.com?subject=My Salon Growth Review Results"
              data-analytics-event="assessment.report_requested"
-             data-analytics-label="stage2_results">Send My Results &amp; Next Steps</a>
+             data-analytics-label="stage2_results">Email CED About My Results</a>
         </div>
 
         <div class="review-controls">

@@ -325,9 +325,11 @@ const validateServiceMixPayload = payload => {
       { violations: result.errors.slice(0, 10) });
   }
 
-  /* Results still reach the visitor by email, so the disclaimer still travels
-     with them. A figure whose disclaimer was left behind is the one thing
-     CLAUDE.md section 4 refuses outright. */
+  /* The results travel onward from here — to storage, and to whatever reads
+     the record later — so the disclaimer travels with them. A figure whose
+     disclaimer was left behind is the one thing CLAUDE.md section 4 refuses
+     outright. (This once said the results reach the visitor by email. They do
+     not; delivery is on-page. The disclaimer requirement is unchanged.) */
   const results = payload.results;
   if (results !== undefined) {
     if (!results || typeof results !== 'object' || Array.isArray(results)) {
