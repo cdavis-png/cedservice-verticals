@@ -453,18 +453,33 @@ test('free-text answers are carried as evidence, never parsed for meaning', () =
 });
 
 /* ============================================================
-   Capacity is monotonic, and it may only ever subtract
+   The capacity ceiling may only ever SUBTRACT
    ------------------------------------------------------------
-   The ported repair fixed the reproduced contradiction. These
-   assert the PROPERTY the repair exists to guarantee, across
-   every band rather than at one worked example, because
-   CLAUDE.md section 4 states it without qualification: capacity
-   evidence may only reduce an estimate, never raise one.
+   CLAUDE.md section 4: capacity evidence may only ever reduce an
+   estimate, never raise one. That has to hold for EACH BOUND
+   INDEPENDENTLY, and the first version of these tests did not
+   say so — they compared the adjusted range against the
+   UNCONSTRAINED one, which is a far larger number, so a clamp
+   that LIFTED the lower bound onto the ceiling still passed
+   every assertion.
+
+   Two defects were found in this code in turn, and both are
+   pinned below:
+
+     · spreading the clamped point without re-capping, which put
+       the high bound 30% ABOVE the ceiling the report states;
+     · capping the spread of the UNCAPPED new demand, which
+       lifted the low bound from 151.55 to 216.50 and collapsed
+       the range onto the ceiling.
+
+   The second is the subtler one, and it is worse than what it
+   replaced: a collapsed range asserts certainty the evidence
+   does not support, and it raises a floor because of a capacity
+   answer — the same prohibition broken from the other side.
    ============================================================ */
 
-/* Least to most headroom. `undefined` is "not asked", which must behave as
-   no constraint rather than as a constraint of zero. */
 const CAPACITY_BANDS = ['none', '1_5', '6_10', '11_20', '21_plus', undefined];
+const TICKETS = ['0', '25', '50', '95', '250'];
 
 const rangeFor = (band, point = 10000, ticket = '50') => {
   const answers = { averageTicket: ticket };
@@ -472,53 +487,105 @@ const rangeFor = (band, point = 10000, ticket = '50') => {
   return bie.visibleOpportunityRange({ point, answers });
 };
 
-test('reducing capacity never raises either bound', () => {
-  /* Walked in increasing-headroom order: every bound must be non-decreasing,
-     so going the other way — reducing capacity — can only hold or lower it. */
-  let previous = null;
+/* The same estimate with the capacity question left unanswered: no ceiling,
+   so nothing is clamped. This is the unadjusted baseline every adjusted bound
+   must sit at or below. */
+const unadjustedFor = (point = 10000, ticket = '50') => rangeFor(undefined, point, ticket);
+
+const r2 = n => Math.round(n * 100) / 100;
+
+test('REGRESSION: the worked example lands on exactly the expected bounds', () => {
+  /* Unadjusted point 10000, spread 0.70/1.30, ceiling 216.50, all of the
+     opportunity newly created demand.
+
+       pre-cap   low 151.55   high 281.45
+       ceiling                216.50
+       expected  low 151.55   high 216.50
+
+     The high is capped because it exceeded the ceiling. The low is UNTOUCHED
+     because it never did, and that is the whole point. */
+  const r = rangeFor('1_5', 10000, '50');
+  assert.equal(r.point, 216.5, 'the clamped point is the ceiling');
+  assert.equal(r.low, 151.55, 'the low bound keeps its spread and is NOT lifted to the ceiling');
+  assert.equal(r.high, 216.5, 'the high bound is capped at the ceiling');
+  assert.equal(r.clampApplied, true);
+  assert.ok(r.low < r.point, 'the range must not collapse onto the ceiling');
+});
+
+test('each adjusted bound is at or below its unadjusted counterpart, independently', () => {
+  /* Stated per bound, because that is the invariant that was violated: a
+     range can satisfy low <= high AND high <= unadjusted high while its low
+     bound has been raised. */
   for (const band of CAPACITY_BANDS) {
-    const r = rangeFor(band);
-    if (previous) {
-      assert.ok(r.low >= previous.low - 0.001,
-        `low fell from ${previous.low} to ${r.low} as capacity INCREASED to ${band}`);
-      assert.ok(r.high >= previous.high - 0.001,
-        `high fell from ${previous.high} to ${r.high} as capacity INCREASED to ${band}`);
+    for (const ticket of TICKETS) {
+      const adj = rangeFor(band, 10000, ticket);
+      const un = unadjustedFor(10000, ticket);
+      assert.ok(adj.low <= un.low + 0.001,
+        `${band} @ ${ticket}: adjusted low ${adj.low} exceeds unadjusted low ${un.low}`);
+      assert.ok(adj.high <= un.high + 0.001,
+        `${band} @ ${ticket}: adjusted high ${adj.high} exceeds unadjusted high ${un.high}`);
+      assert.ok(adj.point <= un.point + 0.001,
+        `${band} @ ${ticket}: adjusted point ${adj.point} exceeds unadjusted point ${un.point}`);
+      assert.ok(adj.low <= adj.high,
+        `${band} @ ${ticket}: low ${adj.low} exceeds high ${adj.high}`);
     }
-    previous = r;
   }
 });
 
-test('capacity never creates opportunity that did not exist unconstrained', () => {
-  /* The unconstrained range is the ceiling on the whole exercise: a capacity
-     answer may subtract from it and may never add. This is the direction the
-     defect broke — a clamped high bound 30% ABOVE the stated ceiling. */
-  const unconstrained = rangeFor(undefined);
+test('the ceiling never lifts a bound that was already beneath it', () => {
+  /* The direct statement of the second defect. Applying the spread to the
+     clamped point gives the value the ceiling is allowed to cap DOWNWARD and
+     nothing else. A bound may equal it or be lower; it may never be higher. */
   for (const band of CAPACITY_BANDS) {
-    const r = rangeFor(band);
-    assert.ok(r.low <= unconstrained.low + 0.001,
-      `${band}: clamped low ${r.low} exceeds the unconstrained low ${unconstrained.low}`);
-    assert.ok(r.high <= unconstrained.high + 0.001,
-      `${band}: clamped high ${r.high} exceeds the unconstrained high ${unconstrained.high}`);
-    assert.ok(r.point <= unconstrained.point + 0.001,
-      `${band}: clamped point ${r.point} exceeds the unconstrained point`);
-  }
-});
-
-test('the range is always ordered, at every band and every ticket', () => {
-  for (const band of CAPACITY_BANDS) {
-    for (const ticket of ['0', '25', '50', '95', '250']) {
+    for (const ticket of TICKETS) {
       const r = rangeFor(band, 10000, ticket);
-      assert.ok(r.low <= r.point && r.point <= r.high,
-        `${band} @ ${ticket}: ${r.low} / ${r.point} / ${r.high} is out of order`);
-      assert.ok(r.low >= 0, `${band} @ ${ticket}: negative lower bound ${r.low}`);
+      const un = unadjustedFor(10000, ticket);
+      if (un.point === 0) continue;
+      const spreadLow = un.low / un.point;
+      const spreadHigh = un.high / un.point;
+      assert.ok(r.low <= r2(r.point * spreadLow) + 0.011,
+        `${band} @ ${ticket}: low ${r.low} was lifted above the spread of its own point ` +
+        `(${r2(r.point * spreadLow)})`);
+      assert.ok(r.high <= r2(r.point * spreadHigh) + 0.011,
+        `${band} @ ${ticket}: high ${r.high} exceeds the spread of its own point`);
     }
   }
 });
 
-test('a clamped bound never exceeds the ceiling the same report states', () => {
-  /* The self-contradiction itself, generalised: whatever the report prints as
-     its ceiling, no bound of the capacity-adjusted range may sit above it once
-     the backfill the ceiling does not bound is taken out. */
+test('tightening capacity never increases either adjusted bound', () => {
+  /* Walked from least to most headroom: every bound must be non-decreasing,
+     so going the other way — tightening capacity — can only hold or lower it. */
+  for (const ticket of TICKETS) {
+    let previous = null;
+    for (const band of CAPACITY_BANDS) {
+      const r = rangeFor(band, 10000, ticket);
+      if (previous) {
+        assert.ok(r.low >= previous.low - 0.001,
+          `@ ${ticket}: low fell from ${previous.low} to ${r.low} as capacity INCREASED to ${band}`);
+        assert.ok(r.high >= previous.high - 0.001,
+          `@ ${ticket}: high fell from ${previous.high} to ${r.high} as capacity INCREASED to ${band}`);
+      }
+      previous = r;
+    }
+  }
+});
+
+test('capacity cannot create opportunity where there was none', () => {
+  /* A zero unadjusted estimate must stay zero at every band and every bound.
+     A ceiling is a cap, and a cap on nothing is nothing. */
+  for (const band of CAPACITY_BANDS) {
+    for (const ticket of TICKETS) {
+      const r = rangeFor(band, 0, ticket);
+      assert.equal(r.low, 0, `${band} @ ${ticket}: capacity created a low bound from a zero estimate`);
+      assert.equal(r.point, 0, `${band} @ ${ticket}: capacity created a point from a zero estimate`);
+      assert.equal(r.high, 0, `${band} @ ${ticket}: capacity created a high bound from a zero estimate`);
+    }
+  }
+});
+
+test('no bound sits above the ceiling the same report states', () => {
+  /* The FIRST defect, still pinned. Backfill is taken out because the ceiling
+     does not bound it: recovering an already-booked slot needs no headroom. */
   for (const band of CAPACITY_BANDS) {
     const fin = bir({ capacity90Day: band, averageTicket: '50' }).financialOpportunityProfile;
     const adj = fin.capacityAdjusted;
@@ -527,13 +594,24 @@ test('a clamped bound never exceeds the ceiling the same report states', () => {
     const newDemandAtHigh = adj.high - (adj.backfillPortion * spreadHigh);
     assert.ok(newDemandAtHigh <= adj.ceiling + 0.01,
       `${band}: new demand at the high bound is ${newDemandAtHigh.toFixed(2)}, above ceiling ${adj.ceiling}`);
+    assert.ok(adj.low <= adj.point && adj.point <= adj.high, `${band}: range out of order`);
   }
+});
+
+test('the BIR keeps a real range when the clamp binds, rather than collapsing', () => {
+  /* The visible consequence of the second defect, asserted where a visitor
+     would have seen it: a clamped report must still express uncertainty. */
+  const fin = bir({ capacity90Day: '1_5', averageTicket: '50' }).financialOpportunityProfile;
+  const adj = fin.capacityAdjusted;
+  assert.equal(adj.clampApplied, true, 'this fixture is meant to clamp');
+  assert.ok(adj.low < adj.point,
+    `the clamped range collapsed: low ${adj.low} is not below point ${adj.point}`);
+  assert.ok(adj.point <= adj.high);
 });
 
 test('the repaired calculation is deterministic', () => {
   /* A returning visitor seeing a different number for the same answers is a
-     trust problem, not a release note. Repeated across bands and repeats so a
-     stray Date.now() or Math.random() in the clamp path would surface. */
+     trust problem, not a release note. */
   for (const band of CAPACITY_BANDS) {
     const first = JSON.stringify(rangeFor(band));
     for (let i = 0; i < 25; i++) {

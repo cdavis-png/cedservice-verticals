@@ -246,20 +246,39 @@
 
   /* One bound of the capacity-adjusted range.
 
-     The confidence spread must be applied to the COMPONENTS and the ceiling
-     re-applied afterwards, never to the already-clamped point. Widening the
-     clamped point re-inflates newly created demand back above the ceiling the
-     same report states a line earlier: a business with headroom for 4.33
-     appointments a month at a 50 USD ticket was told its ceiling was 216.50
-     and shown a range topping at 281.45. That is the report contradicting
-     itself, and it reads as the capacity answer having raised the estimate —
-     which CLAUDE.md section 4 forbids in either direction.
+     The confidence spread scales the ADJUSTED estimate, and the ceiling
+     re-caps it afterwards. Two mistakes are possible here and this function
+     exists because both were made in turn.
+
+     FIRST MISTAKE — spreading the already-clamped point without re-capping.
+     A business with headroom for 4.33 appointments a month at a 50 USD ticket
+     was told its ceiling was 216.50 and shown a range topping at 281.45: the
+     report contradicting itself one line later, and capacity appearing to
+     RAISE an estimate it may only reduce.
+
+     SECOND MISTAKE — capping the spread of the UNCAPPED new demand. Writing
+     `min(newDemandPortion * factor, ceiling)` fixes the high bound and breaks
+     the low one, because when new demand vastly exceeds the ceiling even the
+     0.7 factor leaves it above: min(10000 * 0.7, 216.50) = 216.50. The lower
+     bound was lifted from 151.55 to 216.50 and the range collapsed onto the
+     ceiling — a capacity answer raising a floor, which is the same
+     prohibition broken from the other side, and worse than the defect it
+     replaced because it asserts certainty the evidence does not support.
+
+     The spread therefore scales the CAPPED new demand — the part that
+     actually survives the clamp — and the ceiling caps the result again:
+
+       min(min(newDemand, ceiling) * factor, ceiling)
+
+     At 0.7 that is min(151.55, 216.50) = 151.55; at 1.3, min(281.45, 216.50)
+     = 216.50. The ceiling now only ever removes, which is the whole rule.
 
      Backfill keeps its full spread: recovering a booked slot needs no
      headroom, so no ceiling bounds it. */
   const capacityAdjustedBound = (clamp, factor) => {
     if (clamp.ceiling === null) return round2(clamp.point * factor);
-    const newDemand = Math.min((clamp.newDemandPortion || 0) * factor, clamp.ceiling);
+    const cappedNewDemand = Math.min(clamp.newDemandPortion || 0, clamp.ceiling);
+    const newDemand = Math.min(cappedNewDemand * factor, clamp.ceiling);
     const backfill = (clamp.backfillPortion || 0) * factor;
     return round2(newDemand + backfill);
   };
