@@ -85,11 +85,90 @@
 
 import { handleRequest } from '../../../server/staff-identity-resolution.mjs';
 
+/* ============================================================
+   THE REWRITE SEAM, AND WHY IT HAD TO EXIST AFTER ALL
+
+   The comment above argues that filesystem routing beats a
+   rewrite because it hands the function the ORIGINAL path. That
+   reasoning was sound and the premise was false, and only the
+   platform could say so.
+
+   Observed on a real Preview deployment of this branch:
+
+     GET …/identity-resolution/cases           -> the application answered
+     GET …/identity-resolution/session/refresh -> 404: NOT_FOUND (Vercel)
+
+   One segment reaches the function; two do not. That is
+   `[param]` behaviour, not `[...param]` behaviour: this project
+   is not a framework preset, and its `api/` filesystem routing
+   resolves a bracketed segment as ONE dynamic segment. The
+   catch-all was never a catch-all here, so every console path
+   below /cases/:id was a platform 404 — `session/refresh`,
+   `session/signout`, `cases/:id` and `cases/:id/link`, which is
+   the whole workflow past the queue listing.
+
+   `vercel.json` now carries ONE rewrite that gathers every
+   sub-path back onto this function. Two documented consequences
+   follow, and this seam exists to absorb the second:
+
+     · the function is invoked with the DESTINATION path, not the
+       one the browser asked for;
+     · a `source` parameter the destination does not consume is
+       appended as a QUERY parameter — so `:path+` arrives as
+       `?path=cases/test-id/link`.
+
+   So the original path is not lost, it is relocated, and the one
+   thing handleRequest needs is for `request.url` to say what was
+   asked for. It is restored HERE, in the entrypoint, so that
+   handleRequest, its routing, its provenance gate and its
+   contracts are untouched — this file is already the platform
+   adapter, and adapting is its job.
+
+   IT IS A NARROW SEAM ON PURPOSE. Only the exact rewrite
+   destination is rewritten back; anything else passes through
+   unchanged, so a direct request is still routed by its own path
+   and local tests still drive real URLs. The restored path is
+   rebuilt from validated segments under a FIXED prefix, so a
+   caller who supplies their own `?path=` cannot traverse out of
+   the staff namespace or reach anything the same caller could
+   not have requested directly. It selects which staff route
+   runs; every one of them still enforces provenance, origin,
+   authentication, AAL2 and the live operator lookup for itself.
+   ============================================================ */
+
+const STAFF_PREFIX = '/api/staff/identity-resolution';
+
+/* The single literal segment vercel.json rewrites to. It is not a route the
+   console calls; it exists only so the rewrite has somewhere to land that
+   the platform demonstrably resolves to this function. */
+const REWRITE_TARGET = `${STAFF_PREFIX}/_router`;
+
+/* Deliberately narrow: the segments the supported routes are actually made
+   of. A UUID, `auth-config`, `session`, `refresh`, `signout`, `cases`,
+   `link`. No slash, no dot-segment, no encoded separator. */
+const SAFE_SEGMENT = /^[A-Za-z0-9._-]+$/;
+
+const restoreRewrittenPath = request => {
+  const url = new URL(request.url);
+  if (url.pathname !== REWRITE_TARGET) return request;
+
+  const segments = (url.searchParams.get('path') || '').split('/').filter(Boolean);
+  if (!segments.length || !segments.every(s => SAFE_SEGMENT.test(s) && s !== '.' && s !== '..')) {
+    return request;
+  }
+
+  const restored = new URL(url);
+  restored.pathname = `${STAFF_PREFIX}/${segments.join('/')}`;
+  restored.searchParams.delete('path');
+  /* Method, headers and body are carried over intact; only the URL moves. */
+  return new Request(restored, request);
+};
+
 /* One argument in, one argument forwarded: `handleRequest`'s second
    parameter is a test-only injection seam and nothing the platform passes may
    reach it. Written once and reused by every method below, so no export can
    drift into forwarding something extra. */
-const respond = request => handleRequest(request);
+const respond = request => handleRequest(restoreRewrittenPath(request));
 
 /* The two the console actually uses. */
 export const GET = respond;
