@@ -284,7 +284,7 @@ exact statement shown, and `recordedAt`:
 
 | Record | Required | Notes |
 | --- | --- | --- |
-| `resultsDeliveryConsent` | Yes | Satisfied by email alone |
+| `resultsDeliveryConsent` | Yes | Permission to process the review and show the results on the page |
 | `emailMarketingConsent` | No | Optional |
 | `smsMarketingConsent` | No | Only offered when a mobile number is given |
 
@@ -292,9 +292,25 @@ Rules that must not be broken:
 
 - **Never bundle them into one checkbox.** Agreeing to receive results is not
   agreeing to marketing.
-- **Marketing consent is never a condition of anything.** Declining must still
-  deliver the results, by email. The page says so in plain language, and that
-  sentence stays.
+- **Marketing consent is never a condition of anything.** Declining a marketing
+  permission must never block completing the assessment or reaching the
+  results. Results are shown on the page whether or not the visitor opts in,
+  and the page says so in plain language. That assurance stays; the wording
+  follows whatever the delivery method actually is.
+- **Never claim a delivery that has not happened.** No page, status message,
+  timeline summary or report may say or imply results were emailed unless an
+  operational delivery system has accepted the message *and* its state is
+  recorded truthfully — with provider acceptance distinguished from confirmed
+  delivery. **The current delivery method is on-page**, and there is no email
+  provider in this repository. A permission or status that describes a
+  behaviour the platform does not have is not consent, and is not information.
+
+  *Why this rule replaced "delivered by email".* This file used to require that
+  the page promise delivery by email. Nothing could perform it: the engine
+  reported a stored submission as "Results sent." to a visitor who had just
+  ticked a consent about their email address. The Service Mix review had
+  already corrected its own wording; this rule generalises that correction
+  rather than the defect it replaced.
 - **Never pre-tick a box.** Opt-in only.
 - **SMS consent is unavailable without a mobile number** — the row stays hidden
   and the checkbox disabled until one is entered.

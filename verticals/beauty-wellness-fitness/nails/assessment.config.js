@@ -47,9 +47,11 @@ window.CED_ASSESSMENT_CONFIG = {
        NOT here — they belong at checkout, not in a diagnostic. */
     identityFields: ['businessPhone', 'website', 'googleProfile', 'locationCount'],
 
-    /* Separate, independently recorded permissions. Results delivery is the only
-       required one and is satisfied by email alone, so declining marketing never
-       blocks a visitor from receiving their assessment.
+    /* Separate, independently recorded permissions. The results permission is
+       the only required one and covers processing the review and showing the
+       results on the page, so declining marketing never blocks a visitor from
+       reaching their assessment. It does not promise an email: delivery is
+       on-page and this platform has no email provider.
 
        requiresField gates a consent on another answer: SMS marketing is not
        offered at all unless a mobile number was given.
