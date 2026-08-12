@@ -221,11 +221,17 @@
      not store it, and could not mint one. Never logged — the whole point of
      an opaque bearer value is that it does not appear in places that are
      kept. */
-  const announceContinuation = (opts, body) => {
+  const announceContinuation = (opts, body, payload) => {
     const token = body && body.continuationToken;
     if (!token || typeof opts.onContinuation !== 'function') return;
     try {
-      opts.onContinuation(token);
+      /* The payload lets the owner preserve the contact evidence that belongs
+         to THIS queued review. A retry can run on a later page load, after the
+         form contains another business's details, so reading the live form
+         here would pair a valid token with the wrong prefill. Existing
+         one-argument callbacks remain compatible; JavaScript ignores the
+         additional values. */
+      opts.onContinuation(token, body, payload);
     } catch (err) {
       console.warn('[CED] A continuation context could not be stored.', err);
     }
@@ -386,7 +392,7 @@
            it twice. The context is the only thing that differs between
            attempts, and it is not part of the payload. */
         const { body } = await postJson(entry.payload, opts);
-        announceContinuation(opts, body);
+        announceContinuation(opts, body, entry.payload);
         sent++;                                      /* delivered: dropped immediately */
       } catch (err) {
         const attempts = (entry.attempts || 0) + 1;

@@ -272,7 +272,7 @@ export function loadEngine(dom, config, options = {}) {
           ...(options.submissionResponse || {})
         };
       },
-      retryPendingSubmissions: async () => {},
+      retryPendingSubmissions: options.retryPendingSubmissions || (async () => {}),
       clearQueue: () => {}
     }
   };

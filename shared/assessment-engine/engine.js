@@ -1037,6 +1037,28 @@
       return log[`stage${stage}`] || null;
     };
 
+    /* Keep the server-issued continuation context for the next review.
+
+       A direct submission can use the live form, but a queued submission may
+       succeed on a later page load when that form belongs to somebody else.
+       submission.js therefore gives retry callbacks the original payload;
+       its contact block is the only safe prefill for that result. */
+    const storeIssuedContinuation = (token, _response = null, payload = null) => {
+      const continuation = window.CEDContinuation;
+      if (!continuation || !token) return false;
+      const contact = payload && payload.contact ? payload.contact : {};
+      const contactValue = name => Object.prototype.hasOwnProperty.call(contact, name)
+        ? contact[name] : read.val(name);
+      return continuation.storeContinuation({
+        token,
+        prefill: {
+          salonName: contactValue('salonName'),
+          ownerName: contactValue('ownerName'),
+          email: contactValue('email')
+        }
+      });
+    };
+
     /* businessId, when the capture endpoint returns one, is kept beside the
        saved state so a later reassessment from this browser can be recognised
        as the same business. It is an opaque identifier, never a credential. */
@@ -1115,16 +1137,8 @@
            this device moments ago — names and an email, nothing the server
            holds and nothing they have not seen. It saves the next review
            asking the same questions again. */
-        const continuation = window.CEDContinuation;
-        if (continuation && outcome && outcome.continuationToken) {
-          continuation.storeContinuation({
-            token: outcome.continuationToken,
-            prefill: {
-              salonName: read.val('salonName'),
-              ownerName: read.val('ownerName'),
-              email: read.val('email')
-            }
-          });
+        if (outcome && outcome.continuationToken) {
+          storeIssuedContinuation(outcome.continuationToken, outcome, payload);
         }
         setStatus(outcome.status === 'sent' ? 'sent' : outcome.status === 'queued' ? 'queued' : 'ready', stage);
       } finally {
@@ -1607,7 +1621,13 @@
 
     /* Anything stranded by an earlier failure gets another chance on load. */
     if (window.CEDSubmission) {
-      Promise.resolve(window.CEDSubmission.retryPendingSubmissions(submissionOptions))
+      Promise.resolve(window.CEDSubmission.retryPendingSubmissions({
+        ...submissionOptions,
+        /* A successful retry has no return path to submit(), so without this
+           callback its server-issued continuation context is discarded and
+           the next review resolves as an unrelated business. */
+        onContinuation: storeIssuedContinuation
+      }))
         .catch(err => console.warn('[CED] Retry sweep failed.', err));
     }
   };

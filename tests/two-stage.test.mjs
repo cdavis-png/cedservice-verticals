@@ -70,6 +70,37 @@ test('Stage 1 never shows a Stage 2 question, and never carries one in its paylo
   });
 });
 
+test('a queued Growth retry stores its continuation with the queued review contact', async () => {
+  let retryOptions = null;
+  const { engine } = mountNails({
+    retryPendingSubmissions: async options => { retryOptions = options; }
+  });
+  await Promise.resolve();
+
+  assert.equal(typeof retryOptions?.onContinuation, 'function',
+    'the Growth retry sweep must retain the token returned by the server');
+
+  retryOptions.onContinuation(
+    'growth.retry.issued.context',
+    { reviewType: 'growth_review' },
+    {
+      contact: {
+        salonName: 'Queued Nail Studio',
+        ownerName: 'Queued Owner',
+        email: 'queued-owner@example.test'
+      }
+    }
+  );
+
+  const stored = JSON.parse(engine.storage.getItem('ced:continuation'));
+  assert.equal(stored.token, 'growth.retry.issued.context');
+  assert.deepEqual(stored.prefill, {
+    salonName: 'Queued Nail Studio',
+    ownerName: 'Queued Owner',
+    email: 'queued-owner@example.test'
+  }, 'a later page load must not pair the token with its live form');
+});
+
 test('a Stage 1 submission stays Stage 1 even after Stage 2 has been answered', async () => {
   /* Scoping by stage is by construction, not by the accident of a field
      happening to be disabled. Once Stage 2 is open its fields are enabled, and
