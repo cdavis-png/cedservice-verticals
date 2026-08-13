@@ -503,7 +503,7 @@ it('a completed review produces a Service Mix result on screen', async () => {
 
   /* No endpoint is running, so the transport queued it. That is the correct
      behaviour, and the visitor is told plainly. */
-  assert.match(results.delivery, /saved on this device|Preview mode|has been received/);
+  assert.match(results.delivery, /not been saved to your Business Record yet/);
   assert.equal(/on their way|by email|inbox/i.test(results.delivery), false,
     'nothing in this repository sends a message, so nothing may say one is coming');
   assert.deepEqual(pageErrors, []);
@@ -895,6 +895,34 @@ it('a connected review does not ask again for contact it already has', async () 
   await close();
 });
 
+it('a saved draft with empty contact keys does not block Growth Review prefill', async () => {
+  const { page, close } = await openPage();
+  await page.evaluate(() => {
+    const saved = JSON.parse(localStorage.getItem('cedNailServiceMixReview'));
+    saved.contact = { salonName: '', ownerName: '', email: '' };
+    localStorage.setItem('cedNailServiceMixReview', JSON.stringify(saved));
+    window.CEDContinuation.storeContinuation({
+      token: '1.opaque.growth.token',
+      prefill: {
+        salonName: 'Continued Salon', ownerName: 'Continued Owner',
+        email: 'continued@polished.test'
+      }
+    });
+  });
+  await page.reload({ waitUntil: 'networkidle0' });
+
+  const filled = await page.evaluate(() => ({
+    salonName: document.getElementById('salonName').value,
+    ownerName: document.getElementById('ownerName').value,
+    email: document.getElementById('email').value
+  }));
+  assert.deepEqual(filled, {
+    salonName: 'Continued Salon', ownerName: 'Continued Owner',
+    email: 'continued@polished.test'
+  });
+  await close();
+});
+
 it('a prefill with no context is never used', async () => {
   const { page, close } = await openPage();
   await page.evaluate(() => localStorage.setItem('ced:continuation',
@@ -977,8 +1005,7 @@ it('the delivery note says what actually happened, and promises no email', async
      claim one. */
   assert.equal(/on their way by email|we have emailed|check your inbox/i.test(note), false,
     'the page must not promise a delivery it cannot make');
-  assert.match(note, /received/i);
-  assert.match(note, /results are below/i);
+  assert.match(note, /saved to your Business Record/i);
   await close();
 });
 

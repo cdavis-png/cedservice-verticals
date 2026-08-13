@@ -566,12 +566,21 @@
        names and an email, only from the shared store, and only when a
        context is actually present — a prefill with no context is contact
        data sitting in storage for no reason. */
-    if (arrivedWithContext && !Object.keys(state.contact).length) {
+    if (arrivedWithContext) {
       const prefill = continuationPrefill();
-      const taken = Object.keys(prefill);
+      /* A previously opened Service Mix review may already have persisted an
+         object whose contact keys are present but empty. That is not contact
+         evidence and must not make the visitor type the Growth Review details
+         again. Fill only blanks; never overwrite anything they entered. */
+      const taken = Object.keys(prefill).filter(field =>
+        typeof prefill[field] === 'string' && prefill[field].trim() &&
+        !(typeof state.contact[field] === 'string' && state.contact[field].trim()));
       if (taken.length) {
-        state.contact = { ...prefill };
-        state.prefilledFields = taken;
+        state.contact = {
+          ...state.contact,
+          ...Object.fromEntries(taken.map(field => [field, prefill[field]]))
+        };
+        state.prefilledFields = [...new Set([...state.prefilledFields, ...taken])];
         save();
       }
     }
@@ -662,13 +671,14 @@
        about whether it belongs to this submission. */
     const continuationTokenFor = payload =>
       (contextFitsPayload(payload) ? continuationToken() : null);
-    const sweepQueuedSubmissions = () => {
+    const sweepQueuedSubmissions = (options = {}) => {
       const transport = typeof window !== 'undefined' ? window.CEDSubmission : null;
       if (!transport || typeof transport.retryPendingSubmissions !== 'function') return null;
 
       return Promise.resolve()
         .then(() => transport.retryPendingSubmissions({
           ...(config.submission || {}),
+          ...options,
           continuationToken: continuationTokenFor,
           onContinuation: token => {
             const store = continuation();
@@ -892,7 +902,7 @@
       queueSweep: () => queueSweep,
       /* And a sweep on demand, for a caller that wants to try again without
          a reload. */
-      retryQueuedSubmissions: () => sweepQueuedSubmissions(),
+      retryQueuedSubmissions: options => sweepQueuedSubmissions(options),
       /* Instrumentation the page calls. Every one of them goes through the
          swallowing wrapper, so a broken analytics client cannot break a
          review. */

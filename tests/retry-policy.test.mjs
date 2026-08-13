@@ -116,6 +116,14 @@ test('rate limiting is retryable', async () => {
   assert.equal(outcome.permanent, false);
 });
 
+test('a missing or misrouted assessment endpoint remains recoverable', async () => {
+  for (const status of [404, 405]) {
+    const { outcome, queue } = await runSubmit(jsonResponse(status, {}));
+    assert.equal(outcome.permanent, false, `${status} is a deployment fault, not a visitor refusal`);
+    assert.equal(queue[0].permanent, false);
+  }
+});
+
 test('challenge verification unavailable is retryable; rejected is permanent', async () => {
   const unavailable = await runSubmit(errorResponse(503, 'challenge_unavailable'));
   assert.equal(unavailable.outcome.permanent, false, 'a provider outage is never the visitor’s fault');
@@ -251,6 +259,27 @@ test('a queued idempotency_key_conflict is skipped, not re-attempted', async () 
     assert.equal(result.attempted, 0);
     assert.equal(result.skipped, 1);
     assert.equal(result.remaining, 1, 'retained rather than discarded');
+  } finally {
+    restore();
+  }
+});
+
+test('a visitor-requested retry can bypass backoff without bypassing permanent failures', async () => {
+  const restore = silence();
+  globalThis.localStorage = new MemoryStorage();
+  try {
+    globalThis.fetch = async () => errorResponse(503, 'challenge_unavailable');
+    await submission.submitAssessment(payload(), OPTS);
+
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls++;
+      return jsonResponse(201, { ok: true, businessId: 'b1' });
+    };
+    const result = await submission.retryPendingSubmissions({ ...OPTS, force: true });
+    assert.equal(calls, 1, 'force means retry now, not after the scheduled backoff');
+    assert.equal(result.sent, 1);
+    assert.equal(result.remaining, 0);
   } finally {
     restore();
   }

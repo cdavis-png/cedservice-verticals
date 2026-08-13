@@ -97,7 +97,10 @@
   ]);
 
   /* Transient statuses, used only when no code was returned. */
-  const RETRYABLE_STATUS = new Set([408, 425, 429]);
+  /* A missing or temporarily misrouted endpoint is a deployment fault, not a
+     refusal of the visitor's review. Keep that work recoverable so it can be
+     delivered after the route is restored. */
+  const RETRYABLE_STATUS = new Set([404, 405, 408, 425, 429]);
 
   let idCounter = 0;
   const nextId = () => `${Date.now().toString(36)}-${(idCounter++).toString(36)}`;
@@ -379,7 +382,7 @@
         continue;
       }
       /* Not due yet under the backoff schedule. */
-      if (entry.nextRetryAt && Date.parse(entry.nextRetryAt) > now) {
+      if (!opts.force && entry.nextRetryAt && Date.parse(entry.nextRetryAt) > now) {
         skipped++;
         remaining.push(entry);
         continue;
