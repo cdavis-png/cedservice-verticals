@@ -133,7 +133,7 @@
   const STATUS_COPY = {
     sending: 'Saving your results…',
     sent: 'Results saved.',
-    queued: 'Saved on this device. Saving will retry automatically.',
+    queued: 'Your results are ready on this page. This review has not been saved to your Business Record yet, so it is not yet available to CED staff. A copy remains on this device.',
     ready: 'Results ready.'
   };
 

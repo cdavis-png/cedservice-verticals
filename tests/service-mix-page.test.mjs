@@ -164,7 +164,7 @@ test('consent is two independent checkboxes, never one', () => {
   assert.equal(/consentSmsMarketing|type="tel"|name="mobile"/i.test(VISIBLE_HTML), false,
     'SMS consent is unavailable without a mobile number, so it is not offered');
 
-  assert.match(HTML, /Your results appear on this page either way/i,
+  assert.match(HTML, /Your results appear on this page whether or not you opt in to marketing/i,
     'marketing consent is never a condition of anything, and the page says so');
   assert.match(HTML, /data-legal-review="pending"/,
     'all consent wording is pending legal review');
@@ -194,11 +194,13 @@ test('the page promises no delivery it cannot make', () => {
     'the required permission describes what actually happens');
 });
 
-/* The queued wording claims a retry. That claim is only honest because the
-   controller sweeps the queue on load — if the sweep goes, the sentence goes
-   with it, so the two are asserted together. */
-test('the queued message claims only a retry that something performs', () => {
-  assert.match(VISIBLE_PAGE, /we will retry sending it the next time you open this page/i);
+/* A browser result and a server record are different outcomes. The visitor
+   must be told which one exists, rather than seeing a vague connectivity
+   sentence beside figures that happened to render locally. */
+test('the queued message distinguishes browser results from Business Record persistence', () => {
+  assert.match(VISIBLE_PAGE, /has not been saved to your Business Record yet/i);
+  assert.match(VISIBLE_PAGE, /not available to CED staff/i);
+  assert.match(HTML, /data-action="retry-save"/);
 
   /* "will be sent" is a promise about an OUTCOME. Opening the page starts an
      attempt; the server may still be unreachable, the entry may have
@@ -214,6 +216,15 @@ test('the queued message claims only a retry that something performs', () => {
   assert.match(source, /retryPendingSubmissions/,
     'the page claims a retry, so the controller must actually attempt one');
   assert.match(source, /sweepQueuedSubmissions/);
+  assert.match(PAGE, /retryQueuedSubmissions\(\{ force: true \}\)/,
+    'the visible retry action must bypass automatic backoff');
+});
+
+test('the contact step explains identity linkage rather than imaginary delivery', () => {
+  assert.match(VISIBLE_HTML, /Confirm your business details/i);
+  assert.match(VISIBLE_HTML, /connect this review to your Business Record/i);
+  assert.equal(/Where should we send it\?/i.test(VISIBLE_HTML), false);
+  assert.equal(/results are below either way/i.test(VISIBLE_PAGE), false);
 });
 
 test('the consent statement is read from the DOM at submit time', () => {

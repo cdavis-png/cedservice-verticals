@@ -168,6 +168,34 @@ const queuedEntries = () =>
   require('../shared/assessment-engine/submission.js')
     .pendingSubmissions({ queueKey: QUEUE_KEY });
 
+test('empty contact keys in a saved draft do not block continuation prefill', t => {
+  const restore = silence();
+  t.after(() => { restore(); teardown(); });
+
+  const api = installBrowser();
+  storage.setItem(CONFIG.storageKey, JSON.stringify({
+    assessmentSessionId: 'saved-session',
+    offerings: [],
+    contact: { salonName: '', ownerName: '', email: '' },
+    prefilledFields: []
+  }));
+  require('../shared/security/continuation.js').storeContinuation({
+    token: '1.from.growth',
+    prefill: {
+      salonName: 'Continued Salon', ownerName: 'Continued Owner',
+      email: 'continued@polished.test'
+    }
+  });
+  respond = () => jsonResponse(201, { ok: true });
+
+  const controller = api.init(CONFIG);
+  assert.deepEqual(controller.state().contact, {
+    salonName: 'Continued Salon', ownerName: 'Continued Owner',
+    email: 'continued@polished.test'
+  });
+  assert.deepEqual(controller.prefilledFields().sort(), ['email', 'ownerName', 'salonName']);
+});
+
 /* ---------- it is queued at all ---------- */
 
 test('a connected review that cannot be sent is queued rather than lost', async t => {

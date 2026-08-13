@@ -557,11 +557,11 @@
        "to send your results" and "permission to email the results" both
        described an email nobody sends. */
     if (!salonName || !email) {
-      showError(error, 'We need the salon name and an email address before the review can be sent.');
+      showError(error, 'We need the salon name and an email address before this review can be saved to your Business Record.');
       return;
     }
     if (!consented) {
-      showError(error, 'We need your permission before the review can be sent.');
+      showError(error, 'We need your permission before this review can be saved.');
       return;
     }
     showError(error, '');
@@ -588,30 +588,34 @@
       return;
     }
 
-    /* COMPLIANCE: what this says has to be true.
-
-       There is no tested email delivery path — nothing in this repository
-       sends a message — so the page never says results are on their way. It
-       says what actually happened: the review reached us, or it did not and
-       is saved here.
-
-       The queued wording claims a RETRY, and only a retry. The controller
-       sweeps the queue on every load of this page, so opening it starts an
-       attempt — but an attempt is not an arrival. If the server is still
-       unreachable, or the entry has exhausted its attempts, or it expired
-       after thirty days, nothing is sent. "Will be sent" promised an outcome
-       this page cannot know; "we will try to send it" describes what
-       actually happens.
-
-       If the sweep is ever removed, this sentence goes with it. */
+    const retryButton = $('[data-action="retry-save"]');
+    const queuedPermanently = outcome.status === 'queued' && outcome.result && outcome.result.permanent;
     $('[data-delivery-note]').textContent = outcome.status === 'sent'
-      ? 'Your review has been received. Your results are below.'
+      ? 'This review is saved to your Business Record.'
       : outcome.status === 'queued'
-        ? 'We could not reach the server just now. Your review is saved on this device, and we will retry sending it the next time you open this page. Your results are below either way.'
-        : 'Preview mode: nothing was sent. Your results are shown below.';
+        ? queuedPermanently
+          ? 'Your results were calculated in this browser, but this review was refused and was not saved to your Business Record or made available to CED staff. Delete the copy stored on this device before starting a corrected review.'
+          : 'Your results were calculated in this browser, but this review has not been saved to your Business Record yet and is not available to CED staff. A copy remains on this device. We will retry when you reopen this page, or you can retry now.'
+        : 'Preview mode: this review was not saved. Your results were calculated in this browser.';
+    if (retryButton) retryButton.hidden = outcome.status !== 'queued' || queuedPermanently;
 
     renderResults();
     showStep('results');
+  });
+
+  on($('[data-action="retry-save"]'), 'click', async event => {
+    const button = event.currentTarget;
+    const note = $('[data-delivery-note]');
+    button.disabled = true;
+    note.textContent = 'Trying to save this review to your Business Record…';
+    const result = await controller.retryQueuedSubmissions({ force: true });
+    button.disabled = false;
+    if (result && result.sent > 0) {
+      note.textContent = 'This review is saved to your Business Record.';
+      button.hidden = true;
+      return;
+    }
+    note.textContent = 'This review is still not saved to your Business Record or available to CED staff. The copy on this device is unchanged. You can try again later.';
   });
 
   on($('[data-action="pricing-detail"]'), 'click', () => {

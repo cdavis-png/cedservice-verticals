@@ -379,7 +379,7 @@
         continue;
       }
       /* Not due yet under the backoff schedule. */
-      if (entry.nextRetryAt && Date.parse(entry.nextRetryAt) > now) {
+      if (!opts.force && entry.nextRetryAt && Date.parse(entry.nextRetryAt) > now) {
         skipped++;
         remaining.push(entry);
         continue;

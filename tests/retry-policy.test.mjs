@@ -256,6 +256,27 @@ test('a queued idempotency_key_conflict is skipped, not re-attempted', async () 
   }
 });
 
+test('a visitor-requested retry can bypass backoff without bypassing permanent failures', async () => {
+  const restore = silence();
+  globalThis.localStorage = new MemoryStorage();
+  try {
+    globalThis.fetch = async () => errorResponse(503, 'challenge_unavailable');
+    await submission.submitAssessment(payload(), OPTS);
+
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls++;
+      return jsonResponse(201, { ok: true, businessId: 'b1' });
+    };
+    const result = await submission.retryPendingSubmissions({ ...OPTS, force: true });
+    assert.equal(calls, 1, 'force means retry now, not after the scheduled backoff');
+    assert.equal(result.sent, 1);
+    assert.equal(result.remaining, 0);
+  } finally {
+    restore();
+  }
+});
+
 test('one submissionId is reused across every retry of the same result', async () => {
   const restore = silence();
   globalThis.localStorage = new MemoryStorage();

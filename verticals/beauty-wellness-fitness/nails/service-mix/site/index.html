@@ -129,12 +129,16 @@
     </section>
 
     <!-- ============================================================
-         Step 3 — where to send it
+         Step 3 — confirm the Business Record identity
          ============================================================ -->
     <section class="step" data-step="3" data-step-id="contact" hidden
              aria-labelledby="contact-heading">
       <p class="eyebrow">STEP 3 OF 3</p>
-      <h2 id="contact-heading">Where should we send it?</h2>
+      <h2 id="contact-heading">Confirm your business details</h2>
+      <p class="lead">
+        We use these details to connect this review to your Business Record.
+        Your results appear on this page.
+      </p>
 
       <!-- Shown only when a connected review filled these in. -->
       <p class="note" data-prefill-note hidden></p>
@@ -200,8 +204,8 @@
           <div class="consent-row">
             <input type="checkbox" id="consentResults" name="consentResults" required />
             <label for="consentResults" data-consent-statement>
-              Send my review to CED Solutions so my results can be worked out and
-              shown to me on this page.
+              Save my review with CED Solutions so my results can be worked out,
+              shown to me on this page, and connected to my Business Record.
             </label>
           </div>
 
@@ -213,8 +217,8 @@
           </div>
 
           <p class="note">
-            Your results appear on this page either way. Marketing permission is
-            never a condition of seeing them.
+            Your results appear on this page whether or not you opt in to marketing.
+            Marketing permission is never a condition of seeing them.
           </p>
         </fieldset>
 
@@ -297,6 +301,10 @@
       </div>
 
       <p class="note" data-delivery-note></p>
+
+      <button type="button" class="btn btn-secondary" data-action="retry-save" hidden>
+        Retry saving now
+      </button>
 
       <button type="button" class="btn btn-link" data-action="clear-data">
         Delete what this review stored on my device
