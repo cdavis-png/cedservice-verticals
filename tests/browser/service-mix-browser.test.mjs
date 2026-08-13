@@ -503,7 +503,7 @@ it('a completed review produces a Service Mix result on screen', async () => {
 
   /* No endpoint is running, so the transport queued it. That is the correct
      behaviour, and the visitor is told plainly. */
-  assert.match(results.delivery, /saved on this device|Preview mode|has been received/);
+  assert.match(results.delivery, /not been saved to your Business Record yet/);
   assert.equal(/on their way|by email|inbox/i.test(results.delivery), false,
     'nothing in this repository sends a message, so nothing may say one is coming');
   assert.deepEqual(pageErrors, []);
@@ -898,9 +898,9 @@ it('a connected review does not ask again for contact it already has', async () 
 it('a saved draft with empty contact keys does not block Growth Review prefill', async () => {
   const { page, close } = await openPage();
   await page.evaluate(() => {
-    const saved = JSON.parse(localStorage.getItem('cedServiceMixReview'));
+    const saved = JSON.parse(localStorage.getItem('cedNailServiceMixReview'));
     saved.contact = { salonName: '', ownerName: '', email: '' };
-    localStorage.setItem('cedServiceMixReview', JSON.stringify(saved));
+    localStorage.setItem('cedNailServiceMixReview', JSON.stringify(saved));
     window.CEDContinuation.storeContinuation({
       token: '1.opaque.growth.token',
       prefill: {

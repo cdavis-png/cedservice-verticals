@@ -594,7 +594,7 @@
       ? 'This review is saved to your Business Record.'
       : outcome.status === 'queued'
         ? queuedPermanently
-          ? 'Your results were calculated in this browser, but this review was refused and was not saved to your Business Record or made available to CED staff. Delete the copy stored on this device before starting a corrected review.'
+          ? 'Your results were calculated in this browser, but the server could not accept this review. It was not saved to your Business Record or made available to CED staff. Your answers remain on this device so you can review them or start over.'
           : 'Your results were calculated in this browser, but this review has not been saved to your Business Record yet and is not available to CED staff. A copy remains on this device. We will retry when you reopen this page, or you can retry now.'
         : 'Preview mode: this review was not saved. Your results were calculated in this browser.';
     if (retryButton) retryButton.hidden = outcome.status !== 'queued' || queuedPermanently;

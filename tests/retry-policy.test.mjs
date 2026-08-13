@@ -116,6 +116,14 @@ test('rate limiting is retryable', async () => {
   assert.equal(outcome.permanent, false);
 });
 
+test('a missing or misrouted assessment endpoint remains recoverable', async () => {
+  for (const status of [404, 405]) {
+    const { outcome, queue } = await runSubmit(jsonResponse(status, {}));
+    assert.equal(outcome.permanent, false, `${status} is a deployment fault, not a visitor refusal`);
+    assert.equal(queue[0].permanent, false);
+  }
+});
+
 test('challenge verification unavailable is retryable; rejected is permanent', async () => {
   const unavailable = await runSubmit(errorResponse(503, 'challenge_unavailable'));
   assert.equal(unavailable.outcome.permanent, false, 'a provider outage is never the visitor’s fault');
