@@ -173,7 +173,8 @@ been successfully *called* over PostgREST — the probes were permission
 refusals — so section M of the integration suite still has not run there, and
 neither have the staff route's five RPCs or its two direct table reads.
 Migration **0008 is applied and verified** on that project — ledger version
-`20260809173146`, so the hosted ledger records **0001 through 0008**. It is
+`20260809173146`. The hosted ledger now records **0001 through 0010**, plus one
+entry with no repository file; see section 14 for both. 0008 is
 forward-only and repairs three defects in 0006 (see section 14). Beyond the
 database: the application is not deployed for public traffic; no challenge
 provider has been chosen; and nothing yet reports how many visitors open or
@@ -659,11 +660,16 @@ Abandonment counts are a floor, not a total.
 
 ## 12. The staff identity-resolution console
 
-The first and only **authenticated** surface in this repository. Everything
-else is deliberately public, because the people filling in an assessment have
-no account. This one is the opposite, and it exists because migration 0001
-created `identity_resolution_cases`, called it "the human queue", and gave
-nobody a way to close one.
+The FIRST **authenticated** surface in this repository, and for a long time the
+only one. Most of the rest is deliberately public, because the people filling
+in an assessment have no account. This one is the opposite, and it exists
+because migration 0001 created `identity_resolution_cases`, called it "the
+human queue", and gave nobody a way to close one.
+
+It is no longer alone: `POST /api/sales/promote` (§15) authenticates the same
+way and reuses the same live `staff_operators` lookup. Everything in this
+section about keys, provenance, AAL2 and authorization applies there too — read
+it as the pattern, not as a description of one route.
 
 Full runbook — provisioning, revocation, environment, and what an operator can
 and cannot do — is
@@ -1112,7 +1118,7 @@ already hosted stays:
 
 ### Applying a migration must also RECORD it
 
-`supabase_migrations.schema_migrations` records **0001–0008**, 0008 at version
+`supabase_migrations.schema_migrations` records **0001–0010**, 0008 at version
 `20260809173146`. A migration applied without a history row leaves the two
 disagreeing, and nothing downstream can then tell an unrecorded migration from
 an unapplied one. 0008 is the worked example of doing it right: one
@@ -1157,6 +1163,49 @@ repository actually carried:
 ledger version `20260809173146`, run 16. The recovery procedure above was not
 needed and is retained for the next migration.
 
+### Applied before committed — 0009 and 0010
+
+`0009_bi_sales_handoff_foundation` (`20260814182709`) and
+`0010_sales_handoff_fk_indexes` (`20260814182839`) were applied to
+`qkpptajglstgucadhfwq` **before** they existed as repository files. That is the
+wrong order. It is recorded here rather than tidied away, because the failure
+it risks is specific: a repository whose latest migration is 0008 looks like a
+repository where 0009 is unwritten, and the obvious next action — write it,
+apply it — would fail against a database that already has it.
+
+Both files now exist and are **records, not pending work**. Their SQL was
+recovered from `supabase_migrations.schema_migrations.statements`, which stores
+what actually executed, and each file was verified against its stored statement
+by comparing a comment-stripped, whitespace-normalised MD5. They match. That is
+a stronger guarantee than the usual one in this repository: for 0001–0008 the
+committed file is the *intended* definition and only one deployed function has
+ever been diffed against it, whereas for 0009 and 0010 the committed file is
+provably the *executed* text.
+
+Two consequences, both deliberate:
+
+- **Neither file may be applied to `qkpptajglstgucadhfwq`.** Both carry that
+  instruction in their header.
+- **0009 is not re-runnable**, and it was not rewritten to become so. Its
+  `create table`, `create index` and `create trigger` statements are bare. The
+  rule above still stands for new migrations; making an already-applied file
+  re-runnable would mean it no longer describes what ran.
+
+### One ledger entry has no repository file
+
+`supabase_migrations.schema_migrations` also records
+**`20260806171939 create_aeo_answer_visibility_module`**, applied between 0005
+and 0006. There is no corresponding file in `supabase/migrations/`. It created
+`aeo_targets`, `aeo_competitors`, `aeo_questions`, `aeo_checks` and
+`maps_snapshots` — all present, all RLS-enabled, all currently empty.
+
+This is **unreconciled drift and is deliberately left alone.** It is named here
+so the next person reads a known gap rather than discovering an unexplained one.
+Reconciling it is the same recovery procedure 0009 and 0010 used — recover the
+statement, commit it as a numbered file, apply nothing — but it is a separate
+decision about a module nothing in the sales lifecycle touches, and it should
+not be smuggled into an unrelated change.
+
 ### One elevated key, one selector
 
 `SUPABASE_SECRET_KEY` is preferred everywhere;
@@ -1179,3 +1228,80 @@ second place that reads an elevated key variable.
 A preferred variable that is set but malformed **fails closed and does not
 fall back** — a typo must be a refusal to fix rather than a silent demotion to
 the legacy key.
+
+---
+
+## 15. The BI → Sales boundary
+
+The seam between research and selling. Full runbook, including every GHL id
+this repository addresses:
+[docs/BI_TO_SALES_OPERATIONS.md](docs/BI_TO_SALES_OPERATIONS.md).
+
+| | |
+| --- | --- |
+| Promotion | `api/sales/promote.mjs` → `server/sales-promotion.mjs` |
+| Webhook | `api/webhooks/ghl.mjs` → `server/crm-webhook.mjs` |
+| CRM client | `server/ghl-client.mjs` |
+| Auth primitives | `server/operator-session.mjs` |
+| Migrations | 0009, 0010 (reconciled records), 0011 (pending) |
+
+### Authority, and the line that must not move
+
+Supabase owns identity, evidence, qualification, cross-system links and
+historical milestones. GHL owns communications, sales execution, the CURRENT
+opportunity state, and Won/Lost. **Supabase is never authoritative for the live
+pipeline stage** — the webhook receiver writes history, never a mirror of
+present state. A second copy of live state is a second source of truth, and the
+two disagree the first time a delivery is dropped.
+
+**No database trigger calls GHL**, and none may be added. A trigger making an
+outbound call puts a network round trip inside a lock and turns a CRM outage
+into a failed transaction.
+
+### Two decisions, never one
+
+`qualification_status = 'qualified'` makes a Lead. `pursuit_approved_at` is the
+SEPARATE human decision that permits an Opportunity. The schema refuses to let
+either imply the other, the route refuses before calling GHL, and
+`enforce_external_record_link_handoff` refuses the link even if something got
+past both. Qualification alone is explicitly insufficient — do not add a path
+that infers pursuit approval from confidence, evidence, or a caller's request.
+
+### Vercel, not an Edge Function
+
+Decided by inspection: all server surfaces here are Vercel Node functions, the
+project has zero Edge Functions, and §12 already fixed the shape. An Edge
+Function would be a second deployment architecture — a second home for secrets,
+a second release path, a second runtime, a second answer to where
+authorization happens.
+
+Both sales routes are **plain paths**, not catch-alls: each serves one endpoint
+with no sub-paths, so neither needs the bracket segment or the `vercel.json`
+rewrite the console required. Do not pre-emptively convert them.
+
+### The webhook is the one route with no origin check
+
+HighLevel is not a browser and holds no session, so the Ed25519 signature is
+the ONLY credential. It is therefore absolute: verified over the **unmodified
+raw bytes** before parsing, before the database, before a rate-limit bucket;
+the deprecated RSA `X-WH-Signature` is not accepted; and **no configuration
+flag disables verification**. A "skip in development" switch is exactly the
+switch that reaches production.
+
+Re-serialising the body breaks this. Read it once as a Buffer and hand the same
+Buffer to both the signature check and the hash.
+
+### Timeline payloads carry no contact data
+
+§9's rule, and this is where it is easiest to break: both surfaces build events
+from CRM bodies full of names, emails and phone numbers. Identifiers and keys
+only. `timeline_events` refuses UPDATE, so anything personal that reaches it
+can never be redacted.
+
+### Promotion is not automation
+
+There is no sweep, no schedule and no trigger. Promotion is an explicit
+authenticated call for one handoff. Do not broadly enable automatic
+BI-to-GHL promotion, and do not build researched-outbound opportunity
+automation until the Voice AI inbound-call workflow's opportunity-creation
+behaviour is understood — see the runbook §6.
