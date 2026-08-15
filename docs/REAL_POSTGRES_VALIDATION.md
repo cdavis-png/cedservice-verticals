@@ -30,9 +30,17 @@ closed. Everything below was observed, not predicted.
 > — ledger version `20260809173146` — and verified it: the trigger now covers
 > UPDATE, no internal function is reachable by `service_role`, both helpers are
 > pinned, the two security-advisor warnings are gone, all data is intact, and
-> the rule was exercised behaviourally inside a rolled-back transaction. **The
-> hosted ledger records through 0008.** Runs 14 and 15 are the before; run 16
-> is the current state.
+> the rule was exercised behaviourally inside a rolled-back transaction. Runs
+> 14 and 15 are the before; run 16 was the current state until run 17.
+>
+> **Run 17 is the current state, and it is not a validation run.** Two further
+> migrations — `0009_bi_sales_handoff_foundation` (`20260814182709`) and
+> `0010_sales_handoff_fk_indexes` (`20260814182839`) — were found already
+> applied to `qkpptajglstgucadhfwq` with **no repository files**. They were
+> reconciled *out of* the database rather than applied *into* it. **The hosted
+> ledger records through 0010**, plus one older unreconciled entry,
+> `20260806171939 create_aeo_answer_visibility_module`, which still has no
+> file.
 
 ## Runs
 
@@ -632,6 +640,82 @@ explicitly first, so the revoke has something real to remove.
 [run 16](#run-16--0008-applied-and-verified-on-the-hosted-project).** The
 sentence that stood here, "0008 has not been applied anywhere", was true when
 run 14 was written and is not now.
+
+---
+
+## Run 17 — 0009 and 0010 reconciled out of the database
+
+**Nothing was applied in this run, and that is the point.** Every other run in
+this document records SQL being executed. This one records SQL being
+*recovered*.
+
+| | Run 17 |
+|---|---|
+| Date | 2026-08-14 |
+| Project | `qkpptajglstgucadhfwq` (`ced-cip-dev`) |
+| Postgres | 17.6.1.155 |
+| Method | read-only `execute_sql` against `supabase_migrations.schema_migrations` |
+| Migrations applied | **none** |
+| Result | two ledger entries reconciled into repository files; one left outstanding |
+
+**What was found.** The hosted ledger held two entries with no counterpart in
+`supabase/migrations/`:
+
+| Version | Name |
+|---|---|
+| `20260814182709` | `0009_bi_sales_handoff_foundation` |
+| `20260814182839` | `0010_sales_handoff_fk_indexes` |
+
+They were applied on 2026-08-14, before the repository had files for them.
+The schema they created was confirmed present and correct independently of the
+ledger: `sales_handoffs`, `external_record_links`, `sales_promotion_requests`
+and `crm_webhook_receipts` all exist with RLS enabled and no policies;
+`business_records.lifecycle_state` defaults to `business_record`; the
+`business_records_lifecycle_semantics` trigger raises `23514` on new
+`lead_assessed`; all 14 existing rows remain `lead_assessed` and none uses a new
+value.
+
+**How they were reconciled.** `schema_migrations.statements` stores the text
+that actually executed. Each entry's statement was read and written to its
+numbered file with a header comment and no other change. Faithfulness was then
+*verified rather than asserted*: both sides were lowercased, had `--` comments
+stripped and whitespace collapsed, and were compared by MD5.
+
+| File | Normalised MD5 | Length | Match |
+|---|---|---|---|
+| `0009_bi_sales_handoff_foundation.sql` | `4313c87bf06208e8795acee0f1bf85f0` | 14673 | yes |
+| `0010_sales_handoff_fk_indexes.sql` | `9f5e9e6084de42f95891f0b4949c07cc` | 223 | yes |
+
+This inverts the usual caveat in this document. For 0001–0008 the committed
+file is the *intended* text and only one deployed function has ever been diffed
+against it. For 0009 and 0010 the committed file is provably the *executed*
+text — but nothing has been diffed the other way, so what is **not** established
+is that the executed text was reviewed before it ran.
+
+**Advisors.** Security advisors were read after reconciliation: 25 findings, all
+INFO `rls_enabled_no_policy`, which is the intended design for every table since
+0001. No ERROR and no WARN. Unchanged by this run, which changed nothing.
+
+### What run 17 does NOT establish
+
+- **That 0009's SQL was reviewed before it was applied.** It was not, by
+  anyone whose review is recorded. The reconciliation proves what ran, not that
+  running it was correct.
+- **That the four new tables have ever been written to.** All four are empty.
+  No handoff, link, promotion request or webhook receipt exists.
+- **That the sales lifecycle works.** `staff_operators` holds zero rows and
+  `auth.users` holds zero users, so no handoff can be qualified: both
+  `qualified_by` and `pursuit_approved_by` are foreign keys into
+  `staff_operators`. Nothing downstream of qualification has been exercised.
+
+### Still outstanding after run 17
+
+`20260806171939 create_aeo_answer_visibility_module` is recorded in the ledger
+and has **no repository file**. It created `aeo_targets`, `aeo_competitors`,
+`aeo_questions`, `aeo_checks` and `maps_snapshots` — present, RLS-enabled, all
+empty. It is left unreconciled deliberately; the same recovery procedure would
+work, but it belongs to a module unrelated to the sales lifecycle and should be
+a decision of its own rather than a rider on this one.
 
 ---
 

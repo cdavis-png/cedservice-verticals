@@ -6,7 +6,10 @@ Manual steps to connect the Milestone 1 implementation to a real project.
 > exists".** That is wrong and has been for some time. A persistent hosted
 > **development** project exists — `qkpptajglstgucadhfwq`, PostgreSQL
 > 17.6.1.155 — and its `supabase_migrations.schema_migrations` records
-> migrations **0001 through 0008**.
+> migrations **0001 through 0010**, plus one entry
+> (`20260806171939 create_aeo_answer_visibility_module`) that has no
+> repository file. 0009 and 0010 were applied *before* they were committed
+> and their files are records rather than pending work — see CLAUDE.md §14.
 >
 > 0008 was applied on 2026-08-09 through the tracked `apply_migration`
 > operation, at ledger version `20260809173146`, and its post-application
@@ -427,9 +430,11 @@ PostgREST call will be ambiguous.
 *Historical, superseded:* this section once read "the SQL has never been
 executed", which was true when it was written and is not now.
 
-**Current status.** Migrations **0001–0008** are applied and recorded on the
+**Current status.** Migrations **0001–0010** are applied and recorded on the
 hosted development project (Supabase PostgreSQL 17.6.1.155), 0008 at ledger
-version `20260809173146` with its post-application verification passed. 0006,
+version `20260809173146` with its post-application verification passed, 0009 at
+`20260814182709` and 0010 at `20260814182839` — the last two applied before
+they were committed and reconciled afterwards from the stored statements. 0006,
 0007 and 0008 have additionally been executed against a disposable local
 PostgreSQL 18.3 through PGlite. No privileged RPC has been called through
 PostgREST. See [REAL_POSTGRES_VALIDATION.md](REAL_POSTGRES_VALIDATION.md) runs
