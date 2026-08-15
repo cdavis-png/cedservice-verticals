@@ -6,7 +6,7 @@ Manual steps to connect the Milestone 1 implementation to a real project.
 > exists".** That is wrong and has been for some time. A persistent hosted
 > **development** project exists — `qkpptajglstgucadhfwq`, PostgreSQL
 > 17.6.1.155 — and its `supabase_migrations.schema_migrations` records
-> migrations **0001 through 0010**, plus one entry
+> migrations **0001 through 0011**, plus one entry
 > (`20260806171939 create_aeo_answer_visibility_module`) that has no
 > repository file. 0009 and 0010 were applied *before* they were committed
 > and their files are records rather than pending work — see CLAUDE.md §14.
@@ -62,9 +62,14 @@ you are in **before** running anything.
 
 | | A brand-new project | The existing development project |
 |---|---|---|
-| State | Empty | 0001–0007 applied **and recorded** |
-| To apply | 0001 → 0008, in order | 0008 only |
-| Procedure | §2a | §2b — and §2b is not optional |
+| State | Empty | **0001–0011 applied and recorded** |
+| To apply | 0001 → 0011, in order | **nothing** |
+| Procedure | §2a | §2b, retained as the worked example |
+
+> **The right-hand column is now history.** It read "0001–0007 applied / apply
+> 0008 only" while that was the decision in front of us. `qkpptajglstgucadhfwq`
+> is fully migrated; §2b is kept because it is the pattern the next migration
+> follows, not because anything in it needs running.
 
 ### 2a. A brand-new, empty project
 
@@ -79,7 +84,15 @@ supabase/migrations/0005_assessment_analytics.sql
 supabase/migrations/0006_service_mix_review.sql
 supabase/migrations/0007_staff_identity_resolution.sql
 supabase/migrations/0008_staff_migration_hardening.sql
+supabase/migrations/0009_bi_sales_handoff_foundation.sql
+supabase/migrations/0010_sales_handoff_fk_indexes.sql
+supabase/migrations/0011_promotion_business_serialization.sql
 ```
+
+0009 is **not re-runnable** — it is a reconciled record of SQL that was applied
+before it was committed, and its `create` statements are bare (CLAUDE.md §14).
+On an empty project that is fine: it runs exactly once, in order. Do not apply
+it to a database that already has it.
 
 0003 depends on both predecessors. It **drops and recreates**
 `ingest_assessment` (the signature gains a `p_meta` argument, so
@@ -430,11 +443,13 @@ PostgREST call will be ambiguous.
 *Historical, superseded:* this section once read "the SQL has never been
 executed", which was true when it was written and is not now.
 
-**Current status.** Migrations **0001–0010** are applied and recorded on the
+**Current status.** Migrations **0001–0011** are applied and recorded on the
 hosted development project (Supabase PostgreSQL 17.6.1.155), 0008 at ledger
 version `20260809173146` with its post-application verification passed, 0009 at
-`20260814182709` and 0010 at `20260814182839` — the last two applied before
-they were committed and reconciled afterwards from the stored statements. 0006,
+`20260814182709` and 0010 at `20260814182839` — those two applied before they
+were committed and reconciled afterwards from the stored statements — and 0011
+at `20260815025341`, which went in the right order: committed and reviewed
+first, then applied. 0006,
 0007 and 0008 have additionally been executed against a disposable local
 PostgreSQL 18.3 through PGlite. No privileged RPC has been called through
 PostgREST. See [REAL_POSTGRES_VALIDATION.md](REAL_POSTGRES_VALIDATION.md) runs

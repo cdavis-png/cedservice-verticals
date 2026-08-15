@@ -224,32 +224,100 @@ every existing stage ID has to survive verbatim.
 
 - **There is no automatic BI-to-GHL promotion.** Promotion is an explicit,
   authenticated, per-handoff call. Nothing sweeps qualified handoffs.
-- **No researched-outbound opportunity automation exists**, and none should be
-  built until the Voice AI inbound-call workflow's opportunity-creation
-  behaviour is understood — see §6.
+- **No researched-outbound opportunity automation exists**, and building it
+  remains a separate decision. The Voice AI duplication cause is now
+  understood (§6), which removes the reason to *wait* — it does not by itself
+  make automation desirable.
 - Neither surface has been deployed or reached a real CRM. Every result above
   is from the test suite plus read-only and non-mutating probes.
 
 ---
 
-## 6. Open items
+## 6. The Voice AI duplicate-opportunity cause — resolved
 
-- **The Voice AI workflow.** Contact `AsRMUVZXSAjB9xPrfFKl` (Chris Davis) holds
-  three `Voice AI Lead - C DAVIS` opportunities, all `open`, all `$0`, all in
-  `New Inquiry`, all from source `Voice AI Inbound Call` — created 2026-07-15
-  00:03Z, 2026-07-18 00:18Z and 2026-07-18 00:45Z. **They are test data. Do not
-  delete, close, merge or alter them.** Two on one night 27 minutes apart is
-  repeated workflow entry, not three leads.
+Contact `AsRMUVZXSAjB9xPrfFKl` (Chris Davis) holds three
+`Voice AI Lead - C DAVIS` opportunities, all `open`, all `$0`, all in
+`New Inquiry`, all from source `Voice AI Inbound Call` — created 2026-07-15
+00:03Z, 2026-07-18 00:18Z and 2026-07-18 00:45Z. **They are test data. Do not
+delete, close, merge or alter them.** Two on one night 27 minutes apart was
+repeated workflow entry, not three leads.
 
-  The responsible workflow is almost certainly **`CED Voice AI - Post-Call
-  Intake + Internal Notify`** (`fdd1f46f-437d-4bbb-bfbc-84abd1aec237`);
-  secondary candidate **`Missed-Call Catcher`**
-  (`2a0844f3-15a1-4db0-a7c1-f89aeea0d780`). This cannot be confirmed through
-  the API: `GET /workflows/{id}` and `/versions` both 404, and the public API
-  exposes only the workflow *list*, never triggers or actions. Inspect
-  Automation → Workflows → that workflow → the Create/Update Opportunity action
-  and its Allow Re-Entry setting.
-- **Migration 0011 is written and tested but not applied.**
-- **No staff operator exists.** `auth.users` and `staff_operators` are both
-  empty, so no handoff can be qualified: `qualified_by` and
-  `pursuit_approved_by` are both foreign keys into `staff_operators`.
+**Cause, confirmed manually in the GHL UI on 2026-08-15.** Workflow
+**`CED Voice AI - Post-Call Intake + Internal Notify`**
+(`fdd1f46f-437d-4bbb-bfbc-84abd1aec237`), action **Create or update
+opportunity**:
+
+| Setting | Value |
+| --- | --- |
+| Pipeline | CED Service Leads |
+| Stage | New Inquiry |
+| Opportunity name | `Voice AI Lead - {{contact.name}}` |
+| Source | Voice AI Inbound Call |
+| Status | open |
+| Allow opportunity to move to any previous stage | OFF (unchanged) |
+| **Allow duplicate opportunities** | **was ON — the cause; now OFF** |
+
+With duplicates allowed, every re-entry created another open opportunity for
+the same caller instead of updating the existing one. The setting has been
+turned off and the action saved. The three existing test opportunities were
+not altered.
+
+**This was confirmed by a human reading the workflow screen, not by this
+repository.** The public API exposes only the workflow *list* —
+`GET /workflows/{id}` and `/versions` both 404 — so no action, trigger or
+setting can be read back programmatically, and nothing here can regression-test
+it. If the behaviour recurs, that screen is the only place to look.
+
+---
+
+## 7. Open items
+
+- **Neither surface has been deployed.** No promotion has run, no webhook
+  delivery has been received, and all four sales tables are empty.
+- **The webhook endpoint is not registered with HighLevel.** Until it is, no
+  milestone can reach Supabase.
+- **No handoff exists**, so the promotion path has never been exercised against
+  the real CRM — only against the test doubles.
+- The Vercel Preview build fails closed at `tools/build-static.mjs` with
+  `SUPABASE_URL is not set.` That is the documented fail-closed behaviour
+  (CLAUDE.md §13) and is unrelated to this boundary; it needs the variable set
+  in the Vercel project's Preview environment.
+- One older ledger entry is still unreconciled and has no repository file:
+  `20260806171939 create_aeo_answer_visibility_module`. See CLAUDE.md §14.
+
+---
+
+## 8. Current state, verified 2026-08-15
+
+Read directly from `qkpptajglstgucadhfwq`. Recorded because several statements
+in this document depend on it and would otherwise silently rot.
+
+| | |
+| --- | --- |
+| Hosted ledger | **0001 → 0011**, 0011 at `20260815025341` |
+| `sales_promotion_requests.business_id` | `uuid NOT NULL` |
+| `sales_promotion_requests_one_business_processing_uidx` | present |
+| `sales_promotion_requests_business_idx` | present |
+| `sales_promotion_requests_business_guard` trigger | present |
+| RLS on all four sales tables | **enabled AND forced** |
+| `sales_handoffs` / `external_record_links` / `sales_promotion_requests` / `crm_webhook_receipts` | 0 / 0 / 0 / 0 rows |
+| `business_records` | 14, of which 14 are legacy `lead_assessed` |
+| `timeline_events` | 109 |
+| Staff operators | **1 active, role `owner`**; `auth.users` = 1 |
+
+0011 closed both defects it targeted: the business-level serialization index is
+in place, and RLS is now forced on all four tables where 0009 had left it
+merely enabled.
+
+**Staff authorization is no longer a blocker.** One confirmed Auth user exists
+and was bootstrapped through `bootstrap_staff_owner` as the sole active owner,
+so handoffs can now be qualified and pursuit-approved — `qualified_by` and
+`pursuit_approved_by` both resolve. **No operator identity is recorded in this
+repository**, and none should be: the email, the UUID and the credentials
+belong in Supabase Auth and nowhere else. `bootstrap_staff_owner` refuses to
+run a second time while a single owner exists, so provisioning further
+operators is an owner action, not a repeat of the bootstrap.
+
+The Babe Lounge remains absent from `business_records`,
+`business_identifiers`, `assessment_submissions` and
+`business_intelligence_reports`.

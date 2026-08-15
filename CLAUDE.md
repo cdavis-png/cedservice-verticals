@@ -173,7 +173,7 @@ been successfully *called* over PostgREST — the probes were permission
 refusals — so section M of the integration suite still has not run there, and
 neither have the staff route's five RPCs or its two direct table reads.
 Migration **0008 is applied and verified** on that project — ledger version
-`20260809173146`. The hosted ledger now records **0001 through 0010**, plus one
+`20260809173146`. The hosted ledger now records **0001 through 0011**, plus one
 entry with no repository file; see section 14 for both. 0008 is
 forward-only and repairs three defects in 0006 (see section 14). Beyond the
 database: the application is not deployed for public traffic; no challenge
@@ -926,12 +926,22 @@ Stated precisely, because everything below is still owed:
   *mechanism* that decides a race is proven — a unique index, a `for update`
   on the case, a ledger recheck after the lock — but the race itself has never
   been run.
-- **`auth.users`.** Absent from PGlite, so the `staff_operators` foreign key
-  and the bootstrap's confirmed-email check are **skipped**, not passed.
-- **Real Supabase Auth and TOTP.** Every Auth call is covered against a stubbed
-  client on the server and a stubbed network in the browser. No real access
-  token has ever been verified, no real factor enrolled or challenged, and no
-  real session refreshed or revoked.
+- **`auth.users`, in PGlite.** Still absent there, so the `staff_operators`
+  foreign key and the bootstrap's confirmed-email check remain **skipped, not
+  passed**, in every local run.
+
+  **On the hosted project this is no longer true.** One confirmed Auth user
+  exists and `bootstrap_staff_owner` has executed against it successfully,
+  creating the sole active `owner` — so the foreign key and the
+  confirmed-email check have now genuinely run and passed there, and the
+  function's refusal to bootstrap twice is the state the project is in. No
+  operator identity is recorded in this repository and none may be.
+- **Real Supabase Auth and TOTP.** Every Auth call is still covered against a
+  stubbed client on the server and a stubbed network in the browser. No real
+  access token has been verified, no real factor enrolled or challenged, and
+  no real session refreshed or revoked. Bootstrapping an owner is a database
+  grant, not a sign-in: it establishes *who may act*, and proves nothing about
+  the console's authentication path.
 - **Real invitations.** No `verifyOtp` on a token Supabase minted, no real
   password change, no real `mfa.enroll`, and no authenticator app has ever
   read a real secret. The invite email template the runbook specifies is
@@ -1118,8 +1128,8 @@ already hosted stays:
 
 ### Applying a migration must also RECORD it
 
-`supabase_migrations.schema_migrations` records **0001–0010**, 0008 at version
-`20260809173146`. A migration applied without a history row leaves the two
+`supabase_migrations.schema_migrations` records **0001–0011** — 0008 at version
+`20260809173146`, 0011 at `20260815025341`. A migration applied without a history row leaves the two
 disagreeing, and nothing downstream can then tell an unrecorded migration from
 an unapplied one. 0008 is the worked example of doing it right: one
 `apply_migration` call wrote the DDL and the ledger row together.
@@ -1191,6 +1201,25 @@ Two consequences, both deliberate:
   rule above still stands for new migrations; making an already-applied file
   re-runnable would mean it no longer describes what ran.
 
+### 0011 — committed first, then applied
+
+`0011_promotion_business_serialization` is the counter-example, and the order
+it went in is the order this section asks for: written, tested against the
+whole chain locally, committed and reviewed, and **then** applied through the
+tracked `apply_migration` operation — ledger version `20260815025341`.
+
+It is forward-only and repairs two defects in 0009 without editing it: the
+promotion ledger was serialized per handoff rather than per business, and RLS
+was enabled but not FORCED on all four tables 0009 created. Both are confirmed
+closed on the hosted project — the business-level partial unique index, the
+business column and its guard trigger are present, and all four tables now
+report `relforcerowsecurity = true`.
+
+Its file is unchanged by the application: blob
+`e5cfad4053bf034e60dc55a50357d03679d1641e`, sha256
+`067397e58f7bbfdb5b8d870ca2571750529ac4fc447a02fb8db064b613f86631`. Unlike
+0009 and 0010, every statement in it is re-runnable.
+
 ### One ledger entry has no repository file
 
 `supabase_migrations.schema_migrations` also records
@@ -1243,7 +1272,7 @@ this repository addresses:
 | Webhook | `api/webhooks/ghl.mjs` → `server/crm-webhook.mjs` |
 | CRM client | `server/ghl-client.mjs` |
 | Auth primitives | `server/operator-session.mjs` |
-| Migrations | 0009, 0010 (reconciled records), 0011 (pending) |
+| Migrations | 0009, 0010 (reconciled records), 0011 (applied `20260815025341`) |
 
 ### Authority, and the line that must not move
 
@@ -1301,7 +1330,15 @@ can never be redacted.
 ### Promotion is not automation
 
 There is no sweep, no schedule and no trigger. Promotion is an explicit
-authenticated call for one handoff. Do not broadly enable automatic
-BI-to-GHL promotion, and do not build researched-outbound opportunity
-automation until the Voice AI inbound-call workflow's opportunity-creation
-behaviour is understood — see the runbook §6.
+authenticated call for one handoff. **Do not broadly enable automatic
+BI-to-GHL promotion**, and do not build researched-outbound opportunity
+automation without deciding to — it is a separate decision, not a natural
+next step.
+
+The reason to *wait* has been removed: the Voice AI inbound-call workflow
+created duplicate open opportunities because its Create-or-update-opportunity
+action had **Allow duplicate opportunities** switched on, which has since been
+turned off. That was confirmed by a human reading the workflow screen and
+cannot be verified from here — the public API exposes only the workflow list,
+never its actions — so nothing in this repository can regression-test it.
+Runbook §6 records the settings.

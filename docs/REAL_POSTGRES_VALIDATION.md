@@ -37,8 +37,12 @@ closed. Everything below was observed, not predicted.
 > migrations — `0009_bi_sales_handoff_foundation` (`20260814182709`) and
 > `0010_sales_handoff_fk_indexes` (`20260814182839`) — were found already
 > applied to `qkpptajglstgucadhfwq` with **no repository files**. They were
-> reconciled *out of* the database rather than applied *into* it. **The hosted
-> ledger records through 0010**, plus one older unreconciled entry,
+> reconciled *out of* the database rather than applied *into* it.
+>
+> **Run 18 is the current state.** 0011 was committed and reviewed first and
+> then applied, at ledger version `20260815025341` — the order runs 14 to 17
+> kept discovering had not been followed. **The hosted ledger records through
+> 0011**, plus one older unreconciled entry,
 > `20260806171939 create_aeo_answer_visibility_module`, which still has no
 > file.
 
@@ -643,6 +647,67 @@ run 14 was written and is not now.
 
 ---
 
+## Run 18 — 0011 applied, in the right order
+
+**The first migration in this repository to go committed-first, then applied.**
+0008 was applied from an approved blob but its file had existed for some time;
+0009 and 0010 were applied before they were files at all. This one was written,
+tested against the whole chain locally, committed to a reviewed branch, and
+only then applied.
+
+| | Run 18 |
+|---|---|
+| Date | 2026-08-15 |
+| Project | `qkpptajglstgucadhfwq` (`ced-cip-dev`) |
+| Postgres | 17.6.1.155 |
+| Method | tracked Supabase MCP `apply_migration`, with authorization immediately beforehand |
+| Migration | `0011_promotion_business_serialization` |
+| Ledger version | `20260815025341` |
+| Source blob | `e5cfad4053bf034e60dc55a50357d03679d1641e` (sha256 `067397e5…f86631`) |
+| Result | applied and recorded; every post-application check passed |
+
+**What it repaired.** Two defects in 0009, forward-only, without editing it:
+
+| Defect | Before | After |
+|---|---|---|
+| Concurrency keyed per *handoff*, not per *business* | two handoffs of one business could race the GHL contact create | `business_id` column, guard trigger and partial unique index present |
+| RLS enabled but **not FORCED** on all four sales tables | `relforcerowsecurity = false` | `true` on all four |
+
+**Post-application verification, read directly:**
+
+| Check | Result |
+|---|---|
+| Ledger | `20260815025341 — 0011_promotion_business_serialization` |
+| `sales_promotion_requests.business_id` | `uuid NOT NULL` |
+| `sales_promotion_requests_one_business_processing_uidx` | present |
+| `sales_promotion_requests_business_idx` | present |
+| `sales_promotion_requests_business_guard` trigger | present |
+| RLS enabled / forced, all four sales tables | `true` / `true` |
+| Row counts, all four sales tables | 0 / 0 / 0 / 0 — unchanged |
+| `business_records` | 14, all still legacy `lead_assessed` — unchanged |
+| `timeline_events` | 109 — unchanged |
+
+**Also true as of this run, and not established by it.** One confirmed Supabase
+Auth user exists and was bootstrapped through `bootstrap_staff_owner` as the
+sole active `owner`, so the `staff_operators` foreign key and the bootstrap's
+confirmed-email check have now run for real on a hosted database rather than
+being skipped as they are under PGlite. No operator identity is recorded in
+this repository.
+
+### What run 18 does NOT establish
+
+- **That the sales lifecycle has ever run.** All four tables are still empty.
+  No handoff has been qualified, no contact linked, no opportunity created and
+  no webhook delivery received.
+- **That either server surface works against the real CRM.** Neither is
+  deployed, and every result so far is from the test suite plus read-only or
+  non-mutating probes.
+- **Anything about Supabase Auth beyond the bootstrap.** No real access token
+  has been verified, no factor enrolled, no session refreshed. Bootstrapping an
+  owner is a database grant, not a sign-in.
+
+---
+
 ## Run 17 — 0009 and 0010 reconciled out of the database
 
 **Nothing was applied in this run, and that is the point.** Every other run in
@@ -703,10 +768,15 @@ INFO `rls_enabled_no_policy`, which is the intended design for every table since
   running it was correct.
 - **That the four new tables have ever been written to.** All four are empty.
   No handoff, link, promotion request or webhook receipt exists.
-- **That the sales lifecycle works.** `staff_operators` holds zero rows and
-  `auth.users` holds zero users, so no handoff can be qualified: both
-  `qualified_by` and `pursuit_approved_by` are foreign keys into
-  `staff_operators`. Nothing downstream of qualification has been exercised.
+- **That the sales lifecycle works.** `staff_operators` held zero rows and
+  `auth.users` zero users *at the time of this run*, so no handoff could be
+  qualified: both `qualified_by` and `pursuit_approved_by` are foreign keys
+  into `staff_operators`. Nothing downstream of qualification had been
+  exercised.
+
+  *(Superseded in part by run 18: one active owner now exists, so
+  qualification is possible. The tables are still empty, so it still has not
+  happened.)*
 
 ### Still outstanding after run 17
 
