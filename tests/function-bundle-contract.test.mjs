@@ -67,7 +67,15 @@ const ROOT = resolve(HERE, '..');
 const ENTRYPOINTS = [
   'api/assessments.mjs',
   'api/analytics.mjs',
-  'api/staff/identity-resolution/[...path].mjs'
+  'api/staff/identity-resolution/[...path].mjs',
+  /* The BI→Sales boundary. Both are plain paths rather than catch-alls:
+     each serves exactly one endpoint with no sub-paths, so neither needs
+     the bracket segment or the vercel.json rewrite the staff console
+     required. Their traced sets must still load standalone, which is what
+     catches an import into `server/` or `shared/` that the platform's file
+     tracer cannot follow. */
+  'api/sales/promote.mjs',
+  'api/webhooks/ghl.mjs'
 ];
 
 /* @supabase/supabase-js is imported DYNAMICALLY inside each handler's client

@@ -161,8 +161,10 @@ test('upgrade from a populated pre-0006 database', async t => {
       assert.equal(UPGRADE.applied.length, 5);
       assert.deepEqual(UPGRADE_APPLIED.map(a => a.file),
         ['0006_service_mix_review.sql', '0007_staff_identity_resolution.sql',
-         '0008_staff_migration_hardening.sql'],
-        'the upgrade path carries the staff-resolution migration and the hardening pass too');
+         '0008_staff_migration_hardening.sql', '0009_bi_sales_handoff_foundation.sql',
+         '0010_sales_handoff_fk_indexes.sql', '0011_promotion_business_serialization.sql'],
+        'the upgrade path carries the staff-resolution migration, the hardening pass, '
+        + 'and the whole BI-to-Sales chain');
       assert.equal(BEFORE.submissions.length, 3);
       assert.equal(BEFORE.reports.length, 3);
       assert.ok(BEFORE.timeline.length >= 12);

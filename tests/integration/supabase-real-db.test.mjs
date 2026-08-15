@@ -2651,9 +2651,14 @@ it('P9 — a context naming a record that holds nothing comparable still links',
      a record whose identifiers were redacted. */
   const businessId = id();
   created.businessIds.push(businessId);
+  /* `business_record`, not the legacy `lead_assessed` this fixture used to
+     carry. 0009 blocks NEW assignment of `lead_assessed` — it is ambiguous
+     legacy data, kept valid only for the rows that already hold it. The
+     lifecycle value was never this test's subject; a bare record with no
+     identifiers is. */
   const { error: seedError } = await db.from('business_records').insert({
     business_id: businessId, schema_version: 1, identity_status: 'linked',
-    display_name: `bare record ${RUN}`, vertical_id: 'nails', lifecycle_state: 'lead_assessed'
+    display_name: `bare record ${RUN}`, vertical_id: 'nails', lifecycle_state: 'business_record'
   });
   assert.equal(seedError, null);
 

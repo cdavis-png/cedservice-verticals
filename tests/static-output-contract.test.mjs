@@ -799,7 +799,7 @@ test('no API function is inside the static output', () => {
     'no server module of any kind is published');
 });
 
-test('the api/ tree is untouched by the build and still holds exactly three functions', () => {
+test('the api/ tree is untouched by the build and still holds exactly five functions', () => {
   const found = [];
   const walk = dir => {
     for (const entry of readdirSync(dir)) {
@@ -814,7 +814,9 @@ test('the api/ tree is untouched by the build and still holds exactly three func
   assert.deepEqual(found.sort(), [
     'api/analytics.mjs',
     'api/assessments.mjs',
-    'api/staff/identity-resolution/[...path].mjs'
+    'api/sales/promote.mjs',
+    'api/staff/identity-resolution/[...path].mjs',
+    'api/webhooks/ghl.mjs'
   ], 'the build did not move, copy or remove a function');
   assert.equal(found.filter(f => /staff/i.test(f)).length, 1, 'exactly one staff function');
 });
@@ -836,7 +838,9 @@ test('the vercel.json functions block still names exactly the intended entries',
      Both are kept: this one pins intent, that one pins reality. */
   assert.deepEqual(Object.keys(config.functions).sort(), [
     'api/assessments.mjs',
-    'api/staff/identity-resolution/*.mjs'
+    'api/sales/promote.mjs',
+    'api/staff/identity-resolution/*.mjs',
+    'api/webhooks/ghl.mjs'
   ]);
 });
 
