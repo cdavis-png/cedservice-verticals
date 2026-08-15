@@ -95,7 +95,19 @@
     staffPreAuth: 'staff_preauth:',
     staffSignIn: 'staff_signin:',
     staffSession: 'staff_session:',    /* refresh and sign-out: not credential attempts */
-    staff: 'staff:'
+    staff: 'staff:',
+    /* The sales surfaces. Separate namespaces so a burst of promotions
+       cannot eject an operator from the identity-resolution queue, and so a
+       CRM outage that makes callers retry the promotion route does not spend
+       the console's budget. Same reasoning as the staff split above: the
+       separation lives inside the keyed HMAC, never in the database's
+       `scope` column. */
+    salesPreAuth: 'sales_preauth:',
+    sales: 'sales:',
+    /* The webhook receiver is UNAUTHENTICATED by necessity — HighLevel holds
+       no operator session — so it is metered by address alone and gets its
+       own bucket rather than sharing one with a surface a person uses. */
+    crmWebhook: 'crm_webhook:'
   };
 
   /* Header order matters, and `x-vercel-forwarded-for` is FIRST deliberately.

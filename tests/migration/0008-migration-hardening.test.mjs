@@ -245,8 +245,15 @@ test('0008 repairs three defects that are observed to exist first', async t => {
 
   await t.test('0008 applies as an upgrade over a populated database', async () => {
     const applied = await env.upgrade('0007');
-    assert.deepEqual(applied.map(a => a.file), ['0008_staff_migration_hardening.sql'],
-      'exactly one migration remained to apply');
+    /* 0008 is no longer the tail of the chain. The BI-to-Sales migrations sit
+       behind it and come along on the same upgrade; this file's subject is
+       still 0008, and every assertion below is about what 0008 did. */
+    assert.deepEqual(applied.map(a => a.file), [
+      '0008_staff_migration_hardening.sql',
+      '0009_bi_sales_handoff_foundation.sql',
+      '0010_sales_handoff_fk_indexes.sql',
+      '0011_promotion_business_serialization.sql'
+    ], 'the migrations that remained to apply, 0008 first');
     assert.ok(applied[0].statements > 0);
   });
 
@@ -445,7 +452,10 @@ test('0008 repairs three defects that are observed to exist first', async t => {
         where tgrelid = 'public.business_intelligence_reports'::regclass
           and not tgisinternal order by 1`);
 
-    await env.upgrade('0007');
+    /* Bounded at 0008: this assertion is about 0008's own re-runnability, and
+       0009/0010 are reconciled records that are deliberately not re-runnable.
+       See CLAUDE.md §14. */
+    await env.upgrade('0007', '0008');
 
     const after = await q(
       `select p.proname, pg_get_function_identity_arguments(p.oid) as args,

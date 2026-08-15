@@ -10,6 +10,14 @@
     "api/staff/identity-resolution/*.mjs": {
       "maxDuration": 15,
       "memory": 512
+    },
+    "api/sales/promote.mjs": {
+      "maxDuration": 15,
+      "memory": 512
+    },
+    "api/webhooks/ghl.mjs": {
+      "maxDuration": 15,
+      "memory": 512
     }
   },
   "rewrites": [

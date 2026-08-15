@@ -1,7 +1,16 @@
 # Automation Policy
 
-**Status:** design only. No automation exists. Nothing here is connected to a
-payment processor, messaging provider, CRM, or scheduler.
+**Status:** design only, with one exception. Nothing here is connected to a
+payment processor, messaging provider, or scheduler.
+
+**A CRM boundary now exists in code** — `POST /api/sales/promote` and
+`POST /api/webhooks/ghl`, added with migrations 0009–0011. It is **not**
+automation in the sense this document governs: promotion is an explicit,
+authenticated, per-handoff call made by a staff operator, and creating an
+opportunity additionally requires a separate recorded pursuit approval. Nothing
+sweeps qualified handoffs and nothing promotes on a schedule or a trigger. See
+[BI_TO_SALES_OPERATIONS.md](BI_TO_SALES_OPERATIONS.md). Neither surface has
+been deployed.
 
 Governs what CIP may do without a human, what it must ask about first, and what
 it may never do at all. Where this document and an engine's goals disagree, this
@@ -78,6 +87,11 @@ A CED Service person approves before execution.
 - Acting on a BIR with `low` confidence or `stale`/`expired` data
 - Applying a Learning Engine calibration proposal
 - Any first-of-its-kind action in a new vertical
+- **Creating a CRM opportunity for a researched business.** Qualification is
+  not sufficient on its own: `sales_handoffs.pursuit_approved_by` and
+  `pursuit_approved_at` record a second, separate human decision, and both the
+  promotion boundary and the database refuse an opportunity link without it.
+  Linking a CRM *contact* is the lighter action and needs only qualification.
 
 ### 2.4 Prohibited
 

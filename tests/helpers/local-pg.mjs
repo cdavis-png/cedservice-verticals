@@ -459,11 +459,21 @@ export const startLocalPg = async ({ upTo = null, dataDir = null } = {}) => {
     applied,
     version,
     dataDir,
-    /* Applies the remaining migrations — the upgrade path. */
-    async upgrade(from) {
-      const remaining = migrationFiles().slice(
-        migrationFiles().findIndex(f => f.startsWith(from)) + 1);
-      return applyMigrations(pg, remaining);
+    /* Applies the remaining migrations — the upgrade path.
+       `upTo` bounds the window. It exists for the RE-RUNNABILITY tests: they
+       re-apply a range over an already-migrated cluster and assert nothing
+       changed, which requires every statement in that range to be re-runnable.
+       0009 and 0010 are deliberately NOT — they are reconciled records of SQL
+       that has already run, and rewriting them to add `if not exists` would
+       mean they no longer describe what ran (CLAUDE.md §14). Bounding the
+       window keeps that rule assertable for the migrations it applies to,
+       instead of dropping the assertion because two files are exempt. */
+    async upgrade(from, upTo = null) {
+      const all = migrationFiles();
+      const start = all.findIndex(f => f.startsWith(from)) + 1;
+      const end = upTo ? all.findIndex(f => f.startsWith(upTo)) + 1 : all.length;
+      if (upTo && end === 0) throw new Error(`local-pg: no migration matching "${upTo}"`);
+      return applyMigrations(pg, all.slice(start, end));
     },
     /* Disposable in the literal sense: the cluster is removed, not merely
        disconnected from. */

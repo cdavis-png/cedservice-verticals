@@ -272,7 +272,7 @@ test('server RPC permissions are explicit, and only service_role has them', asyn
         where n.nspname = 'public' and c.relkind = 'r'
           and c.relrowsecurity and c.relforcerowsecurity
         order by 1`)).map(r => r.relname);
-    assert.equal(tables.length, 16, 'RLS must be enabled AND forced on every table');
+    assert.equal(tables.length, 20, 'RLS must be enabled AND forced on every table');
 
     for (const table of tables) {
       const read = await asRole('anon', `select * from public.${table} limit 1`);

@@ -207,33 +207,55 @@ test('the implementation is NOT under api/, so it is not deployed a second time'
   assert.ok(existsSync(join(ROOT, 'server/staff-identity-resolution.mjs')),
     'it lives outside api/ instead');
 
-  /* THREE deployable filesystem functions, derived from the api/ tree. */
+  /* FIVE deployable filesystem functions, derived from the api/ tree. The
+     two sales routes hold the same shape for the same reason: their
+     implementations are in server/, so neither deploys a second time at a
+     bare path. */
   const deployable = listFunctions();
   assert.deepEqual(deployable.sort(), [
     'api/analytics.mjs',
     'api/assessments.mjs',
-    'api/staff/identity-resolution/[...path].mjs'
-  ], 'exactly three functions deploy');
+    'api/sales/promote.mjs',
+    'api/staff/identity-resolution/[...path].mjs',
+    'api/webhooks/ghl.mjs'
+  ], 'exactly five functions deploy');
+
+  assert.equal(existsSync(join(ROOT, 'api/sales-promotion.mjs')), false,
+    'the promotion implementation must not sit in the routing surface');
+  assert.ok(existsSync(join(ROOT, 'server/sales-promotion.mjs')),
+    'it lives outside api/ instead');
+  assert.equal(existsSync(join(ROOT, 'api/crm-webhook.mjs')), false,
+    'the webhook implementation must not sit in the routing surface');
+  assert.ok(existsSync(join(ROOT, 'server/crm-webhook.mjs')),
+    'it lives outside api/ instead');
 
   const staff = deployable.filter(f => /staff/i.test(f));
   assert.equal(staff.length, 1, 'one staff function, not two');
   assert.deepEqual(staff, ['api/staff/identity-resolution/[...path].mjs']);
 });
 
-test('three deployable functions, two configured — the counts are different on purpose', () => {
+test('five deployable functions, four configured — the counts are different on purpose', () => {
   /* Pinned because an earlier report described "three functions" and a later
-     one "two", and both were right about different things. The staff route
-     performs a permanent attachment and shares the public route's database
-     timeout, so its budget is stated rather than inherited; api/analytics.mjs
-     is deliberately left on platform defaults. */
+     one "two", and both were right about different things. A route that
+     performs a permanent attachment or writes to an external CRM states its
+     budget rather than inheriting one; api/analytics.mjs is deliberately left
+     on platform defaults.
+
+     The two sales routes joined this list with 0009–0011. Both make outbound
+     calls to GHL, so both need a stated budget for the same reason the staff
+     route does: an unbounded invocation that reaches the platform ceiling
+     answers 504 with no body, and the promotion route must be able to release
+     its own idempotency claim before that happens. */
   const deployable = listFunctions();
   const configured = Object.keys(config.functions || {}).sort();
 
-  assert.equal(deployable.length, 3, 'three deployable filesystem functions');
+  assert.equal(deployable.length, 5, 'five deployable filesystem functions');
   assert.deepEqual(configured, [
     'api/assessments.mjs',
-    'api/staff/identity-resolution/*.mjs'
-  ], 'two entries in the vercel.json functions block');
+    'api/sales/promote.mjs',
+    'api/staff/identity-resolution/*.mjs',
+    'api/webhooks/ghl.mjs'
+  ], 'four entries in the vercel.json functions block');
 
   /* THE KEYS ARE GLOBS, so they are resolved against the real functions
      rather than compared as paths. Treating them as paths is what let the

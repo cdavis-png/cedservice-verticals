@@ -1,0 +1,776 @@
+/* ============================================================
+   CED Intelligence Platform — the Promote to Sales boundary
+   ------------------------------------------------------------
+   POST /api/sales/promote
+
+   THE ONE PLACE A BUSINESS RECORD BECOMES A CRM CONTACT, and
+   conditionally an opportunity. Nothing else in this repository
+   writes to GHL, and no database trigger does either — a trigger
+   that called an external API would make a CRM outage into a
+   failed transaction, and would put a network call inside a lock.
+
+   ------------------------------------------------------------
+   WHY A VERCEL FUNCTION AND NOT A SUPABASE EDGE FUNCTION.
+
+   This was inspected rather than assumed. The repository has
+   three server surfaces — api/assessments.mjs, api/analytics.mjs
+   and api/staff/identity-resolution/[...path].mjs — all Vercel
+   Node functions, all reading their secrets from the Vercel
+   Function environment, all resolving the elevated key through
+   shared/security/supabase-keys.js. The project has ZERO Supabase
+   Edge Functions deployed. §12 already settled the shape for an
+   authenticated route: an `api/` entrypoint whose only job is
+   platform adaptation, and the implementation in `server/`,
+   outside the api/ tree, because Vercel deploys every file under
+   api/ as its own function.
+
+   An Edge Function would be a SECOND deployment architecture — a
+   second place secrets live, a second build and release path, a
+   second runtime with a different fetch and crypto surface, and a
+   second answer to "where does authorization happen". CLAUDE.md
+   forbids that without justification and there is none: this route
+   needs the elevated key, the operator guard and the origin
+   allowlist, and all three already exist here.
+
+   ------------------------------------------------------------
+   WHAT THIS ROUTE REFUSES TO DECIDE.
+
+   Qualification and approval-to-pursue are human decisions taken
+   before this route runs. It reads them; it never makes them.
+   Specifically it will not create an opportunity because the
+   evidence looks good, because the caller asked nicely, or
+   because a handoff is qualified — qualification alone is
+   explicitly insufficient, and `pursuit_approved_at` is the
+   separate decision that permits it.
+   ============================================================ */
+
+import { randomUUID, createHash, createHmac } from 'node:crypto';
+import rateLimit from '../shared/security/rate-limit.js';
+import bodyReader from '../shared/security/read-body.js';
+import originPolicy from '../shared/security/origin.js';
+import {
+  OperatorError, operatorFail, getServiceClient, bearerToken, verifyAccessToken,
+  assertActiveOperator, jsonResponse, makeLogger, classifySalesDbError, insecureAllowed
+} from './operator-session.mjs';
+import {
+  resolveGhlConfig, createGhlClient, opportunityName, GhlApiError, GhlConfigError,
+  CED_LEAD_TAG, CED_SOURCE_BI_RESEARCH_TAG
+} from './ghl-client.mjs';
+
+const {
+  buildRateLimitKeys, staffRateLimitPolicy, NAMESPACES, readAddress, isUsableAddress
+} = rateLimit;
+const { readBoundedBody, parseJsonSafely, OUTCOME: BODY } = bodyReader;
+const { configuredOrigins, isAllowedOrigin } = originPolicy;
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const MAX_BODY_BYTES = 4096;
+const MAX_IDEMPOTENCY_KEY = 200;
+const RATE_LIMIT_UNAVAILABLE_RETRY_SECONDS = 5;
+const PROMOTION_IN_PROGRESS_RETRY_SECONDS = 3;
+
+const hmac = (secret, input) => createHmac('sha256', secret).update(input).digest('hex');
+const sha256 = value => createHash('sha256').update(value).digest('hex');
+
+const SAFE_FETCH_SITES = new Set(['same-origin', 'none']);
+
+/* ------------------------------------------------------------
+   Provenance — proved before anything is spent
+   ------------------------------------------------------------
+   Method-sensitive for exactly the reason §12 records: a same-origin GET
+   carries no Origin at all, because the Fetch standard only appends one
+   when tainting is `cors` or the method is neither GET nor HEAD. This
+   route serves one unsafe method, so an exact Origin is always required
+   — but the shape is kept identical to the staff route so the two cannot
+   drift into disagreeing about what a browser sends. */
+/* Its own named variable, not the verticals' list and not the console's.
+   §12's reasoning applies unchanged: a marketing vertical has no business
+   calling this endpoint, and sharing a list would silently widen it every
+   time a vertical launched. Unset, the allowlist is the request's OWN
+   origin — correct with no configuration for a console served beside the
+   route it calls. */
+const salesOrigins = (env, url, request) => {
+  const configured = configuredOrigins(env, 'CED_SALES_ALLOWED_ORIGINS');
+  if (configured.length) return configured;
+  const configuredStaff = configuredOrigins(env, 'CED_STAFF_ALLOWED_ORIGINS');
+  if (configuredStaff.length) return configuredStaff;
+  const proto = request.headers.get('x-forwarded-proto') || url.protocol.replace(':', '');
+  return [`${proto}://${url.host}`];
+};
+
+const assertOrigin = (request, env, url) => {
+  const origin = request.headers.get('origin');
+  const method = String(request.method || '').toUpperCase();
+  const allowed = salesOrigins(env, url, request);
+
+  if (origin) {
+    if (!isAllowedOrigin(origin, allowed)) {
+      operatorFail(403, 'origin_not_allowed', 'This origin may not call this endpoint.');
+    }
+    return;
+  }
+  if (method === 'GET' || method === 'HEAD') {
+    const site = request.headers.get('sec-fetch-site');
+    if (!site || !SAFE_FETCH_SITES.has(site)) {
+      operatorFail(403, 'origin_required', 'This request could not be attributed to an allowed origin.');
+    }
+    return;
+  }
+  /* `same-site` is never accepted, here as there: it means any host under
+     the same registrable domain, and this route must not inherit trust
+     from whatever else is hosted beside it. */
+  operatorFail(403, 'origin_required', 'An Origin header is required.');
+};
+
+const assertJsonContentType = request => {
+  const raw = request.headers.get('content-type') || '';
+  const type = raw.split(';')[0].trim().toLowerCase();
+  if (type !== 'application/json') {
+    operatorFail(415, 'unsupported_media_type', 'This endpoint accepts application/json.');
+  }
+};
+
+/* ------------------------------------------------------------
+   The request hash
+   ------------------------------------------------------------
+   The idempotency contract: the same key with the same inputs is a
+   retry; the same key with DIFFERENT inputs is a mistake, and must be
+   refused rather than handed the first call's outcome.
+
+   The OPERATOR is part of the decision, following the precedent the
+   staff route set for the same reason — a promotion is attributed to a
+   person, and a second operator reusing the first one's key must not be
+   told they performed it.
+
+   `createOpportunity` is in the hash because it changes what the call
+   DOES. A retry that flips it from false to true is a request to create
+   an opportunity, not a repeat of a request that only linked a contact.
+
+   THE DELIMITER IS `\0`, WRITTEN AS AN ESCAPE. A separator that cannot occur
+   inside any of the values is what stops two different requests hashing the
+   same — no UUID, and neither '0' nor '1', can contain a NUL. It must be the
+   two-character escape and never a literal control byte in the source: a
+   literal one makes git classify this whole file as BINARY, which is how it
+   was first written here and why the diff was unreviewable. */
+const requestHash = ({ handoffId, businessId, operatorUserId, createOpportunity }) =>
+  sha256([
+    'v1', handoffId, businessId, operatorUserId, createOpportunity ? '1' : '0'
+  ].join('\0'));
+
+/* ------------------------------------------------------------
+   Timeline append
+   ------------------------------------------------------------
+   Append-only and idempotent through `timeline_events_idempotency`, the
+   unique index on (event_name, idempotency_key). A repeated append for
+   the same real-world fact is silently absorbed rather than duplicated.
+
+   THE PAYLOAD CARRIES NO CONTACT DATA. §9 is unambiguous: timeline and
+   audit payloads must never carry contact data, because both tables
+   refuse UPDATE and anything personal that reaches them can never be
+   redacted. So this writes identifiers and keys — never a name, email,
+   phone or address, and never the CRM's echo of one. */
+const appendTimelineEvent = async (db, {
+  businessId, eventName, idempotencyKey, summary, payload,
+  occurredAt, correlationId, sourceRecordId = null
+}) => {
+  const occurred = occurredAt || new Date().toISOString();
+  /* `timeline_recorded_after_occurred` requires recorded_at >= occurred_at.
+     An external timestamp can be slightly ahead of our clock, so recorded_at
+     is the later of the two rather than a bare now() that would fail the
+     check on ordinary skew. occurred_at stays truthful either way. */
+  const recorded = new Date(Math.max(Date.now(), Date.parse(occurred) || 0)).toISOString();
+
+  const { error } = await db
+    .from('timeline_events')
+    .upsert({
+      business_id: businessId,
+      event_name: eventName,
+      event_version: 1,
+      occurred_at: occurred,
+      recorded_at: recorded,
+      producer: 'sales-promotion',
+      source_system: 'ced',
+      source_record_id: sourceRecordId,
+      correlation_id: correlationId,
+      idempotency_key: idempotencyKey,
+      summary,
+      payload
+    }, { onConflict: 'event_name,idempotency_key', ignoreDuplicates: true });
+
+  return error || null;
+};
+
+/* ============================================================
+   The handler
+   ============================================================ */
+export async function handleRequest(request, deps = {}) {
+  const env = deps.env || process.env;
+  const correlationId = deps.correlationId || (deps.randomUUID || randomUUID)();
+  const log = makeLogger(env, correlationId);
+
+  /* Set once the ledger row is claimed, so the failure path knows there is
+     something to release. A promotion left `processing` would wedge every
+     later promotion for that business behind the new partial unique index. */
+  let claimedRequestId = null;
+  let db = null;
+
+  const releaseClaim = async (errorCode) => {
+    if (!claimedRequestId || !db) return;
+    try {
+      await db.from('sales_promotion_requests')
+        .update({ status: 'failed', error_code: String(errorCode).slice(0, 100), completed_at: new Date().toISOString() })
+        .eq('promotion_request_id', claimedRequestId)
+        .eq('status', 'processing');
+    } catch (releaseError) {
+      /* Logged and swallowed: the caller's real error must survive, and a
+         stuck row is recoverable by a human where a masked error is not. */
+      log('error', 'promotion_claim_release_failed', { promotionRequestId: claimedRequestId });
+    }
+  };
+
+  try {
+    const url = new URL(request.url);
+    const path = url.pathname.replace(/\/+$/, '');
+
+    const proto = request.headers.get('x-forwarded-proto') || url.protocol.replace(':', '');
+    if (proto !== 'https' && !insecureAllowed(env, url, 'CED_ALLOW_INSECURE_SALES')) {
+      operatorFail(403, 'https_required', 'This endpoint requires HTTPS.');
+    }
+
+    /* 1. provenance, before the limiter, the body, or any credential. */
+    assertOrigin(request, env, url);
+
+    if (!/\/promote$/.test(path)) {
+      return jsonResponse(404, { ok: false, code: 'not_found', message: 'No such endpoint.' }, correlationId);
+    }
+    if (String(request.method || '').toUpperCase() !== 'POST') {
+      return jsonResponse(405, { ok: false, code: 'method_not_allowed', message: 'This endpoint accepts POST.' },
+        correlationId, { Allow: 'POST' });
+    }
+    assertJsonContentType(request);
+
+    /* 2. rate limiting — pre-authentication, keyed on address only. */
+    /* Assigns `db` in BOTH branches. An earlier version returned `deps.db`
+       without assigning it, so with an injected client the outer `db` stayed
+       null and `releaseClaim` — which guards on it — silently did nothing.
+       A claim left `processing` wedges every later promotion for that
+       business behind the partial unique index, so the failure path is
+       exactly the one that must not depend on how the client was obtained. */
+    const database = async () => {
+      if (!db) db = deps.db || await getServiceClient(env);
+      return db;
+    };
+
+    const limitPass = async ({ namespace, sessionId, includeSession, event }) => {
+      const secret = env.CED_RATE_LIMIT_SECRET || '';
+      if (!secret.trim()) {
+        log('error', 'promotion_rate_limit_unavailable', { pass: event, reason: 'no_secret' });
+        return jsonResponse(503, { ok: false, code: 'rate_limit_unavailable', message: 'Requests cannot be processed right now.' },
+          correlationId, { 'Retry-After': String(RATE_LIMIT_UNAVAILABLE_RETRY_SECONDS) });
+      }
+      const address = readAddress(request.headers);
+      if (!isUsableAddress(address)) {
+        log('warn', 'promotion_rate_limit_unavailable', { pass: event, reason: 'no_address' });
+        return jsonResponse(503, { ok: false, code: 'rate_limit_unavailable', message: 'Requests cannot be processed right now.' },
+          correlationId, { 'Retry-After': String(RATE_LIMIT_UNAVAILABLE_RETRY_SECONDS) });
+      }
+      const keys = buildRateLimitKeys({
+        headers: request.headers, sessionId, env, hmacFn: hmac, namespace, includeSession
+      });
+      const policy = staffRateLimitPolicy(env);
+      const client = await database();
+      for (const { scope, key } of keys) {
+        const { data, error } = await client.rpc('check_rate_limit', {
+          p_scope: scope, p_key: key,
+          p_window_seconds: policy.window, p_max_requests: policy.max
+        });
+        if (error) {
+          log('error', 'promotion_rate_limit_unavailable', { pass: event, reason: 'rpc_error' });
+          return jsonResponse(503, { ok: false, code: 'rate_limit_unavailable', message: 'Requests cannot be processed right now.' },
+            correlationId, { 'Retry-After': String(RATE_LIMIT_UNAVAILABLE_RETRY_SECONDS) });
+        }
+        const row = Array.isArray(data) ? data[0] : data;
+        if (row && row.allowed === false) {
+          log('warn', event, { scope });
+          return jsonResponse(429, { ok: false, code: 'rate_limited', message: 'Too many requests.' },
+            correlationId, { 'Retry-After': String(row.retry_after_seconds || 60) });
+        }
+      }
+      return null;
+    };
+
+    const preAuthRefusal = await limitPass({
+      namespace: NAMESPACES.salesPreAuth, sessionId: null, includeSession: false,
+      event: 'promotion_rate_limited_preauth'
+    });
+    if (preAuthRefusal) return preAuthRefusal;
+
+    /* 3. authenticate. */
+    const token = bearerToken(request);
+    if (!token) {
+      operatorFail(401, 'authentication_required', 'A bearer access token is required.');
+    }
+    const verify = deps.verifyAccessToken || verifyAccessToken;
+    const session = await verify(token, env, deps);
+    if (!session) {
+      operatorFail(401, 'invalid_token', 'The access token is not valid.');
+    }
+    /* AAL2 is confirmed from the verified token, never assumed. */
+    const aal = session.aal || 'aal1';
+
+    const authedRefusal = await limitPass({
+      namespace: NAMESPACES.sales, sessionId: session.userId, includeSession: true,
+      event: 'promotion_rate_limited'
+    });
+    if (authedRefusal) return authedRefusal;
+
+    const client = await database();
+
+    /* 4. authorize — the live lookup, before any privileged read. [req 1] */
+    const guardError = await assertActiveOperator(client, session.userId, aal);
+    if (guardError) {
+      const [status, code, message] = classifySalesDbError(guardError);
+      log('warn', 'promotion_authorization_refused', { operatorUserId: session.userId, code });
+      return jsonResponse(status, { ok: false, code, message }, correlationId);
+    }
+
+    /* 5. read the request. */
+    const bodyResult = await readBoundedBody(request, MAX_BODY_BYTES);
+    if (bodyResult.outcome === BODY.tooLarge) {
+      operatorFail(413, 'body_too_large', 'The request body is too large.');
+    }
+    if (bodyResult.outcome !== BODY.ok) {
+      operatorFail(400, 'invalid_body', 'The request body could not be read.');
+    }
+    const parsed = parseJsonSafely(bodyResult.text);
+    const body = parsed.ok ? parsed.value : null;
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      operatorFail(400, 'invalid_body', 'The request body must be a JSON object.');
+    }
+
+    const handoffId = String(body.handoffId ?? '').trim();
+    if (!UUID_RE.test(handoffId)) {
+      operatorFail(400, 'invalid_handoff_id', 'A valid handoffId is required.');
+    }
+    const createOpportunity = body.createOpportunity === true;
+
+    const idempotencyKey = String(request.headers.get('idempotency-key') ?? '').trim();
+    if (!idempotencyKey || idempotencyKey.length > MAX_IDEMPOTENCY_KEY) {
+      operatorFail(400, 'idempotency_key_required', 'An Idempotency-Key header is required.');
+    }
+
+    /* 6. load the handoff. [req 3] */
+    const { data: handoff, error: handoffError } = await client
+      .from('sales_handoffs')
+      .select('handoff_id, business_id, need_key, need_summary, offer_key, qualification_status, pursuit_approved_at')
+      .eq('handoff_id', handoffId)
+      .maybeSingle();
+    if (handoffError) {
+      const [status, code, message] = classifySalesDbError(handoffError);
+      return jsonResponse(status, { ok: false, code, message }, correlationId);
+    }
+    if (!handoff) {
+      operatorFail(404, 'unknown_handoff', 'No such sales handoff.');
+    }
+
+    /* A handoff that is not qualified may not be promoted at all — not as a
+       contact and not as an opportunity. `deferred` and `withdrawn` are
+       decisions to NOT pursue, and `not_qualified` is a decision against. */
+    if (handoff.qualification_status !== 'qualified') {
+      operatorFail(422, 'handoff_not_qualified',
+        `This handoff is ${handoff.qualification_status} and cannot be promoted.`);
+    }
+
+    /* 7. resolve the Business Record. [req 2] */
+    const { data: businessRecord, error: businessError } = await client
+      .from('business_records')
+      .select('business_id, display_name, lifecycle_state')
+      .eq('business_id', handoff.business_id)
+      .maybeSingle();
+    if (businessError) {
+      const [status, code, message] = classifySalesDbError(businessError);
+      return jsonResponse(status, { ok: false, code, message }, correlationId);
+    }
+    if (!businessRecord) {
+      operatorFail(404, 'unknown_business', 'The handoff references a Business Record that does not exist.');
+    }
+
+    /* GHL configuration is resolved BEFORE the claim, so a misconfigured
+       deployment refuses without leaving a ledger row behind. */
+    let ghlConfig;
+    try {
+      ghlConfig = resolveGhlConfig(env);
+    } catch (configError) {
+      log('error', 'promotion_crm_unconfigured', { reason: String(configError.message) });
+      operatorFail(503, 'crm_unconfigured', 'The CRM integration is not configured.');
+    }
+    const ghl = deps.ghl || createGhlClient(ghlConfig, deps.ghlOptions || {});
+    const accountKey = ghlConfig.locationId;
+
+    const hash = requestHash({
+      handoffId, businessId: handoff.business_id,
+      operatorUserId: session.userId, createOpportunity
+    });
+
+    /* 8. claim the idempotency request. [req 4] */
+    const { data: claimed, error: claimError } = await client
+      .from('sales_promotion_requests')
+      .insert({
+        idempotency_key: idempotencyKey,
+        handoff_id: handoffId,
+        business_id: handoff.business_id,
+        request_hash: hash,
+        create_opportunity: createOpportunity,
+        status: 'processing'
+      })
+      .select('promotion_request_id')
+      .maybeSingle();
+
+    if (claimError) {
+      const conflict = String(claimError.code || '') === '23505';
+      if (!conflict) {
+        const [status, code, message] = classifySalesDbError(claimError);
+        return jsonResponse(status, { ok: false, code, message }, correlationId);
+      }
+
+      const detail = String(claimError.message || '');
+
+      /* A business-level or handoff-level conflict is another promotion in
+         flight. It is RETRYABLE and says so: by the time the caller retries,
+         the first will have completed and the contact link will exist, so
+         the retry resolves rather than creates. This is the serialization
+         0011 exists to provide. */
+      if (detail.includes('one_business_processing') || detail.includes('one_processing')) {
+        const [status, code, message] = classifySalesDbError(claimError);
+        log('info', 'promotion_serialized', { businessId: handoff.business_id, code });
+        return jsonResponse(status, { ok: false, code, message }, correlationId,
+          { 'Retry-After': String(PROMOTION_IN_PROGRESS_RETRY_SECONDS) });
+      }
+
+      /* Otherwise the idempotency key itself is in use. Read the row it
+         collided with and answer according to what that call did. */
+      const { data: existing } = await client
+        .from('sales_promotion_requests')
+        .select('promotion_request_id, request_hash, status, response_body, error_code')
+        .eq('idempotency_key', idempotencyKey)
+        .maybeSingle();
+
+      if (!existing) {
+        /* The row vanished between the insert and the read — it can only
+           have been a concurrent caller. Retryable. */
+        return jsonResponse(409, { ok: false, code: 'promotion_in_progress', message: 'A promotion is already in progress.' },
+          correlationId, { 'Retry-After': String(PROMOTION_IN_PROGRESS_RETRY_SECONDS) });
+      }
+
+      /* Same key, different request. Refused — never answered with the
+         first call's outcome. */
+      if (existing.request_hash !== hash) {
+        log('warn', 'promotion_idempotency_conflict', { idempotencyKeyKnown: true });
+        return jsonResponse(409, {
+          ok: false, code: 'idempotency_conflict',
+          message: 'This Idempotency-Key was used for a different request.'
+        }, correlationId);
+      }
+
+      /* Same key, same request. [req 19] */
+      if (existing.status === 'completed') {
+        log('info', 'promotion_replayed', { promotionRequestId: existing.promotion_request_id });
+        return jsonResponse(200, { ...(existing.response_body || {}), replayed: true }, correlationId);
+      }
+      if (existing.status === 'processing') {
+        return jsonResponse(409, { ok: false, code: 'promotion_in_progress', message: 'This promotion is still in progress.' },
+          correlationId, { 'Retry-After': String(PROMOTION_IN_PROGRESS_RETRY_SECONDS) });
+      }
+      /* `failed`. The recorded failure is returned rather than retried
+         silently under the same key: a retry is a new decision and takes a
+         new key, which is what makes partial-failure recovery observable. */
+      return jsonResponse(409, {
+        ok: false, code: 'promotion_failed_previously',
+        message: 'This Idempotency-Key recorded a failure. Retry with a new key.',
+        errorCode: existing.error_code || null
+      }, correlationId);
+    }
+
+    claimedRequestId = claimed?.promotion_request_id || null;
+
+    /* ---------- 9. resolve the contact ---------- */
+
+    /* [req 5] An existing active link is authoritative and is consulted
+       before GHL is asked anything. */
+    const { data: existingContactLink } = await client
+      .from('external_record_links')
+      .select('link_id, external_record_id')
+      .eq('business_id', handoff.business_id)
+      .eq('external_system', 'ghl')
+      .eq('external_account_key', accountKey)
+      .eq('record_type', 'contact')
+      .eq('is_active', true)
+      .maybeSingle();
+
+    let contactId = existingContactLink?.external_record_id || null;
+    let contactCreated = false;
+    let contactAdopted = false;
+
+    if (!contactId) {
+      /* [req 6] Search before creating. This is what recovers a contact
+         whose link was lost — after a partial failure, a restore, or a row
+         removed by hand. Without it, the recovery path creates a duplicate. */
+      const found = await ghl.findContactByBusinessId(handoff.business_id);
+      if (found?.id) {
+        contactId = found.id;
+        contactAdopted = true;
+      }
+    }
+
+    const leadFocus = handoff.offer_key
+      ? `${handoff.need_key} / ${handoff.offer_key}`
+      : handoff.need_key;
+
+    /* [req 8][req 9][req 10] The fields every BI-sourced contact carries.
+       Custom fields are addressed by ID, never by fieldKey — a key can be
+       renamed in the CRM UI and an ID cannot. */
+    const contactFields = {
+      customFields: [
+        { id: ghlConfig.businessIdFieldId, value: handoff.business_id },
+        { id: ghlConfig.leadFocusFieldId, value: leadFocus }
+      ],
+      tags: [CED_LEAD_TAG, CED_SOURCE_BI_RESEARCH_TAG]
+    };
+
+    if (!contactId) {
+      /* [req 7] Exactly one intended contact.
+
+         NO NAME, EMAIL OR PHONE IS INVENTED HERE. The contact is created
+         with the Business Record's own display name and nothing else. A
+         placeholder email or phone would be fabricated identity data in a
+         CRM that deduplicates on exactly those fields — it would defeat
+         GHL's own matching and attach a real business to a value nobody
+         can verify. */
+      const created = await ghl.createContact({
+        name: businessRecord.display_name,
+        companyName: businessRecord.display_name,
+        ...contactFields
+      });
+      if (!created?.id) {
+        throw new GhlApiError(502, 'crm_contact_not_created', 'The CRM did not return a contact.', null);
+      }
+      contactId = created.id;
+      contactCreated = true;
+    } else {
+      /* Adopted or already linked: bring the CED fields up to date without
+         touching anything the CRM owns. */
+      await ghl.updateContact(contactId, contactFields);
+    }
+
+    /* [req 11] Persist the link. Idempotent: a link that already exists for
+       this exact external record is left alone rather than duplicated. */
+    if (!existingContactLink) {
+      const { error: linkError } = await client
+        .from('external_record_links')
+        .insert({
+          business_id: handoff.business_id,
+          external_system: 'ghl',
+          external_account_key: accountKey,
+          record_type: 'contact',
+          external_record_id: contactId,
+          is_active: true
+        });
+      if (linkError && String(linkError.code) !== '23505') {
+        const [status, code, message] = classifySalesDbError(linkError);
+        await releaseClaim(code);
+        return jsonResponse(status, { ok: false, code, message }, correlationId);
+      }
+    }
+
+    /* [req 12] */
+    const contactEventError = await appendTimelineEvent(client, {
+      businessId: handoff.business_id,
+      eventName: 'crm.contact_linked',
+      idempotencyKey: `contact:${handoff.business_id}:${contactId}`,
+      summary: 'CRM contact linked to this Business Record.',
+      payload: {
+        externalSystem: 'ghl',
+        externalAccountKey: accountKey,
+        externalRecordId: contactId,
+        handoffId,
+        needKey: handoff.need_key,
+        offerKey: handoff.offer_key,
+        origin: contactCreated ? 'created' : (contactAdopted ? 'adopted' : 'existing')
+      },
+      correlationId,
+      sourceRecordId: contactId
+    });
+    if (contactEventError) {
+      const [status, code, message] = classifySalesDbError(contactEventError);
+      await releaseClaim(code);
+      return jsonResponse(status, { ok: false, code, message }, correlationId);
+    }
+
+    /* ---------- 10. the opportunity, only if permitted ---------- */
+
+    let opportunityId = null;
+    let opportunityCreated = false;
+    let opportunitySkippedReason = null;
+
+    if (!createOpportunity) {
+      opportunitySkippedReason = 'not_requested';
+    } else if (!handoff.pursuit_approved_at) {
+      /* [req 13] Qualification is NOT sufficient. This is the separate human
+         decision, and the route refuses rather than inferring it. The
+         database would refuse the link too; refusing here means no CRM
+         opportunity is created that the link then rejects. */
+      opportunitySkippedReason = 'pursuit_not_approved';
+    } else {
+      const { data: existingOppLink } = await client
+        .from('external_record_links')
+        .select('link_id, external_record_id')
+        .eq('handoff_id', handoffId)
+        .eq('record_type', 'opportunity')
+        .eq('is_active', true)
+        .maybeSingle();
+
+      if (existingOppLink) {
+        opportunityId = existingOppLink.external_record_id;
+        opportunitySkippedReason = 'already_linked';
+      } else {
+        /* [req 14] Search before creating, so a lost link does not become a
+           second open opportunity. [req 15] The rule is one OPEN opportunity
+           per canonical business + need + offer, and the name is how that is
+           recognised in the CRM — the handoff's uniqueness index guarantees
+           the triple is unique, so the name derived from it is too. */
+        const desiredName = opportunityName(businessRecord.display_name, handoff.need_summary);
+        const open = (await ghl.findOpportunitiesByContact(contactId))
+          .filter(o => String(o?.status || '').toLowerCase() === 'open');
+        const match = open.find(o => String(o?.name || '').trim() === desiredName);
+
+        if (match?.id) {
+          opportunityId = match.id;
+          opportunitySkippedReason = 'existing_open_opportunity';
+        } else {
+          /* [req 16] Researched outbound starts in `Qualified — Not
+             Contacted`. Inbound entry into `New Inquiry` belongs to GHL's
+             own workflows and is not touched from here. */
+          const created = await ghl.createOpportunity({
+            contactId,
+            name: desiredName,
+            stageId: ghlConfig.qualifiedNotContactedStageId
+          });
+          if (!created?.id) {
+            throw new GhlApiError(502, 'crm_opportunity_not_created', 'The CRM did not return an opportunity.', null);
+          }
+          opportunityId = created.id;
+          opportunityCreated = true;
+        }
+
+        /* [req 17] The database refuses this link unless the handoff is
+           qualified AND pursuit-approved, and unless the business matches —
+           a second, independent check of what this route already decided. */
+        const { error: oppLinkError } = await client
+          .from('external_record_links')
+          .insert({
+            business_id: handoff.business_id,
+            external_system: 'ghl',
+            external_account_key: accountKey,
+            record_type: 'opportunity',
+            external_record_id: opportunityId,
+            handoff_id: handoffId,
+            is_active: true
+          });
+        if (oppLinkError && String(oppLinkError.code) !== '23505') {
+          const [status, code, message] = classifySalesDbError(oppLinkError);
+          await releaseClaim(code);
+          return jsonResponse(status, { ok: false, code, message }, correlationId);
+        }
+
+        /* [req 18] */
+        const oppEventError = await appendTimelineEvent(client, {
+          businessId: handoff.business_id,
+          eventName: 'sales.opportunity_created',
+          idempotencyKey: `opportunity:${handoffId}:${opportunityId}`,
+          summary: 'CRM opportunity created for an approved sales handoff.',
+          payload: {
+            externalSystem: 'ghl',
+            externalAccountKey: accountKey,
+            externalRecordId: opportunityId,
+            handoffId,
+            needKey: handoff.need_key,
+            offerKey: handoff.offer_key,
+            pipelineId: ghlConfig.pipelineId,
+            stageId: ghlConfig.qualifiedNotContactedStageId,
+            origin: opportunityCreated ? 'created' : 'existing'
+          },
+          correlationId,
+          sourceRecordId: opportunityId
+        });
+        if (oppEventError) {
+          const [status, code, message] = classifySalesDbError(oppEventError);
+          await releaseClaim(code);
+          return jsonResponse(status, { ok: false, code, message }, correlationId);
+        }
+      }
+    }
+
+    /* ---------- 11. complete, replay-safely ---------- [req 19] */
+    const responseBody = {
+      ok: true,
+      businessId: handoff.business_id,
+      handoffId,
+      contact: {
+        externalRecordId: contactId,
+        created: contactCreated,
+        adopted: contactAdopted
+      },
+      opportunity: opportunityId
+        ? { externalRecordId: opportunityId, created: opportunityCreated }
+        : null,
+      opportunitySkippedReason
+    };
+
+    const { error: completeError } = await client
+      .from('sales_promotion_requests')
+      .update({
+        status: 'completed',
+        response_body: responseBody,
+        completed_at: new Date().toISOString()
+      })
+      .eq('promotion_request_id', claimedRequestId);
+
+    if (completeError) {
+      /* The work happened; only the record of it failed. Say so rather than
+         reporting a failure that would invite a retry which then finds the
+         contact already linked and reports something different again. */
+      log('error', 'promotion_completion_not_recorded', { promotionRequestId: claimedRequestId });
+      return jsonResponse(500, {
+        ok: false, code: 'completion_not_recorded',
+        message: 'The promotion succeeded but its record could not be completed. Do not retry; reconcile manually.'
+      }, correlationId);
+    }
+
+    claimedRequestId = null;
+    log('info', 'promotion_completed', {
+      businessId: handoff.business_id, handoffId,
+      contactCreated, opportunityCreated
+    });
+    return jsonResponse(200, { ...responseBody, replayed: false }, correlationId);
+
+  } catch (error) {
+    if (error instanceof OperatorError) {
+      await releaseClaim(error.code);
+      return jsonResponse(error.status, { ok: false, code: error.code, message: error.message }, correlationId);
+    }
+    if (error instanceof GhlApiError) {
+      await releaseClaim(error.code);
+      log('error', 'promotion_crm_error', { code: error.code, detail: error.detail });
+      return jsonResponse(error.status, { ok: false, code: error.code, message: error.message }, correlationId);
+    }
+    if (error instanceof GhlConfigError) {
+      await releaseClaim('crm_unconfigured');
+      return jsonResponse(503, { ok: false, code: 'crm_unconfigured', message: 'The CRM integration is not configured.' }, correlationId);
+    }
+    await releaseClaim('unhandled_error');
+    log('error', 'promotion_unhandled', { message: String(error?.message || error).slice(0, 300) });
+    return jsonResponse(500, { ok: false, code: 'internal_error', message: 'The request could not be completed.' }, correlationId);
+  }
+}
+
+export const __testing = { requestHash, appendTimelineEvent, assertOrigin };
