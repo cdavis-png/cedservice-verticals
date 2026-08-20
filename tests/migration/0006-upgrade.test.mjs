@@ -161,7 +161,7 @@ test('upgrade from a populated pre-0006 database', async t => {
       assert.equal(UPGRADE.applied.length, 5);
       assert.deepEqual(UPGRADE_APPLIED.map(a => a.file),
         ['0006_service_mix_review.sql', '0007_staff_identity_resolution.sql',
-         '0008_staff_migration_hardening.sql'],
+         '0008_staff_migration_hardening.sql', '0009_aeo_evidence_store.sql'],
         'the upgrade path carries the staff-resolution migration and the hardening pass too');
       assert.equal(BEFORE.submissions.length, 3);
       assert.equal(BEFORE.reports.length, 3);

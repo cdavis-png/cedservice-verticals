@@ -459,11 +459,17 @@ export const startLocalPg = async ({ upTo = null, dataDir = null } = {}) => {
     applied,
     version,
     dataDir,
-    /* Applies the remaining migrations — the upgrade path. */
-    async upgrade(from) {
-      const remaining = migrationFiles().slice(
-        migrationFiles().findIndex(f => f.startsWith(from)) + 1);
-      return applyMigrations(pg, remaining);
+    /* Applies the remaining migrations — the upgrade path.
+
+       `upTo` stops the chain at a named migration, so a test about ONE
+       migration keeps testing that migration when a later one is added.
+       Without it, every such test asserts "exactly one migration remained"
+       and fails the day it stops being the last file in the directory. */
+    async upgrade(from, upTo = null) {
+      const files = migrationFiles();
+      const start = files.findIndex(f => f.startsWith(from)) + 1;
+      const end = upTo ? files.findIndex(f => f.startsWith(upTo)) + 1 : files.length;
+      return applyMigrations(pg, files.slice(start, end));
     },
     /* Disposable in the literal sense: the cluster is removed, not merely
        disconnected from. */

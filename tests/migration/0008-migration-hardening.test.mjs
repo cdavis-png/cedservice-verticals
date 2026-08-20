@@ -244,7 +244,9 @@ test('0008 repairs three defects that are observed to exist first', async t => {
      ============================================================ */
 
   await t.test('0008 applies as an upgrade over a populated database', async () => {
-    const applied = await env.upgrade('0007');
+    /* Scoped to 0008: this test is about 0008, not about whatever
+       migration happens to be last in the directory. */
+    const applied = await env.upgrade('0007', '0008');
     assert.deepEqual(applied.map(a => a.file), ['0008_staff_migration_hardening.sql'],
       'exactly one migration remained to apply');
     assert.ok(applied[0].statements > 0);
@@ -445,7 +447,7 @@ test('0008 repairs three defects that are observed to exist first', async t => {
         where tgrelid = 'public.business_intelligence_reports'::regclass
           and not tgisinternal order by 1`);
 
-    await env.upgrade('0007');
+    await env.upgrade('0007', '0008');
 
     const after = await q(
       `select p.proname, pg_get_function_identity_arguments(p.oid) as args,
