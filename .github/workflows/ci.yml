@@ -1,0 +1,195 @@
+# =============================================================
+# Repository CI
+# -------------------------------------------------------------
+# Until this file existed the only check on a pull request was a
+# Vercel deployment, which builds and publishes but runs no test
+# in this repository. A green PR therefore meant "it deployed",
+# not "it works".
+#
+# Every command here is one the repository already defines in
+# package.json. Nothing is reimplemented, and no suite is
+# skipped, weakened or made conditional to obtain a green run.
+#
+# TWO SUITES SKIP THEMSELVES WHEN THEIR PRECONDITIONS ARE
+# MISSING, AND BOTH ARE GUARDED HERE.
+#
+#   - tests/browser/* skip when no Chromium-based browser is
+#     found. They print to stderr and still exit 0.
+#   - tests/integration/* skip every test unless an explicit
+#     opt-in is set, for the good reason that the same suite can
+#     otherwise reach a real Supabase project.
+#
+# A skipped suite reports "0 failed" and looks identical to a
+# passing one. Each is preceded by a preflight that fails the job
+# if the precondition is absent, and followed by an assertion
+# that the run actually executed tests.
+#
+# Steps that pipe into `tee` declare `shell: bash`, which GitHub
+# runs with `-eo pipefail`. The default `run:` shell has no
+# pipefail, so a failing suite piped into tee would exit 0 and
+# the job would pass while the tests failed.
+#
+# The skip assertions match the count line without depending on
+# its leading glyph, because node's default reporter is TAP when
+# stdout is not a TTY on Node 20 and spec on newer majors. One
+# emits "# skipped 0", the other a glyph followed by "skipped 0".
+# =============================================================
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A new push supersedes an in-flight run for the same ref. `main`
+# is excluded so the branch's own history keeps a complete record.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests and static build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # NODE 22, NOT 20, AND THE REASON MATTERS.
+      #
+      # package.json declares engines.node >= 20, but the test scripts
+      # pass a QUOTED glob to node: node --test "tests/*.test.mjs".
+      # The quotes stop the shell expanding it, and node only learned to
+      # expand --test patterns itself after 20 - on Node 20 the run dies
+      # with "Could not find .../tests/*.test.mjs" before a single test
+      # executes. The first CI run found exactly that, which is the kind
+      # of thing CI exists to find.
+      #
+      # 22 is the lowest version on which the repository's own scripts
+      # work. The engines declaration is therefore inaccurate, and that
+      # is reported rather than silently corrected here: widening it is
+      # a package.json decision, and rewriting the scripts to avoid the
+      # glob would change which files each suite collects.
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      # `npm ci` installs from package-lock.json exactly and fails
+      # if the two disagree, which `npm install` does not.
+      - name: Install dependencies from the lockfile
+        run: npm ci
+
+      - name: Unit tests
+        run: npm test
+
+      # Real PostgreSQL through PGlite. No daemon, no container and
+      # no credential. See tests/migration/run.mjs for why each file
+      # gets its own process.
+      - name: Migration tests
+        run: npm run test:migration
+
+      # PRECONDITION. puppeteer-core drives a browser the machine
+      # already has; it downloads none. ubuntu-latest ships Google
+      # Chrome at this path. If that ever stops being true the
+      # browser suite would skip silently, so fail here instead.
+      - name: Preflight - a browser exists for the browser suite
+        run: |
+          test -x /usr/bin/google-chrome \
+            || { echo "::error::/usr/bin/google-chrome is missing; the browser suite would skip silently"; exit 1; }
+          /usr/bin/google-chrome --version
+
+      - name: Browser tests
+        shell: bash
+        run: npm run test:browser 2>&1 | tee browser.log
+
+      - name: Assert the browser suite actually ran
+        shell: bash
+        run: |
+          grep -qE '^.{0,6}skipped 0$' browser.log \
+            || { echo "::error::browser tests were skipped"; sed -n '1,40p' browser.log; exit 1; }
+          grep -qE '^.{0,6}pass [1-9]' browser.log \
+            || { echo "::error::browser tests reported no passing tests"; exit 1; }
+
+      # Local mode only. CED_LOCAL_PG=true makes the suite build a
+      # disposable PostgreSQL in-process, and it REFUSES to start if
+      # hosted credentials are also present - so this step must not
+      # be given SUPABASE_URL. Both variables below are opt-in
+      # switches, not secrets.
+      - name: Integration tests (disposable local PostgreSQL)
+        env:
+          CED_LOCAL_PG: 'true'
+          CED_ALLOW_INTEGRATION_TESTS: 'true'
+        shell: bash
+        run: npm run test:integration:local 2>&1 | tee integration.log
+
+      - name: Assert the integration suite actually ran
+        shell: bash
+        run: |
+          grep -qE '^.{0,6}skipped 0$' integration.log \
+            || { echo "::error::integration tests were skipped - check the opt-in guards"; sed -n '1,40p' integration.log; exit 1; }
+          grep -qE '^.{0,6}pass [1-9]' integration.log \
+            || { echo "::error::integration tests reported no passing tests"; exit 1; }
+
+      # The production behaviour is to REFUSE to build when
+      # SUPABASE_URL is absent or malformed, because the onboarding
+      # page's CSP is generated from it and a guessed value would
+      # publish a page permitted to reach the wrong project. That
+      # refusal is asserted before the successful build, so a
+      # regression that made the build tolerant fails here rather
+      # than shipping a placeholder.
+      - name: Static build refuses to run without SUPABASE_URL
+        shell: bash
+        run: |
+          if node tools/build-static.mjs > unset.log 2>&1; then
+            echo "::error::the build succeeded with SUPABASE_URL unset; the fail-closed guard is gone"
+            cat unset.log
+            exit 1
+          fi
+          grep -q 'SUPABASE_URL is not set' unset.log \
+            || { echo "::error::the build failed for an unexpected reason"; cat unset.log; exit 1; }
+
+      # A syntactically valid but obviously fake project ref. It is
+      # NOT a secret and NOT a real project: nothing is deployed from
+      # CI, and the value reaches exactly one place - the generated
+      # connect-src in the onboarding page's CSP. Vercel supplies the
+      # real SUPABASE_URL for real deployments.
+      - name: Static build
+        env:
+          SUPABASE_URL: https://cifixtureprojectref0.supabase.co
+        run: node tools/build-static.mjs
+
+      - name: Assert the build published a real tree with a generated CSP
+        env:
+          SUPABASE_URL: https://cifixtureprojectref0.supabase.co
+        shell: bash
+        run: |
+          test -d dist || { echo "::error::no dist/ directory"; exit 1; }
+          count=$(find dist -type f | wc -l)
+          echo "published $count files"
+          test "$count" -gt 0 || { echo "::error::dist/ is empty"; exit 1; }
+          grep -q "connect-src 'self' ${SUPABASE_URL};" \
+            dist/staff/identity-resolution/accept-invite.html \
+            || { echo "::error::the onboarding CSP was not generated"; exit 1; }
+          # The committed source must stay fail-closed, so an unbuilt
+          # copy reaches nothing.
+          grep -q "connect-src 'self'" staff/identity-resolution/accept-invite.html \
+            || { echo "::error::the committed page lost its fail-closed CSP"; exit 1; }
+          # server/ and the server-only shared/security modules must
+          # stay traceable by Vercel yet unpublished.
+          for forbidden in server shared/security/origin.js shared/security/rate-limit.js; do
+            test ! -e "dist/$forbidden" \
+              || { echo "::error::dist/ published $forbidden"; exit 1; }
+          done
+
+      # tests/static-output-contract.test.mjs already runs inside
+      # `npm test` above. Naming it here makes the coverage visible
+      # to a reviewer reading the job log.
+      - name: Static output contract (also covered by npm test)
+        run: node --test tests/static-output-contract.test.mjs

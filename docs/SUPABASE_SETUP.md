@@ -431,11 +431,20 @@ executed", which was true when it was written and is not now.
 hosted development project (Supabase PostgreSQL 17.6.1.155), 0008 at ledger
 version `20260809173146` with its post-application verification passed. 0006,
 0007 and 0008 have additionally been executed against a disposable local
-PostgreSQL 18.3 through PGlite. `GET /auth-config` is hosted and answers HTTP
-200; no privileged RPC has been called, because no elevated credential is
-configured on any Vercel environment. See
-[REAL_POSTGRES_VALIDATION.md](REAL_POSTGRES_VALIDATION.md) runs 14, 15 and 16,
-which are the one place this is stated.
+PostgreSQL 18.3 through PGlite. No privileged RPC has been called through
+PostgREST. See [REAL_POSTGRES_VALIDATION.md](REAL_POSTGRES_VALIDATION.md) runs
+14, 15 and 16, which are the one place this is stated.
+
+**`GET /auth-config` — what is and is not known.** The endpoint exists in the
+staff-onboarding implementation, and its response contract is covered by the
+automated unit and browser suites against local servers. **No reproducible
+hosted HTTP 200 request to it has been identified.** An earlier version of
+this paragraph asserted one; that assertion is withdrawn for want of any
+evidence record — no host, deployment id, timestamp, response body or headers
+were ever captured. The current Preview is protected by Vercel SSO, so the
+deployed endpoint's response, headers and returned public configuration remain
+**unobserved**. Nothing here asserts that no manual call was ever made; only
+that no sufficient record of one exists.
 
 Executing the SQL is still not the same as smoke-testing this project. Do not
 stop at the happy path — the full sequence, including the constraint-violation
